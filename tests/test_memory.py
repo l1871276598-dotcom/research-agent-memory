@@ -1,17 +1,26 @@
 import json
 import hashlib
+import importlib.util
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MEMORY_CLI = REPO_ROOT / "src" / "memory.py"
 CSV_HEADER = "id,doi,title,authors,journal,year,status,pdf_path,note_path,project,tags"
+
+
+def load_memory_module():
+    spec = importlib.util.spec_from_file_location("memory_module_for_tests", MEMORY_CLI)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 EXPECTED_DIRS = [
     "memory/profile",
@@ -685,6 +694,398 @@ class ValidateCommandTests(unittest.TestCase):
             }
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(before, after)
+
+
+class ContextTransitionCommandTests(unittest.TestCase):
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(MEMORY_CLI), *args],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+
+    def run_init(self, root):
+        return self.run_cli("init", "--root", str(root))
+
+    def run_validate(self, root):
+        return self.run_cli("validate", "--root", str(root))
+
+    def run_transition(self, root, *extra):
+        base = [
+            "context-transition",
+            "--root",
+            str(root),
+            "--from-context",
+            "university-student",
+            "--to-context",
+            "industry-engineer",
+            "--to-title",
+            "企业研发阶段",
+            "--workspace",
+            "work",
+            "--confidentiality",
+            "internal",
+            "--effective-date",
+            "2027-07-01",
+            "--reason",
+            "毕业后进入企业研发岗位",
+        ]
+        return self.run_cli(*(base + list(extra)))
+
+    def run_add_context(self, root, context_id, title="研究生阶段", workspace="personal", confidentiality="personal", status="active", valid_from="2023-09-01", content="当前处于研究生科研阶段。"):
+        args = [
+            "add",
+            "--root",
+            str(root),
+            "--type",
+            "context",
+            "--title",
+            title,
+            "--scope",
+            "context",
+            "--workspace",
+            workspace,
+            "--confidentiality",
+            confidentiality,
+            "--source",
+            "user",
+            "--confidence",
+            "confirmed",
+            "--content",
+            content,
+            "--context-id",
+            context_id,
+            "--valid-from",
+            valid_from,
+            "--tags",
+            "education",
+            "research",
+            "--status",
+            status,
+        ]
+        return self.run_cli(*args)
+
+    def records(self, root):
+        module = load_memory_module()
+        items = []
+        for path in sorted((root / "memory").rglob("*.md")):
+            record, errors = module.parse_front_matter(path)
+            self.assertEqual(errors, [], path)
+            items.append((path, record))
+        return items
+
+    def record_by_context(self, root, context_id):
+        matches = [(path, record) for path, record in self.records(root) if record.get("context_id") == context_id]
+        self.assertEqual(len(matches), 1)
+        return matches[0]
+
+    def transition_records(self, root):
+        return [
+            (path, record)
+            for path, record in self.records(root)
+            if record.get("type") == "context_transition"
+        ]
+
+    def hashes(self, root):
+        return {
+            path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted((root / "memory").rglob("*.md"))
+        }
+
+    def all_names(self, root):
+        return sorted(path.name for path in (root / "memory").rglob("*") if path.is_file())
+
+    def test_context_transition_same_workspace_updates_source_and_creates_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add_context(root, "university-student").returncode, 0)
+
+            result = self.run_transition(root, "--workspace", "personal", "--confidentiality", "personal")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            source_path, source = self.record_by_context(root, "university-student")
+            target_path, target = self.record_by_context(root, "industry-engineer")
+            transitions = self.transition_records(root)
+            self.assertEqual(source["status"], "historical")
+            self.assertEqual(source["valid_until"], "2027-06-30")
+            self.assertEqual(target["status"], "active")
+            self.assertEqual(target_path.parent, root / "memory" / "contexts")
+            self.assertEqual(len(transitions), 1)
+            self.assertIn(source["id"], target["supersedes"])
+            self.assertIn(target["id"], source["superseded_by"])
+            self.assertIn(f"Updated: {source_path.relative_to(root)}", result.stdout)
+
+    def test_context_transition_cross_workspace_creates_work_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add_context(root, "university-student").returncode, 0)
+
+            result = self.run_transition(root)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            _, target = self.record_by_context(root, "industry-engineer")
+            self.assertEqual(target["workspace"], "work")
+            self.assertEqual(target["confidentiality"], "internal")
+            self.assertEqual(self.run_validate(root).returncode, 0)
+
+    def test_context_transition_preserves_source_body_after_front_matter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add_context(root, "university-student").returncode, 0)
+            source_path, _ = self.record_by_context(root, "university-student")
+            before_body = source_path.read_text(encoding="utf-8").split("---", 2)[2]
+
+            self.assertEqual(self.run_transition(root).returncode, 0)
+
+            after_body = source_path.read_text(encoding="utf-8").split("---", 2)[2]
+            self.assertEqual(after_body, before_body)
+
+    def test_context_transition_sets_supersession_links(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add_context(root, "university-student").returncode, 0)
+
+            self.assertEqual(self.run_transition(root).returncode, 0)
+
+            _, source = self.record_by_context(root, "university-student")
+            _, target = self.record_by_context(root, "industry-engineer")
+            self.assertEqual(source["superseded_by"], [target["id"]])
+            self.assertEqual(target["supersedes"], [source["id"]])
+
+    def test_context_transition_record_contains_required_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add_context(root, "university-student").returncode, 0)
+
+            self.assertEqual(self.run_transition(root, "--tags", "career", "work").returncode, 0)
+
+            [(path, record)] = self.transition_records(root)
+            self.assertEqual(path.parent, root / "memory" / "transitions")
+            self.assertEqual(record["type"], "context_transition")
+            self.assertEqual(record["scope"], "context")
+            self.assertEqual(record["from_context"], "university-student")
+            self.assertEqual(record["to_context"], "industry-engineer")
+            self.assertEqual(record["effective_date"], "2027-07-01")
+            self.assertEqual(record["reason"], "毕业后进入企业研发岗位")
+            self.assertEqual(record["content"], "毕业后进入企业研发岗位")
+            self.assertEqual(record["tags"], ["career", "work"])
+            self.assertNotIn("context_id", record)
+
+    def test_context_transition_dry_run_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add_context(root, "university-student").returncode, 0)
+            before = self.hashes(root)
+
+            result = self.run_transition(root, "--dry-run")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.hashes(root), before)
+            self.assertIn("Dry run: no files changed", result.stdout)
+            self.assertIn("New context: memory/contexts/", result.stdout)
+            self.assertIn("Transition: memory/transitions/", result.stdout)
+
+    def test_context_transition_rejects_missing_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+
+            result = self.run_transition(root)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Transition aborted because validation failed.", result.stderr)
+            self.assertEqual(self.records(root), [])
+
+    def test_context_transition_rejects_inactive_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add_context(root, "university-student", status="historical").returncode, 0)
+            before = self.hashes(root)
+
+            result = self.run_transition(root)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("source context must be active", result.stderr)
+            self.assertEqual(self.hashes(root), before)
+
+    def test_context_transition_rejects_existing_target_context_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add_context(root, "university-student").returncode, 0)
+            self.assertEqual(
+                self.run_add_context(root, "industry-engineer", workspace="work", confidentiality="internal").returncode,
+                0,
+            )
+            before = self.hashes(root)
+
+            result = self.run_transition(root)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("target context_id already exists", result.stderr)
+            self.assertEqual(self.hashes(root), before)
+
+    def test_context_transition_rejects_same_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add_context(root, "university-student").returncode, 0)
+            before = self.hashes(root)
+
+            result = self.run_transition(root, "--to-context", "university-student")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("to-context must differ from from-context", result.stderr)
+            self.assertEqual(self.hashes(root), before)
+
+    def test_context_transition_rejects_active_target_workspace_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add_context(root, "university-student").returncode, 0)
+            self.assertEqual(
+                self.run_add_context(root, "work-now", title="工作阶段", workspace="work", confidentiality="internal").returncode,
+                0,
+            )
+            before = self.hashes(root)
+
+            result = self.run_transition(root)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("target workspace already has an active context", result.stderr)
+            self.assertEqual(self.hashes(root), before)
+
+    def test_context_transition_allows_source_as_only_same_workspace_active_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add_context(root, "university-student").returncode, 0)
+
+            result = self.run_transition(root, "--workspace", "personal", "--confidentiality", "personal")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.run_validate(root).returncode, 0)
+
+    def test_context_transition_rejects_invalid_effective_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add_context(root, "university-student").returncode, 0)
+            before = self.hashes(root)
+
+            result = self.run_transition(root, "--effective-date", "2027-02-30")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("effective-date", result.stderr)
+            self.assertEqual(self.hashes(root), before)
+
+    def test_context_transition_rejects_effective_date_not_after_valid_from(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add_context(root, "university-student").returncode, 0)
+            before = self.hashes(root)
+
+            result = self.run_transition(root, "--effective-date", "2023-09-01")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("effective-date must be later than source valid_from", result.stderr)
+            self.assertEqual(self.hashes(root), before)
+
+    def test_context_transition_rejects_invalid_store_without_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add_context(root, "university-student").returncode, 0)
+            source_path, _ = self.record_by_context(root, "university-student")
+            before = self.hashes(root)
+            source_path.write_text(source_path.read_text(encoding="utf-8").replace('title: "研究生阶段"\n', "", 1), encoding="utf-8")
+            invalid = self.hashes(root)
+
+            result = self.run_transition(root)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Transition aborted because validation failed.", result.stderr)
+            self.assertEqual(self.hashes(root), invalid)
+            self.assertNotEqual(before, invalid)
+
+    def test_context_transition_leaves_no_temporary_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add_context(root, "university-student").returncode, 0)
+
+            self.assertEqual(self.run_transition(root).returncode, 0)
+
+            self.assertFalse([name for name in self.all_names(root) if name.startswith(".tmp-")])
+
+    def test_context_transition_rolls_back_when_create_fails_before_source_replace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            module = load_memory_module()
+            self.assertEqual(module.init_store(root)[0], root.resolve())
+            add_args = mock.Mock(
+                root=str(root),
+                type="context",
+                title="研究生阶段",
+                scope="context",
+                workspace="personal",
+                confidentiality="personal",
+                source="user",
+                confidence="confirmed",
+                content="当前处于研究生科研阶段。",
+                status="active",
+                context_id="university-student",
+                project=None,
+                valid_from="2023-09-01",
+                valid_until=None,
+                tags=["education", "research"],
+                from_context=None,
+                to_context=None,
+                effective_date=None,
+                reason=None,
+            )
+            module.add_memory(add_args)
+            before = self.hashes(root)
+            transition_args = mock.Mock(
+                root=str(root),
+                from_context="university-student",
+                to_context="industry-engineer",
+                to_title="企业研发阶段",
+                workspace="work",
+                confidentiality="internal",
+                effective_date="2027-07-01",
+                reason="毕业后进入企业研发岗位",
+                source="user",
+                confidence="confirmed",
+                content=None,
+                tags=None,
+                dry_run=False,
+            )
+
+            original_replace = Path.replace
+            calls = []
+
+            def fail_second_replace(path, target):
+                calls.append(Path(target).name)
+                if len(calls) == 2:
+                    raise OSError("disk full")
+                return original_replace(path, target)
+
+            with mock.patch.object(Path, "replace", fail_second_replace):
+                with self.assertRaises(OSError):
+                    module.context_transition(transition_args)
+
+            self.assertEqual(self.hashes(root), before)
+            self.assertFalse([name for name in self.all_names(root) if name.startswith(".tmp-")])
 
 
 class ExportCommandTests(unittest.TestCase):

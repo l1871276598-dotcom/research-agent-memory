@@ -5,7 +5,7 @@ import os
 import re
 import sys
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 
@@ -229,7 +229,7 @@ def _quoted(value):
     return json.dumps(value, ensure_ascii=False)
 
 
-def render_memory(record):
+def render_front_matter(record):
     lines = ["---"]
     for field in [
         "id",
@@ -255,27 +255,45 @@ def render_memory(record):
         if field in record:
             lines.append(f"{field}: {_quoted(record[field])}")
 
-    lines.append("tags:")
-    for tag in record["tags"]:
-        lines.append(f"  - {_quoted(tag)}")
-    if not record["tags"]:
-        lines[-1] = "tags: []"
+    for field in ["supersedes", "superseded_by", "tags"]:
+        if field not in record:
+            continue
+        values = record.get(field, [])
+        lines.append(f"{field}:")
+        for value in values:
+            lines.append(f"  - {_quoted(value)}")
+        if not values:
+            lines[-1] = f"{field}: []"
 
     lines.append("content: |-")
     content_lines = record["content"].splitlines() or [""]
     for line in content_lines:
         lines.append(f"  {line}")
-    lines.extend(
-        [
-            "---",
-            "",
-            f"# {record['title']}",
-            "",
-            "该记忆的结构化内容保存在 front matter 的 content 字段中。",
-            "",
-        ]
-    )
+    lines.append("---")
     return "\n".join(lines)
+
+
+def render_memory(record):
+    lines = [
+        render_front_matter(record),
+        "",
+        f"# {record['title']}",
+        "",
+        "该记忆的结构化内容保存在 front matter 的 content 字段中。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def render_existing_memory(path, record):
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    end = None
+    for index, line in enumerate(lines[1:], start=1):
+        if line.rstrip("\n") == "---":
+            end = index
+            break
+    body = "".join(lines[end + 1 :]) if end is not None else ""
+    return render_front_matter(record) + "\n" + body
 
 
 def add_memory(args):
@@ -713,6 +731,214 @@ def export_store(root, include_internal=False):
     }, []
 
 
+def _transition_abort(messages):
+    raise ValueError("\n".join(messages + ["Transition aborted because validation failed."]))
+
+
+def _new_memory_target(root, memory_type, title, used_ids):
+    target_dir = root / TYPE_DIRS[memory_type]
+    today = date.today().isoformat().replace("-", "")
+    slug = safe_slug(title)
+    while True:
+        memory_id = f"{memory_type}-{today}-{uuid.uuid4().hex[:8]}"
+        target = target_dir / f"{memory_id}-{slug}.md"
+        if memory_id not in used_ids and not target.exists():
+            used_ids.add(memory_id)
+            return memory_id, target
+
+
+def _expected_type_for_path(root, path):
+    rel_path = path.relative_to(root).as_posix()
+    for relative_dir, memory_type in DIR_TYPES.items():
+        if rel_path == relative_dir or rel_path.startswith(relative_dir + "/"):
+            return memory_type
+    return None
+
+
+def _validate_hypothetical_records(root, records):
+    errors = []
+    pairs = []
+    for item in records:
+        rel_path = item["path"].relative_to(root).as_posix()
+        errors.extend(validate_record(item["record"], item["path"], rel_path, _expected_type_for_path(root, item["path"])))
+        pairs.append((rel_path, item["record"]))
+    errors.extend(_validate_cross_file(pairs))
+    return errors
+
+
+def _prepare_text(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".tmp-{path.name}-{uuid.uuid4().hex}"
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return tmp
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _replace_transaction(operations, cleanup_paths):
+    prepared = []
+    try:
+        for path, content in operations:
+            prepared.append((_prepare_text(path, content), path))
+        for tmp, path in prepared:
+            tmp.replace(path)
+    except OSError:
+        for tmp, _ in prepared:
+            tmp.unlink(missing_ok=True)
+        for path in cleanup_paths:
+            path.unlink(missing_ok=True)
+        raise
+
+
+def context_transition(args):
+    root, records, errors, _ = collect_validated_records(args.root)
+    if errors:
+        _transition_abort([f"ERROR {rel_path}: {message}" for rel_path, message in errors])
+
+    messages = []
+    if args.from_context == args.to_context:
+        messages.append("ERROR context-transition: to-context must differ from from-context")
+    if not (3 <= len(args.to_context) <= 128) or not ID_PATTERN.fullmatch(args.to_context):
+        messages.append("ERROR context-transition: to-context must match memory id pattern")
+    if args.confidentiality in {"internal", "restricted"} and args.workspace != "work":
+        messages.append("ERROR context-transition: confidentiality internal or restricted requires workspace work")
+    effective = _real_date(args.effective_date)
+    if effective is None:
+        messages.append("ERROR context-transition: effective-date must be a real YYYY-MM-DD date")
+
+    contexts = [item for item in records if item["record"].get("type") == "context"]
+    sources = [item for item in contexts if item["record"].get("context_id") == args.from_context]
+    targets = [item for item in contexts if item["record"].get("context_id") == args.to_context]
+    if len(sources) != 1:
+        messages.append("ERROR context-transition: source context must exist exactly once")
+    if targets:
+        messages.append("ERROR context-transition: target context_id already exists")
+
+    source_item = sources[0] if len(sources) == 1 else None
+    if source_item is not None:
+        source_record = source_item["record"]
+        if source_record.get("status") != "active":
+            messages.append("ERROR context-transition: source context must be active")
+        source_valid_from = _real_date(source_record.get("valid_from"))
+        if source_valid_from is None:
+            messages.append("ERROR context-transition: source context must have valid valid_from")
+        elif effective is not None and effective <= source_valid_from:
+            messages.append("ERROR context-transition: effective-date must be later than source valid_from")
+        for item in contexts:
+            record = item["record"]
+            if item is source_item:
+                continue
+            if record.get("status") == "active" and record.get("workspace") == args.workspace:
+                messages.append("ERROR context-transition: target workspace already has an active context")
+                break
+
+    if messages:
+        _transition_abort(messages)
+
+    today = date.today().isoformat()
+    used_ids = {
+        item["record"].get("id")
+        for item in records
+        if isinstance(item["record"].get("id"), str)
+    }
+    source_record = dict(source_item["record"])
+    source_record["status"] = "historical"
+    source_record["updated"] = today
+    source_record["valid_until"] = (effective - timedelta(days=1)).isoformat()
+
+    new_context_id, new_context_path = _new_memory_target(root, "context", args.to_title, used_ids)
+    transition_title = f"从「{source_record['title']}」迁移到「{args.to_title}」"
+    transition_id, transition_path = _new_memory_target(root, "context_transition", transition_title, used_ids)
+    superseded_by = list(source_record.get("superseded_by", []))
+    if new_context_id not in superseded_by:
+        superseded_by.append(new_context_id)
+    source_record["superseded_by"] = superseded_by
+
+    content = args.content if args.content is not None else args.reason
+    new_context_record = {
+        "id": new_context_id,
+        "type": "context",
+        "title": args.to_title,
+        "created": today,
+        "updated": today,
+        "status": "active",
+        "scope": "context",
+        "workspace": args.workspace,
+        "confidentiality": args.confidentiality,
+        "source": args.source,
+        "confidence": args.confidence,
+        "context_id": args.to_context,
+        "valid_from": args.effective_date,
+        "supersedes": [source_record["id"]],
+        "tags": args.tags or [],
+        "content": content,
+    }
+    transition_record = {
+        "id": transition_id,
+        "type": "context_transition",
+        "title": transition_title,
+        "created": today,
+        "updated": today,
+        "status": "active",
+        "scope": "context",
+        "workspace": args.workspace,
+        "confidentiality": args.confidentiality,
+        "source": args.source,
+        "confidence": args.confidence,
+        "from_context": args.from_context,
+        "to_context": args.to_context,
+        "effective_date": args.effective_date,
+        "reason": args.reason,
+        "tags": args.tags or [],
+        "content": content,
+    }
+
+    final_records = []
+    for item in records:
+        if item is source_item:
+            final_records.append({**item, "record": source_record})
+        else:
+            final_records.append(item)
+    final_records.extend(
+        [
+            {"relative_path": new_context_path.relative_to(root).as_posix(), "record": new_context_record, "path": new_context_path},
+            {"relative_path": transition_path.relative_to(root).as_posix(), "record": transition_record, "path": transition_path},
+        ]
+    )
+    final_errors = _validate_hypothetical_records(root, final_records)
+    if final_errors:
+        _transition_abort([f"ERROR {rel_path}: {message}" for rel_path, message in final_errors])
+
+    source_path = source_item["path"]
+    summary = {
+        "from_context": args.from_context,
+        "to_context": args.to_context,
+        "effective_date": args.effective_date,
+        "source_path": source_path.relative_to(root).as_posix(),
+        "new_context_path": new_context_path.relative_to(root).as_posix(),
+        "transition_path": transition_path.relative_to(root).as_posix(),
+    }
+    if args.dry_run:
+        summary["dry_run"] = True
+        return summary
+
+    _replace_transaction(
+        [
+            (new_context_path, render_memory(new_context_record)),
+            (transition_path, render_memory(transition_record)),
+            (source_path, render_existing_memory(source_path, source_record)),
+        ],
+        [new_context_path, transition_path],
+    )
+    summary["dry_run"] = False
+    return summary
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Manage file-based research memory.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -746,6 +972,21 @@ def build_parser():
     export_parser = subparsers.add_parser("export", help="Export memory records.")
     export_parser.add_argument("--root", required=True, help="Initialized data root.")
     export_parser.add_argument("--include-internal", action="store_true")
+
+    transition_parser = subparsers.add_parser("context-transition", help="Migrate an active context.")
+    transition_parser.add_argument("--root", required=True, help="Initialized data root.")
+    transition_parser.add_argument("--from-context", required=True, dest="from_context")
+    transition_parser.add_argument("--to-context", required=True, dest="to_context")
+    transition_parser.add_argument("--to-title", required=True, dest="to_title")
+    transition_parser.add_argument("--workspace", required=True, choices=WORKSPACE_CHOICES)
+    transition_parser.add_argument("--confidentiality", required=True, choices=CONFIDENTIALITY_CHOICES)
+    transition_parser.add_argument("--effective-date", required=True, dest="effective_date")
+    transition_parser.add_argument("--reason", required=True)
+    transition_parser.add_argument("--source", default="user")
+    transition_parser.add_argument("--confidence", default="confirmed", choices=CONFIDENCE_CHOICES)
+    transition_parser.add_argument("--content")
+    transition_parser.add_argument("--tags", nargs="*")
+    transition_parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -788,6 +1029,25 @@ def main(argv=None):
             print(f"Skipped restricted: {summary['skipped_restricted']}")
             print("Output: exports/memory.jsonl")
             print("Manifest: exports/index_manifest.json")
+            return 0
+        if args.command == "context-transition":
+            summary = context_transition(args)
+            if summary["dry_run"]:
+                print("Dry run: no files changed")
+                print(f"From context: {summary['from_context']}")
+                print(f"To context: {summary['to_context']}")
+                print(f"Effective date: {summary['effective_date']}")
+                print(f"Source file: {summary['source_path']}")
+                print(f"New context: {summary['new_context_path']}")
+                print(f"Transition: {summary['transition_path']}")
+                return 0
+            print("Transition completed")
+            print(f"From context: {summary['from_context']}")
+            print(f"To context: {summary['to_context']}")
+            print(f"Effective date: {summary['effective_date']}")
+            print(f"Updated: {summary['source_path']}")
+            print(f"Created context: {summary['new_context_path']}")
+            print(f"Created transition: {summary['transition_path']}")
             return 0
     except (OSError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
