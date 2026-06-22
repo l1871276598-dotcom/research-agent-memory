@@ -2,13 +2,17 @@
 
 ## 项目简介
 
-这是一个本地优先的个人科研 Agent 记忆库。GitHub 保存代码、规则、Schema、模板、测试和文档；iCloud 数据目录保存 Markdown、JSONL、文献笔记、文献矩阵和允许同步的文件；未来的 SQLite、Chroma、缓存和日志放在 Mac 本地运行目录。
+这是一个本地优先的个人科研 Agent 记忆库。
 
-当前项目支持文件型记忆、工作区与保密级别隔离、情景迁移，并可在后续阶段扩展到 SQLite FTS5、语义搜索和 MCP 接口。
+- GitHub 保存代码、Schema、模板、测试和文档。
+- iCloud 数据目录保存 Markdown 记忆、JSONL、文献笔记、文献矩阵和允许同步的归档文件。
+- Mac 本地运行目录保存 SQLite、缓存和日志。
 
-## 当前版本能力
+真实记忆、未发表资料、PDF 和运行数据库不得进入 GitHub。活动 SQLite 数据库不得直接放入 iCloud。
 
-Phase 1 已实现以下命令：
+## 当前能力
+
+### 核心记忆命令
 
 ```bash
 python3 src/memory.py init --root PATH
@@ -16,56 +20,90 @@ python3 src/memory.py add ...
 python3 src/memory.py validate --root PATH
 python3 src/memory.py export --root PATH
 python3 src/memory.py context-transition ...
+python3 src/memory.py db-init --root PATH
+python3 src/memory.py index --root PATH
 ```
 
-当前未实现：
+已实现：
 
-- SQLite FTS5
-- Chroma
-- Ollama
-- MCP
-- 文献自动抓取
-- 总控 Agent 接入
+- 标准数据目录初始化
+- `profile`、`context`、`principle`、`project`、`decision`、`procedure`、`session` 等结构化记忆
+- 单文件与跨文件验证
+- workspace 与保密级别隔离
+- 确定性 JSONL 导出和 SHA-256 清单
+- 事务式情景迁移
+- 本地 SQLite FTS5 初始化
+- Markdown 记忆增量索引
+- 中文二元词索引预处理
 
-## 存储职责边界
+### 轻量扩展命令
 
-GitHub 保存：
+为避免继续扩大核心 `memory.py`，检索和 ChatGPT 导入暂放在一个轻量入口中：
 
-- 代码
-- Schema
-- 模板
-- 测试
-- 文档
-- 示例配置
+```bash
+python3 src/memory_tools.py search ...
+python3 src/memory_tools.py import-chatgpt ...
+```
 
-iCloud 数据目录保存：
+已实现：
 
-- Markdown 记忆
-- JSONL
-- 文献笔记
-- 文献矩阵
-- 允许同步的导出文件
+- SQLite FTS5 全文检索
+- 中文部分短语检索
+- 按类型、项目、workspace 和状态过滤
+- 文本或 JSON 输出
+- 从 ChatGPT 官方导出 ZIP 中识别 `conversations.json`
+- 将当前活动分支的文本消息归档为 Markdown
+- 使用对话 ID 和内容哈希进行幂等更新
+- `--dry-run` 预演
+- 导入清单生成
 
-Mac 本地运行目录保存未来运行时数据：
+当前 ChatGPT 导入仅负责原始对话归档，不会自动把每段对话晋升为长期记忆，也不会导入附件或所有分支版本。
 
-- SQLite
-- Chroma
-- 缓存
-- 日志
+## 推荐目录
 
-活动数据库不得直接放入 iCloud。真实记忆、PDF、内部资料和数据库不得进入 GitHub。
+```text
+GitHub 代码仓库
+└── research-agent-memory/
+    ├── src/
+    ├── tests/
+    ├── schemas/
+    ├── templates/
+    └── .github/workflows/
+
+iCloud 数据目录
+└── ResearchAgent/
+    ├── memory/
+    ├── literature/
+    ├── manuscripts/
+    ├── imports/chatgpt/
+    ├── exports/
+    └── backups/
+
+Mac 本地运行目录
+└── ~/Library/Application Support/ResearchAgent/
+    └── memory.sqlite
+```
 
 ## 快速开始
 
-以下命令只使用临时目录，可以直接复制执行：
+以下示例使用建议路径：
 
 ```bash
-rm -rf /tmp/research-agent-demo
+DATA_ROOT="$HOME/Library/Mobile Documents/com~apple~CloudDocs/ResearchAgent"
+STATE_DIR="$HOME/Library/Application Support/ResearchAgent"
+```
 
-python3 src/memory.py init --root /tmp/research-agent-demo
+### 1. 初始化数据目录
 
+```bash
+python3 src/memory.py init --root "$DATA_ROOT"
+```
+
+### 2. 添加一条记忆
+
+```bash
 python3 src/memory.py add \
-  --root /tmp/research-agent-demo \
+  --root "$DATA_ROOT" \
   --type principle \
   --title "代码最少原则" \
   --scope global \
@@ -75,32 +113,108 @@ python3 src/memory.py add \
   --confidence confirmed \
   --content "使用尽可能少的代码实现相同功能。" \
   --tags coding architecture
-
-python3 src/memory.py add \
-  --root /tmp/research-agent-demo \
-  --type context \
-  --title "研究生阶段" \
-  --scope context \
-  --workspace personal \
-  --confidentiality personal \
-  --source user \
-  --confidence confirmed \
-  --content "当前处于个人科研学习阶段。" \
-  --context-id university-student \
-  --valid-from 2023-09-01 \
-  --tags education research
-
-python3 src/memory.py validate --root /tmp/research-agent-demo
-python3 src/memory.py export --root /tmp/research-agent-demo
 ```
 
-## 情景变化示例
+### 3. 验证记忆库
 
-从 `university-student` 迁移到 `industry-engineer`：
+```bash
+python3 src/memory.py validate --root "$DATA_ROOT"
+```
+
+### 4. 初始化并更新本地索引
+
+```bash
+python3 src/memory.py db-init \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR"
+
+python3 src/memory.py index \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR"
+```
+
+可先预演索引变化：
+
+```bash
+python3 src/memory.py index \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --dry-run
+```
+
+## 搜索记忆
+
+基础搜索：
+
+```bash
+python3 src/memory_tools.py search "代码最少" \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR"
+```
+
+按项目和类型过滤：
+
+```bash
+python3 src/memory_tools.py search "论文证据链" \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --project pdc-rock-manuscript \
+  --type procedure
+```
+
+输出 JSON：
+
+```bash
+python3 src/memory_tools.py search "RMRE" \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --json
+```
+
+搜索前必须先完成 `db-init` 和 `index`。
+
+## 导入 ChatGPT 官方导出
+
+先预演：
+
+```bash
+python3 src/memory_tools.py import-chatgpt \
+  --zip "$HOME/Downloads/chatgpt-export.zip" \
+  --root "$DATA_ROOT" \
+  --dry-run
+```
+
+正式导入：
+
+```bash
+python3 src/memory_tools.py import-chatgpt \
+  --zip "$HOME/Downloads/chatgpt-export.zip" \
+  --root "$DATA_ROOT"
+```
+
+输出位置：
+
+```text
+imports/chatgpt/conversations/YYYY/MM/*.md
+imports/chatgpt/import_manifest.json
+```
+
+重复导入相同内容不会重复创建对话文件；对话内容发生变化时会更新原文件。
+
+当前限制：
+
+- 只处理官方导出 ZIP 中的文本对话
+- 默认归档 `current_node` 对应的活动分支
+- 不导入图片、附件和语音文件
+- 不自动提取原则、决策或项目长期记忆
+- 原生 ChatGPT App 尚无实时自动同步接口
+- `imports/chatgpt/` 尚未纳入 SQLite 记忆索引
+
+## 情景迁移
 
 ```bash
 python3 src/memory.py context-transition \
-  --root /tmp/research-agent-demo \
+  --root "$DATA_ROOT" \
   --from-context university-student \
   --to-context industry-engineer \
   --to-title "企业研发阶段" \
@@ -109,40 +223,41 @@ python3 src/memory.py context-transition \
   --effective-date 2027-07-01 \
   --reason "从学校科研阶段进入企业研发阶段" \
   --dry-run
-
-python3 src/memory.py context-transition \
-  --root /tmp/research-agent-demo \
-  --from-context university-student \
-  --to-context industry-engineer \
-  --to-title "企业研发阶段" \
-  --workspace work \
-  --confidentiality internal \
-  --effective-date 2027-07-01 \
-  --reason "从学校科研阶段进入企业研发阶段"
-
-python3 src/memory.py validate --root /tmp/research-agent-demo
 ```
 
-旧 Context 不会被删除，而是转为 `historical`，并通过 `superseded_by` 与新 Context 建立关系。
+旧 Context 不会被删除，而是转为 `historical`，并通过 `supersedes` 和 `superseded_by` 建立关系。
 
 ## 保密规则
 
 - `public` 和 `personal` 默认可导出。
-- `internal` 默认不导出。
-- `--include-internal` 可显式包含 `internal`。
+- `internal` 默认不导出，可用 `--include-internal` 显式包含。
 - `restricted` 永远不导出。
 - `internal` 和 `restricted` 必须属于 `work` workspace。
+- 密码、API key、SSH 私钥和其他凭证不得写入记忆库。
+- 原始 ChatGPT 导出 ZIP、真实记忆、PDF 和 SQLite 不得提交到 GitHub。
 
-## 测试
+## 自动测试
 
-当前验收使用：
+GitHub Actions 在 push 和 pull request 时自动执行：
 
 ```bash
 python3 -m unittest discover -s tests -v
 python3 -m compileall src
 ```
 
-最近一次代码级验收结果：59 个测试全部通过，`compileall` 通过。
+本地也可以运行相同命令。
+
+## 尚未实现
+
+- ChatGPT 对话实时同步
+- 对话自动提取并审核候选长期记忆
+- ChatGPT 附件导入
+- 将原始对话纳入统一搜索
+- PDF 自动解析和文献矩阵自动填充
+- Zotero 或 EndNote 同步
+- Chroma、向量嵌入和语义检索
+- MCP 接口
+- 总控 Agent
 
 ## 许可证
 
