@@ -1,0 +1,297 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/memory.schema.json",
+  "title": "Memory",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "type",
+    "title",
+    "created",
+    "updated",
+    "status",
+    "scope",
+    "workspace",
+    "confidentiality",
+    "source",
+    "confidence",
+    "content"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:\\-]*$"
+    },
+    "type": {
+      "enum": [
+        "profile",
+        "context",
+        "context_transition",
+        "principle",
+        "project",
+        "decision",
+        "procedure",
+        "session"
+      ]
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "created": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "updated": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "status": {
+      "enum": [
+        "active",
+        "historical",
+        "deprecated",
+        "candidate",
+        "conflict",
+        "archived"
+      ]
+    },
+    "scope": {
+      "enum": [
+        "global",
+        "context",
+        "project"
+      ]
+    },
+    "workspace": {
+      "enum": [
+        "personal",
+        "work"
+      ]
+    },
+    "confidentiality": {
+      "enum": [
+        "public",
+        "personal",
+        "internal",
+        "restricted"
+      ]
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "confidence": {
+      "enum": [
+        "confirmed",
+        "inferred",
+        "uncertain"
+      ]
+    },
+    "content": {
+      "type": "string"
+    },
+    "context_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "project": {
+      "type": "string",
+      "minLength": 1
+    },
+    "valid_from": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "valid_until": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "supersedes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "superseded_by": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "from_context": {
+      "type": "string",
+      "minLength": 1
+    },
+    "to_context": {
+      "type": "string",
+      "minLength": 1
+    },
+    "effective_date": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "context"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "scope": {
+            "const": "context"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "context_transition"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "required": [
+          "from_context",
+          "to_context",
+          "effective_date",
+          "reason"
+        ],
+        "properties": {
+          "scope": {
+            "const": "context"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "project"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "required": [
+          "project"
+        ],
+        "properties": {
+          "scope": {
+            "const": "project"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "scope": {
+            "const": "context"
+          }
+        },
+        "required": [
+          "scope"
+        ]
+      },
+      "then": {
+        "if": {
+          "not": {
+            "properties": {
+              "type": {
+                "const": "context_transition"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          }
+        },
+        "then": {
+          "required": [
+            "context_id"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "scope": {
+            "const": "project"
+          }
+        },
+        "required": [
+          "scope"
+        ]
+      },
+      "then": {
+        "required": [
+          "project"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "confidentiality": {
+            "enum": [
+              "internal",
+              "restricted"
+            ]
+          }
+        },
+        "required": [
+          "confidentiality"
+        ]
+      },
+      "then": {
+        "properties": {
+          "workspace": {
+            "const": "work"
+          }
+        }
+      }
+    }
+  ]
+}

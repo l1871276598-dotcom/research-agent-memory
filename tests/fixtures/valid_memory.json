@@ -1,0 +1,20 @@
+{
+  "id": "context-university-001",
+  "type": "context",
+  "title": "研究生阶段",
+  "created": "2026-06-22",
+  "updated": "2026-06-22",
+  "status": "active",
+  "scope": "context",
+  "workspace": "personal",
+  "confidentiality": "personal",
+  "source": "user",
+  "confidence": "confirmed",
+  "content": "用户处于研究生阶段，学习和研究相关记忆应归入 university-student 情景。",
+  "context_id": "university-student",
+  "valid_from": "2023-09-01",
+  "tags": [
+    "education",
+    "research"
+  ]
+}

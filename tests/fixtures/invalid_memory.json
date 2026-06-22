@@ -1,0 +1,14 @@
+{
+  "id": "invalid-memory-001",
+  "type": "unknown_type",
+  "created": "2026-99-99",
+  "updated": "2026-06-22",
+  "status": "unknown_status",
+  "scope": "global",
+  "workspace": "personal",
+  "confidentiality": "restricted",
+  "source": "user",
+  "confidence": "confirmed",
+  "content": "这条记录故意包含多个 Schema 错误，用于后续验证器测试。",
+  "unexpected_field": "not allowed"
+}
