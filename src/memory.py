@@ -1,5 +1,7 @@
 import argparse
+import hashlib
 import json
+import os
 import re
 import sys
 import uuid
@@ -553,11 +555,12 @@ def _memory_paths(root):
     return sorted(paths, key=lambda path: path.relative_to(root).as_posix())
 
 
-def validate_store(root):
+def collect_validated_records(root):
     root = _require_data_root(root)
     errors = []
     records = []
-    for path in _memory_paths(root):
+    paths = _memory_paths(root)
+    for path in paths:
         rel_path = path.relative_to(root).as_posix()
         if path.is_symlink():
             errors.append((rel_path, "memory file must not be a symbolic link"))
@@ -579,10 +582,15 @@ def validate_store(root):
         if record is None:
             continue
         errors.extend(validate_record(record, path, rel_path, expected_type))
-        records.append((rel_path, record))
+        records.append({"relative_path": rel_path, "record": record, "path": path})
 
-    errors.extend(_validate_cross_file(records))
-    return len(_memory_paths(root)), errors
+    errors.extend(_validate_cross_file([(item["relative_path"], item["record"]) for item in records]))
+    return root, records, errors, len(paths)
+
+
+def validate_store(root):
+    _, _, errors, count = collect_validated_records(root)
+    return count, errors
 
 
 def _validate_cross_file(records):
@@ -635,6 +643,76 @@ def _validate_cross_file(records):
     return errors
 
 
+def atomic_write_text(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".tmp-{path.name}-{uuid.uuid4().hex}"
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp.replace(path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def export_store(root, include_internal=False):
+    root, records, errors, _ = collect_validated_records(root)
+    if errors:
+        return None, errors
+
+    exported = []
+    skipped_internal = 0
+    skipped_restricted = 0
+    for item in sorted(records, key=lambda value: value["relative_path"]):
+        confidentiality = item["record"].get("confidentiality")
+        if confidentiality == "restricted":
+            skipped_restricted += 1
+            continue
+        if confidentiality == "internal" and not include_internal:
+            skipped_internal += 1
+            continue
+        sha256 = hashlib.sha256(item["path"].read_bytes()).hexdigest()
+        exported.append(
+            {
+                "record": item["record"],
+                "relative_path": item["relative_path"],
+                "sha256": sha256,
+            }
+        )
+
+    jsonl = "".join(
+        json.dumps(row, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
+        for row in exported
+    )
+    manifest = {
+        "format_version": 1,
+        "records": [
+            {
+                "id": row["record"]["id"],
+                "type": row["record"]["type"],
+                "status": row["record"]["status"],
+                "workspace": row["record"]["workspace"],
+                "confidentiality": row["record"]["confidentiality"],
+                "relative_path": row["relative_path"],
+                "sha256": row["sha256"],
+            }
+            for row in exported
+        ],
+    }
+    manifest_text = json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+
+    exports = root / "exports"
+    atomic_write_text(exports / "memory.jsonl", jsonl)
+    atomic_write_text(exports / "index_manifest.json", manifest_text)
+    return {
+        "exported": len(exported),
+        "skipped_internal": skipped_internal,
+        "skipped_restricted": skipped_restricted,
+    }, []
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Manage file-based research memory.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -664,6 +742,10 @@ def build_parser():
 
     validate_parser = subparsers.add_parser("validate", help="Validate memory files.")
     validate_parser.add_argument("--root", required=True, help="Initialized data root.")
+
+    export_parser = subparsers.add_parser("export", help="Export memory records.")
+    export_parser.add_argument("--root", required=True, help="Initialized data root.")
+    export_parser.add_argument("--include-internal", action="store_true")
     return parser
 
 
@@ -694,6 +776,19 @@ def main(argv=None):
             print(f"Errors: {len(errors)}")
             print("Warnings: 0")
             return 1 if errors else 0
+        if args.command == "export":
+            summary, errors = export_store(args.root, args.include_internal)
+            if errors:
+                for rel_path, message in errors:
+                    print(f"ERROR {rel_path}: {message}")
+                print("Export aborted because validation failed.")
+                return 1
+            print(f"Exported: {summary['exported']} records")
+            print(f"Skipped internal: {summary['skipped_internal']}")
+            print(f"Skipped restricted: {summary['skipped_restricted']}")
+            print("Output: exports/memory.jsonl")
+            print("Manifest: exports/index_manifest.json")
+            return 0
     except (OSError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1

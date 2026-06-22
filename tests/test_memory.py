@@ -687,5 +687,243 @@ class ValidateCommandTests(unittest.TestCase):
             self.assertEqual(before, after)
 
 
+class ExportCommandTests(unittest.TestCase):
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(MEMORY_CLI), *args],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+
+    def run_init(self, root):
+        return self.run_cli("init", "--root", str(root))
+
+    def run_export(self, root, *extra):
+        return self.run_cli("export", "--root", str(root), *extra)
+
+    def run_add(self, root, memory_type="principle", title="代码最少原则", scope="global", **kwargs):
+        args = [
+            "add",
+            "--root",
+            str(root),
+            "--type",
+            memory_type,
+            "--title",
+            title,
+            "--scope",
+            scope,
+            "--workspace",
+            kwargs.pop("workspace", "personal"),
+            "--confidentiality",
+            kwargs.pop("confidentiality", "personal"),
+            "--source",
+            "user",
+            "--confidence",
+            "confirmed",
+            "--content",
+            kwargs.pop("content", "使用尽可能少的代码实现相同功能。"),
+        ]
+        for option, value in kwargs.items():
+            flag = "--" + option.replace("_", "-")
+            if isinstance(value, list):
+                args.append(flag)
+                args.extend(value)
+            elif value is not None:
+                args.extend([flag, value])
+        return self.run_cli(*args)
+
+    def memory_files(self, root):
+        return sorted(path for path in (root / "memory").rglob("*.md") if path.is_file())
+
+    def load_jsonl(self, root):
+        path = root / "exports" / "memory.jsonl"
+        text = path.read_text(encoding="utf-8")
+        return [json.loads(line) for line in text.splitlines()]
+
+    def load_manifest(self, root):
+        return json.loads((root / "exports" / "index_manifest.json").read_text(encoding="utf-8"))
+
+    def test_export_empty_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+
+            result = self.run_export(root)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / "exports" / "memory.jsonl").read_text(encoding="utf-8"), "")
+            self.assertEqual(self.load_manifest(root), {"format_version": 1, "records": []})
+            self.assertIn("Exported: 0 records", result.stdout)
+
+    def test_export_valid_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add(root, tags=["coding"]).returncode, 0)
+            source = self.memory_files(root)[0]
+            source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+
+            result = self.run_export(root)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            rows = self.load_jsonl(root)
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(set(row), {"record", "relative_path", "sha256"})
+            self.assertEqual(row["sha256"], source_hash)
+            self.assertEqual(row["relative_path"], source.relative_to(root).as_posix())
+            self.assertEqual(row["record"]["type"], "principle")
+            manifest_row = self.load_manifest(root)["records"][0]
+            self.assertEqual(manifest_row["id"], row["record"]["id"])
+            self.assertEqual(manifest_row["type"], "principle")
+            self.assertEqual(manifest_row["status"], "active")
+            self.assertEqual(manifest_row["workspace"], "personal")
+            self.assertEqual(manifest_row["confidentiality"], "personal")
+            self.assertEqual(manifest_row["relative_path"], row["relative_path"])
+            self.assertEqual(manifest_row["sha256"], source_hash)
+
+    def test_export_order_is_stable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add(root, "session", "会话", "project", project="p").returncode, 0)
+            self.assertEqual(self.run_add(root, "principle", "原则", "global").returncode, 0)
+            self.assertEqual(self.run_add(root, "profile", "档案", "global").returncode, 0)
+
+            self.assertEqual(self.run_export(root).returncode, 0)
+
+            paths = [row["relative_path"] for row in self.load_jsonl(root)]
+            self.assertEqual(paths, sorted(paths))
+
+    def test_export_is_deterministic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add(root).returncode, 0)
+            self.assertEqual(self.run_export(root).returncode, 0)
+            jsonl_before = (root / "exports" / "memory.jsonl").read_bytes()
+            manifest_before = (root / "exports" / "index_manifest.json").read_bytes()
+
+            self.assertEqual(self.run_export(root).returncode, 0)
+
+            self.assertEqual((root / "exports" / "memory.jsonl").read_bytes(), jsonl_before)
+            self.assertEqual((root / "exports" / "index_manifest.json").read_bytes(), manifest_before)
+
+    def test_export_rejects_invalid_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add(root).returncode, 0)
+            path = self.memory_files(root)[0]
+            text = path.read_text(encoding="utf-8")
+            path.write_text(re.sub(r'^title: ".*"\n', "", text, count=1, flags=re.MULTILINE), encoding="utf-8")
+
+            result = self.run_export(root)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Export aborted because validation failed.", result.stdout)
+            self.assertFalse((root / "exports" / "memory.jsonl").exists())
+
+    def test_export_preserves_existing_outputs_on_validation_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add(root).returncode, 0)
+            self.assertEqual(self.run_export(root).returncode, 0)
+            jsonl_before = (root / "exports" / "memory.jsonl").read_bytes()
+            manifest_before = (root / "exports" / "index_manifest.json").read_bytes()
+            path = self.memory_files(root)[0]
+            path.write_text(path.read_text(encoding="utf-8").replace('type: "principle"', 'type: "bad"', 1), encoding="utf-8")
+
+            result = self.run_export(root)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((root / "exports" / "memory.jsonl").read_bytes(), jsonl_before)
+            self.assertEqual((root / "exports" / "index_manifest.json").read_bytes(), manifest_before)
+
+    def test_export_excludes_internal_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(
+                self.run_add(root, workspace="work", confidentiality="internal").returncode,
+                0,
+            )
+
+            result = self.run_export(root)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.load_jsonl(root), [])
+            self.assertIn("Skipped internal: 1", result.stdout)
+
+    def test_export_includes_internal_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(
+                self.run_add(root, workspace="work", confidentiality="internal").returncode,
+                0,
+            )
+
+            result = self.run_export(root, "--include-internal")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            rows = self.load_jsonl(root)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["record"]["confidentiality"], "internal")
+
+    def test_export_never_exports_restricted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(
+                self.run_add(root, workspace="work", confidentiality="restricted").returncode,
+                0,
+            )
+
+            default = self.run_export(root)
+            include_internal = self.run_export(root, "--include-internal")
+
+            self.assertEqual(default.returncode, 0, default.stdout + default.stderr)
+            self.assertEqual(include_internal.returncode, 0, include_internal.stdout + include_internal.stderr)
+            self.assertEqual(self.load_jsonl(root), [])
+            self.assertIn("Skipped restricted: 1", default.stdout)
+            self.assertIn("Skipped restricted: 1", include_internal.stdout)
+
+    def test_export_does_not_modify_memory_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add(root).returncode, 0)
+            before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in self.memory_files(root)}
+
+            self.assertEqual(self.run_export(root).returncode, 0)
+
+            after = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in self.memory_files(root)}
+            self.assertEqual(before, after)
+
+    def test_export_leaves_no_temporary_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add(root).returncode, 0)
+
+            self.assertEqual(self.run_export(root).returncode, 0)
+
+            names = [path.name for path in (root / "exports").iterdir()]
+            self.assertFalse([name for name in names if name.startswith(".tmp-")])
+
+    def test_export_invalid_root_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            root.mkdir()
+
+            result = self.run_export(root)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((root / "exports" / "memory.jsonl").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
