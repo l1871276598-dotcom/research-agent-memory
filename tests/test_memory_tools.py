@@ -4,7 +4,10 @@ import json
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
 import zipfile
 from contextlib import redirect_stdout
 from io import StringIO
@@ -169,6 +172,84 @@ class MemoryToolsTests(unittest.TestCase):
                 archive.writestr("other.json", "[]")
             with self.assertRaisesRegex(ValueError, "conversations.json"):
                 TOOLS._load_conversations(path)
+
+    def test_live_archive_is_idempotent_and_title_safe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.make_root(Path(tmp))
+            payload = {
+                "title": "原始标题",
+                "created_at": "2026-06-22T08:00:00Z",
+                "updated_at": "2026-06-22T08:05:00Z",
+                "messages": [
+                    {"role": "user", "content": "请归档这次讨论。"},
+                    {"role": "assistant", "content": "可以。"},
+                ],
+            }
+            first = TOOLS.archive_live(root, payload)
+            self.assertEqual(first["status"], "created")
+            self.assertEqual(TOOLS.archive_live(root, payload)["status"], "unchanged")
+            payload["title"] = "重命名标题"
+            changed = TOOLS.archive_live(root, payload)
+            self.assertEqual(changed["status"], "updated")
+            files = list((root / "imports/chatgpt/live").rglob("*.md"))
+            self.assertEqual(len(files), 1)
+            text = files[0].read_text(encoding="utf-8")
+            self.assertIn('source: "chatgpt_action"', text)
+            self.assertIn("# 重命名标题", text)
+            self.assertIn("## User", text)
+            self.assertIn("## Assistant", text)
+
+    def test_live_archive_rejects_hidden_roles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.make_root(Path(tmp))
+            with self.assertRaisesRegex(ValueError, "visible user and assistant"):
+                TOOLS.archive_live(
+                    root,
+                    {"title": "bad", "messages": [{"role": "system", "content": "secret"}]},
+                )
+
+    def test_archive_http_requires_bearer_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.make_root(Path(tmp))
+            token = "x" * 32
+            server = TOOLS._archive_server(root, token, "127.0.0.1", 0, 100000)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            url = f"http://127.0.0.1:{server.server_port}/archive"
+            body = json.dumps(
+                {
+                    "title": "HTTP test",
+                    "messages": [
+                        {"role": "user", "content": "archive"},
+                        {"role": "assistant", "content": "done"},
+                    ],
+                }
+            ).encode()
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(
+                        urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}),
+                        timeout=5,
+                    )
+                self.assertEqual(caught.exception.code, 401)
+                request = urllib.request.Request(
+                    url,
+                    data=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {token}",
+                    },
+                )
+                response = urllib.request.urlopen(request, timeout=5)
+                self.assertEqual(response.status, 201)
+                self.assertEqual(json.loads(response.read())["status"], "created")
+                response = urllib.request.urlopen(request, timeout=5)
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read())["status"], "unchanged")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
 
 
 if __name__ == "__main__":
