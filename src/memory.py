@@ -6,7 +6,7 @@ import re
 import sqlite3
 import sys
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -135,6 +135,7 @@ REQUIRED_INDEXES = {
     "idx_memories_context",
     "idx_memories_workspace_status",
 }
+CJK_RUN = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF]+")
 
 
 def _repository_root():
@@ -1218,6 +1219,285 @@ def db_init(args):
     }
 
 
+def normalize_fts_text(value):
+    text = "" if value is None else str(value)
+    parts = []
+    last = 0
+    for match in CJK_RUN.finditer(text):
+        if match.start() > last:
+            parts.append(text[last:match.start()])
+        run = match.group(0)
+        grams = [run]
+        if len(run) >= 2:
+            grams.extend(run[index : index + 2] for index in range(len(run) - 1))
+        parts.append(" ".join(grams))
+        last = match.end()
+    if last < len(text):
+        parts.append(text[last:])
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+
+def _record_tags(record):
+    tags = record.get("tags", [])
+    return tags if isinstance(tags, list) else []
+
+
+def _record_to_db_values(item):
+    record = item["record"]
+    return {
+        "id": record["id"],
+        "type": record["type"],
+        "title": record["title"],
+        "content": record["content"],
+        "tags": json.dumps(_record_tags(record), ensure_ascii=False, separators=(",", ":")),
+        "status": record["status"],
+        "scope": record["scope"],
+        "workspace": record["workspace"],
+        "confidentiality": record["confidentiality"],
+        "source": record["source"],
+        "confidence": record["confidence"],
+        "context_id": record.get("context_id"),
+        "project": record.get("project"),
+        "valid_from": record.get("valid_from"),
+        "valid_until": record.get("valid_until"),
+        "created": record["created"],
+        "updated": record["updated"],
+        "relative_path": item["relative_path"],
+        "sha256": item["sha256"],
+    }
+
+
+def _fts_values(item):
+    record = item["record"]
+    return (
+        record["id"],
+        normalize_fts_text(record["title"]),
+        normalize_fts_text(record["content"]),
+        normalize_fts_text(" ".join(_record_tags(record))),
+    )
+
+
+def _current_index_items(root, records):
+    items = []
+    for item in records:
+        path = item["path"]
+        raw = path.read_bytes()
+        items.append(
+            {
+                "relative_path": item["relative_path"],
+                "record": item["record"],
+                "path": path,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "mtime_ns": path.stat().st_mtime_ns,
+            }
+        )
+    return sorted(items, key=lambda value: value["relative_path"])
+
+
+def _database_index_state(conn):
+    memories = [
+        dict(zip(MEMORIES_COLUMNS, row))
+        for row in conn.execute("SELECT " + ", ".join(MEMORIES_COLUMNS) + " FROM memories")
+    ]
+    index_state = {
+        row[0]: {"sha256": row[1], "mtime_ns": row[2], "indexed_at": row[3]}
+        for row in conn.execute("SELECT relative_path, sha256, mtime_ns, indexed_at FROM index_state")
+    }
+    fts_counts = {
+        row[0]: row[1]
+        for row in conn.execute("SELECT id, COUNT(*) FROM memory_fts GROUP BY id")
+    }
+    return {
+        "memories_by_id": {row["id"]: row for row in memories},
+        "memories_by_path": {row["relative_path"]: row for row in memories},
+        "index_state": index_state,
+        "fts_counts": fts_counts,
+    }
+
+
+def plan_index_changes(conn, items):
+    state = _database_index_state(conn)
+    current_paths = {item["relative_path"] for item in items}
+    current_ids = {item["record"]["id"] for item in items}
+    added = []
+    updated = []
+    unchanged = []
+    deleted = []
+
+    for relative_path in sorted(set(state["index_state"]) - current_paths):
+        old = state["memories_by_path"].get(relative_path)
+        if old and old["id"] in current_ids:
+            continue
+        deleted.append({"relative_path": relative_path, "id": old["id"] if old else None})
+
+    for item in items:
+        memory_id = item["record"]["id"]
+        relative_path = item["relative_path"]
+        state_row = state["index_state"].get(relative_path)
+        memory_row = state["memories_by_id"].get(memory_id)
+        path_row = state["memories_by_path"].get(relative_path)
+        fts_count = state["fts_counts"].get(memory_id, 0)
+
+        if (
+            state_row
+            and state_row["sha256"] == item["sha256"]
+            and memory_row
+            and memory_row["relative_path"] == relative_path
+            and path_row
+            and path_row["id"] == memory_id
+            and fts_count == 1
+        ):
+            unchanged.append(item)
+        elif not state_row and memory_id not in state["memories_by_id"] and not path_row:
+            added.append(item)
+        else:
+            updated.append(item)
+
+    return {
+        "added": added,
+        "updated": updated,
+        "deleted": deleted,
+        "unchanged": unchanged,
+        "state": state,
+    }
+
+
+def _upsert_memory(conn, item, indexed_at):
+    values = _record_to_db_values(item)
+    columns = MEMORIES_COLUMNS
+    placeholders = ", ".join("?" for _ in columns)
+    updates = ", ".join(f"{column} = excluded.{column}" for column in columns if column != "id")
+    conn.execute(
+        f"""
+        INSERT INTO memories ({", ".join(columns)})
+        VALUES ({placeholders})
+        ON CONFLICT(id) DO UPDATE SET {updates}
+        """,
+        tuple(values[column] for column in columns),
+    )
+    conn.execute(
+        "INSERT INTO memory_fts(id, title, content, tags) VALUES (?, ?, ?, ?)",
+        _fts_values(item),
+    )
+    conn.execute(
+        """
+        INSERT INTO index_state(relative_path, sha256, mtime_ns, indexed_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(relative_path) DO UPDATE SET
+            sha256 = excluded.sha256,
+            mtime_ns = excluded.mtime_ns,
+            indexed_at = excluded.indexed_at
+        """,
+        (item["relative_path"], item["sha256"], item["mtime_ns"], indexed_at),
+    )
+
+
+def check_index_consistency(conn, expected_count):
+    counts = {
+        "memories": conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0],
+        "index_state": conn.execute("SELECT COUNT(*) FROM index_state").fetchone()[0],
+        "fts_distinct": conn.execute("SELECT COUNT(DISTINCT id) FROM memory_fts").fetchone()[0],
+    }
+    if any(value != expected_count for value in counts.values()):
+        raise ValueError("SQLite index consistency check failed.")
+    if conn.execute("SELECT id FROM memory_fts GROUP BY id HAVING COUNT(*) > 1").fetchone():
+        raise ValueError("SQLite index consistency check failed.")
+    if conn.execute(
+        """
+        SELECT memories.relative_path
+        FROM memories
+        LEFT JOIN index_state USING(relative_path)
+        WHERE index_state.relative_path IS NULL
+        """
+    ).fetchone():
+        raise ValueError("SQLite index consistency check failed.")
+    if conn.execute(
+        """
+        SELECT index_state.relative_path
+        FROM index_state
+        LEFT JOIN memories USING(relative_path)
+        WHERE memories.relative_path IS NULL
+        """
+    ).fetchone():
+        raise ValueError("SQLite index consistency check failed.")
+    if conn.execute(
+        """
+        SELECT memories.id
+        FROM memories
+        LEFT JOIN memory_fts ON memory_fts.id = memories.id
+        WHERE memory_fts.id IS NULL
+        """
+    ).fetchone():
+        raise ValueError("SQLite index consistency check failed.")
+
+
+def apply_index_changes(conn, plan, expected_count):
+    indexed_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    for item in plan["deleted"]:
+        if item["id"]:
+            conn.execute("DELETE FROM memory_fts WHERE id = ?", (item["id"],))
+            conn.execute("DELETE FROM memories WHERE id = ?", (item["id"],))
+        conn.execute("DELETE FROM memories WHERE relative_path = ?", (item["relative_path"],))
+        conn.execute("DELETE FROM index_state WHERE relative_path = ?", (item["relative_path"],))
+
+    for item in plan["added"] + plan["updated"]:
+        memory_id = item["record"]["id"]
+        old = plan["state"]["memories_by_id"].get(memory_id)
+        if old and old["relative_path"] != item["relative_path"]:
+            conn.execute("DELETE FROM index_state WHERE relative_path = ?", (old["relative_path"],))
+        conflicts = conn.execute(
+            "SELECT id FROM memories WHERE relative_path = ? AND id != ?",
+            (item["relative_path"], memory_id),
+        ).fetchall()
+        for (conflict_id,) in conflicts:
+            conn.execute("DELETE FROM memory_fts WHERE id = ?", (conflict_id,))
+            conn.execute("DELETE FROM memories WHERE id = ?", (conflict_id,))
+        conn.execute("DELETE FROM memory_fts WHERE id = ?", (memory_id,))
+        _upsert_memory(conn, item, indexed_at)
+
+    check_index_consistency(conn, expected_count)
+
+
+def index_store(args):
+    root, records, errors, _ = collect_validated_records(args.root)
+    if errors:
+        messages = [f"ERROR {rel_path}: {message}" for rel_path, message in errors]
+        raise ValueError("\n".join(messages + ["Index aborted because validation failed."]))
+
+    state_dir = args.state_dir if args.state_dir else default_state_dir()
+    state, db = check_state_dir(root, state_dir)
+    if not db.exists():
+        raise ValueError("Database is not initialized. Run db-init first.")
+    summary = inspect_database(db)
+    if not summary["initialized"]:
+        raise ValueError("Database is not initialized. Run db-init first.")
+
+    items = _current_index_items(root, records)
+    with sqlite3.connect(db) as conn:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        plan = plan_index_changes(conn, items)
+        result = {
+            "added": len(plan["added"]),
+            "updated": len(plan["updated"]),
+            "deleted": len(plan["deleted"]),
+            "unchanged": len(plan["unchanged"]),
+            "database": db,
+            "dry_run": args.dry_run,
+        }
+        if args.dry_run:
+            return result
+        try:
+            conn.execute("BEGIN")
+            apply_index_changes(conn, plan, len(items))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    checkpoint_database(db)
+    return result
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Manage file-based research memory.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1255,6 +1535,15 @@ def build_parser():
         default=str(default_state_dir()),
         help="Local state directory for memory.sqlite.",
     )
+
+    index_parser = subparsers.add_parser("index", help="Incrementally index memory files into SQLite.")
+    index_parser.add_argument("--root", required=True, help="Initialized data root.")
+    index_parser.add_argument(
+        "--state-dir",
+        default=str(default_state_dir()),
+        help="Local state directory for memory.sqlite.",
+    )
+    index_parser.add_argument("--dry-run", action="store_true")
 
     export_parser = subparsers.add_parser("export", help="Export memory records.")
     export_parser.add_argument("--root", required=True, help="Initialized data root.")
@@ -1315,6 +1604,21 @@ def main(argv=None):
             print(f"Schema version: {summary['version']}")
             print("FTS5: available")
             print("Tables: " + ", ".join(summary["tables"]))
+            return 0
+        if args.command == "index":
+            summary = index_store(args)
+            if summary["dry_run"]:
+                print("Dry run: no database changes")
+                print(f"Would add: {summary['added']}")
+                print(f"Would update: {summary['updated']}")
+                print(f"Would delete: {summary['deleted']}")
+            else:
+                print("Index complete")
+                print(f"Added: {summary['added']}")
+                print(f"Updated: {summary['updated']}")
+                print(f"Deleted: {summary['deleted']}")
+            print(f"Unchanged: {summary['unchanged']}")
+            print(f"Database: {summary['database']}")
             return 0
         if args.command == "export":
             summary, errors = export_store(args.root, args.include_internal)

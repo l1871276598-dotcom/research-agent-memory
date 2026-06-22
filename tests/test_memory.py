@@ -1454,6 +1454,352 @@ class DbInitCommandTests(unittest.TestCase):
             self.assertFalse([path.name for path in state_dir.iterdir() if path.name.startswith(".tmp-")])
 
 
+class IndexCommandTests(unittest.TestCase):
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(MEMORY_CLI), *args],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+
+    def run_init(self, root):
+        return self.run_cli("init", "--root", str(root))
+
+    def run_db_init(self, root, state_dir):
+        return self.run_cli("db-init", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_index(self, root, state_dir, *extra):
+        return self.run_cli("index", "--root", str(root), "--state-dir", str(state_dir), *extra)
+
+    def run_add(self, root, **kwargs):
+        args = [
+            "add",
+            "--root",
+            str(root),
+            "--type",
+            kwargs.pop("memory_type", "principle"),
+            "--title",
+            kwargs.pop("title", "代码最少原则"),
+            "--scope",
+            kwargs.pop("scope", "global"),
+            "--workspace",
+            kwargs.pop("workspace", "personal"),
+            "--confidentiality",
+            kwargs.pop("confidentiality", "personal"),
+            "--source",
+            "user",
+            "--confidence",
+            "confirmed",
+            "--content",
+            kwargs.pop("content", "使用尽可能少的代码实现相同功能。"),
+        ]
+        for option, value in kwargs.items():
+            flag = "--" + option.replace("_", "-")
+            if isinstance(value, list):
+                args.append(flag)
+                args.extend(value)
+            elif value is not None:
+                args.extend([flag, value])
+        return self.run_cli(*args)
+
+    def setup_store(self, tmp):
+        root = Path(tmp) / "data"
+        state_dir = Path(tmp) / "state"
+        self.assertEqual(self.run_init(root).returncode, 0)
+        self.assertEqual(self.run_db_init(root, state_dir).returncode, 0)
+        return root, state_dir, state_dir / "memory.sqlite"
+
+    def memory_files(self, root):
+        return sorted(path for path in (root / "memory").rglob("*.md") if path.is_file())
+
+    def counts(self, db):
+        with sqlite3.connect(db) as conn:
+            return {
+                "memories": conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0],
+                "memory_fts": conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0],
+                "index_state": conn.execute("SELECT COUNT(*) FROM index_state").fetchone()[0],
+            }
+
+    def rows(self, db, sql, params=()):
+        with sqlite3.connect(db) as conn:
+            return conn.execute(sql, params).fetchall()
+
+    def db_hash(self, db):
+        return hashlib.sha256(db.read_bytes()).hexdigest()
+
+    def replace_in_file(self, path, old, new):
+        text = path.read_text(encoding="utf-8")
+        self.assertIn(old, text)
+        path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+    def test_index_empty_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+
+            result = self.run_index(root, state_dir)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.counts(db), {"memories": 0, "memory_fts": 0, "index_state": 0})
+            self.assertIn("Added: 0", result.stdout)
+            self.assertIn("Unchanged: 0", result.stdout)
+
+    def test_index_adds_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root, tags=["coding"]).returncode, 0)
+
+            result = self.run_index(root, state_dir)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.counts(db), {"memories": 1, "memory_fts": 1, "index_state": 1})
+            self.assertIn("Added: 1", result.stdout)
+
+    def test_index_stores_original_memory_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            self.assertEqual(
+                self.run_add(root, tags=["coding", "architecture"], content="使用尽可能少的代码实现功能。").returncode,
+                0,
+            )
+
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            [(title, content, tags)] = self.rows(db, "SELECT title, content, tags FROM memories")
+            self.assertEqual(title, "代码最少原则")
+            self.assertEqual(content, "使用尽可能少的代码实现功能。")
+            self.assertEqual(json.loads(tags), ["coding", "architecture"])
+
+    def test_index_chinese_bigram_fts_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root).returncode, 0)
+
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            fts = self.rows(db, "SELECT id FROM memory_fts WHERE memory_fts MATCH ?", ("代码",))
+            [(title,)] = self.rows(db, "SELECT title FROM memories")
+            self.assertEqual(len(fts), 1)
+            self.assertEqual(title, "代码最少原则")
+
+    def test_index_english_fts_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root, title="Minimal Code Principle", content="Prefer simple code.").returncode, 0)
+
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            self.assertEqual(len(self.rows(db, "SELECT id FROM memory_fts WHERE memory_fts MATCH ?", ("simple",))), 1)
+
+    def test_index_is_incremental(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root).returncode, 0)
+
+            first = self.run_index(root, state_dir)
+            [(indexed_at,)] = self.rows(db, "SELECT indexed_at FROM index_state")
+            second = self.run_index(root, state_dir)
+            [(indexed_at_after,)] = self.rows(db, "SELECT indexed_at FROM index_state")
+
+            self.assertIn("Added: 1", first.stdout)
+            self.assertIn("Unchanged: 1", second.stdout)
+            self.assertEqual(indexed_at_after, indexed_at)
+
+    def test_index_updates_changed_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root).returncode, 0)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            path = self.memory_files(root)[0]
+            self.replace_in_file(path, "使用尽可能少的代码实现相同功能。", "使用简单代码完成当前功能。")
+
+            result = self.run_index(root, state_dir)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Updated: 1", result.stdout)
+            [(content,)] = self.rows(db, "SELECT content FROM memories")
+            self.assertEqual(content, "使用简单代码完成当前功能。")
+            self.assertEqual(self.rows(db, "SELECT id, COUNT(*) FROM memory_fts GROUP BY id HAVING COUNT(*) > 1"), [])
+
+    def test_index_deletes_removed_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root).returncode, 0)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            self.memory_files(root)[0].unlink()
+
+            result = self.run_index(root, state_dir)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Deleted: 1", result.stdout)
+            self.assertEqual(self.counts(db), {"memories": 0, "memory_fts": 0, "index_state": 0})
+
+    def test_index_repairs_missing_fts_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root).returncode, 0)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            with sqlite3.connect(db) as conn:
+                conn.execute("DELETE FROM memory_fts")
+
+            result = self.run_index(root, state_dir)
+
+            self.assertIn("Updated: 1", result.stdout)
+            self.assertEqual(self.counts(db)["memory_fts"], 1)
+
+    def test_index_repairs_missing_memory_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root).returncode, 0)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            with sqlite3.connect(db) as conn:
+                conn.execute("DELETE FROM memories")
+
+            result = self.run_index(root, state_dir)
+
+            self.assertIn("Updated: 1", result.stdout)
+            self.assertEqual(self.counts(db), {"memories": 1, "memory_fts": 1, "index_state": 1})
+
+    def test_index_handles_path_change_for_same_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root).returncode, 0)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            old_path = self.memory_files(root)[0]
+            memory_id = old_path.name.split("-", 2)[0] + "-" + old_path.name.split("-", 2)[1] + "-" + old_path.name.split("-", 2)[2].split("-", 1)[0]
+            new_path = old_path.with_name(f"{memory_id}-renamed.md")
+            old_relative = old_path.relative_to(root).as_posix()
+            old_path.rename(new_path)
+
+            result = self.run_index(root, state_dir)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            [(relative_path,)] = self.rows(db, "SELECT relative_path FROM memories")
+            self.assertEqual(relative_path, new_path.relative_to(root).as_posix())
+            self.assertEqual(self.rows(db, "SELECT relative_path FROM index_state WHERE relative_path = ?", (old_relative,)), [])
+            self.assertEqual(self.rows(db, "SELECT id, COUNT(*) FROM memory_fts GROUP BY id"), [(memory_id, 1)])
+
+    def test_index_dry_run_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root).returncode, 0)
+            before = self.db_hash(db)
+
+            result = self.run_index(root, state_dir, "--dry-run")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Dry run: no database changes", result.stdout)
+            self.assertEqual(self.db_hash(db), before)
+            self.assertEqual(self.counts(db), {"memories": 0, "memory_fts": 0, "index_state": 0})
+
+    def test_index_rejects_invalid_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root).returncode, 0)
+            path = self.memory_files(root)[0]
+            self.replace_in_file(path, 'title: "代码最少原则"\n', "")
+            before = self.db_hash(db)
+
+            result = self.run_index(root, state_dir)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Index aborted because validation failed.", result.stderr)
+            self.assertEqual(self.db_hash(db), before)
+
+    def test_index_requires_initialized_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            self.assertEqual(self.run_init(root).returncode, 0)
+
+            result = self.run_index(root, state_dir)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Database is not initialized. Run db-init first.", result.stderr)
+            self.assertFalse(state_dir.exists())
+
+    def test_index_indexes_internal_and_restricted_locally(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root, title="内部原则", workspace="work", confidentiality="internal").returncode, 0)
+            self.assertEqual(self.run_add(root, title="受限原则", workspace="work", confidentiality="restricted").returncode, 0)
+
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            self.assertEqual(self.counts(db), {"memories": 2, "memory_fts": 2, "index_state": 2})
+            self.assertEqual(set(self.rows(db, "SELECT confidentiality FROM memories")), {("internal",), ("restricted",)})
+
+    def test_index_does_not_modify_source_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root).returncode, 0)
+            before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in self.memory_files(root)}
+
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            after = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in self.memory_files(root)}
+            self.assertEqual(after, before)
+
+    def test_index_transaction_rolls_back_on_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_memory_module()
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            module.init_store(root)
+            add_args = mock.Mock(
+                root=str(root),
+                type="principle",
+                title="代码最少原则",
+                scope="global",
+                workspace="personal",
+                confidentiality="personal",
+                source="user",
+                confidence="confirmed",
+                content="使用尽可能少的代码实现功能。",
+                status="active",
+                context_id=None,
+                project=None,
+                valid_from=None,
+                valid_until=None,
+                tags=[],
+                from_context=None,
+                to_context=None,
+                effective_date=None,
+                reason=None,
+            )
+            module.add_memory(add_args)
+            module.db_init(mock.Mock(root=str(root), state_dir=str(state_dir)))
+            args = mock.Mock(root=str(root), state_dir=str(state_dir), dry_run=False)
+
+            with mock.patch.object(module, "check_index_consistency", side_effect=ValueError("forced failure")):
+                with self.assertRaisesRegex(ValueError, "forced failure"):
+                    module.index_store(args)
+            self.assertEqual(self.counts(state_dir / "memory.sqlite"), {"memories": 0, "memory_fts": 0, "index_state": 0})
+
+    def test_index_leaves_no_duplicate_fts_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root).returncode, 0)
+            for text in ["使用简单代码完成当前功能。", "继续使用简单代码。"]:
+                self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+                path = self.memory_files(root)[0]
+                old_content = re.search(r"content: \|-\n  .+", path.read_text(encoding="utf-8")).group(0)
+                self.replace_in_file(path, old_content, f"content: |-\n  {text}")
+
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            self.assertEqual(self.rows(db, "SELECT id, COUNT(*) FROM memory_fts GROUP BY id HAVING COUNT(*) > 1"), [])
+
+    def test_index_leaves_no_wal_or_shm_after_close(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root).returncode, 0)
+
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            self.assertEqual(sorted(path.name for path in state_dir.iterdir()), ["memory.sqlite"])
+
+
 class ExportCommandTests(unittest.TestCase):
     def run_cli(self, *args):
         return subprocess.run(
