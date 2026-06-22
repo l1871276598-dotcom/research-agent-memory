@@ -92,11 +92,11 @@ class MemoryToolsTests(unittest.TestCase):
                 self.assertEqual(TOOLS.search(args), 1)
             self.assertEqual(json.loads(output.getvalue())[0]["id"], "principle-1")
 
-    def sample_export(self, path):
+    def sample_export(self, path, title="测试 对话"):
         conversations = [
             {
                 "id": "conversation-1",
-                "title": "测试 对话",
+                "title": title,
                 "create_time": 1710000000,
                 "update_time": 1710000300,
                 "current_node": "a2",
@@ -139,9 +139,15 @@ class MemoryToolsTests(unittest.TestCase):
             with redirect_stdout(second):
                 TOOLS.import_chatgpt(args)
             self.assertIn("Unchanged: 1", second.getvalue())
+            self.sample_export(export, title="重命名对话")
+            changed = StringIO()
+            with redirect_stdout(changed):
+                TOOLS.import_chatgpt(args)
+            self.assertIn("Updated: 1", changed.getvalue())
             files = list((root / "imports/chatgpt/conversations").rglob("*.md"))
             self.assertEqual(len(files), 1)
             text = files[0].read_text(encoding="utf-8")
+            self.assertIn("# 重命名对话", text)
             self.assertIn("## User", text)
             self.assertIn("## Assistant", text)
 
