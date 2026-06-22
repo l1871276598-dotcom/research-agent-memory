@@ -8,16 +8,16 @@
   },
   "phase_1": {
     "name": "文件型基础记忆库",
-    "status": "active",
+    "status": "completed",
     "label": "v0.1-memory-files",
     "prerequisites": [
       "phase_0"
     ],
-    "acceptance_document": "docs/phase_1_acceptance.md"
+    "acceptance_document": "docs/phase_1_data_acceptance.md"
   },
   "phase_2": {
     "name": "SQLite FTS5 精确检索",
-    "status": "locked",
+    "status": "unlocked",
     "label": "v0.2-fts-search",
     "prerequisites": [
       "phase_1"
