@@ -1,0 +1,63 @@
+{
+  "phase_0": {
+    "name": "仓库初始化和执行约束",
+    "status": "completed",
+    "label": "v0.0-repository-bootstrap",
+    "prerequisites": [],
+    "acceptance_document": "docs/phase_0_acceptance.md"
+  },
+  "phase_1": {
+    "name": "文件型基础记忆库",
+    "status": "unlocked",
+    "label": "v0.1-memory-files",
+    "prerequisites": [
+      "phase_0"
+    ],
+    "acceptance_document": "docs/phase_1_acceptance.md"
+  },
+  "phase_2": {
+    "name": "SQLite FTS5 精确检索",
+    "status": "locked",
+    "label": "v0.2-fts-search",
+    "prerequisites": [
+      "phase_1"
+    ],
+    "acceptance_document": "docs/phase_2_acceptance.md"
+  },
+  "phase_3": {
+    "name": "Ollama 和 Chroma 语义检索",
+    "status": "locked",
+    "label": "v0.3-semantic-search",
+    "prerequisites": [
+      "phase_2"
+    ],
+    "acceptance_document": "docs/phase_3_acceptance.md"
+  },
+  "phase_4": {
+    "name": "MCP 统一接口",
+    "status": "locked",
+    "label": "v0.4-mcp-memory",
+    "prerequisites": [
+      "phase_3"
+    ],
+    "acceptance_document": "docs/phase_4_acceptance.md"
+  },
+  "phase_5": {
+    "name": "期刊和文献自动化",
+    "status": "locked",
+    "label": "v0.5-literature-pipeline",
+    "prerequisites": [
+      "phase_4"
+    ],
+    "acceptance_document": "docs/phase_5_acceptance.md"
+  },
+  "phase_6": {
+    "name": "接入论文工作流与规则型总控 Agent",
+    "status": "locked",
+    "label": "v0.6-agent-integration",
+    "prerequisites": [
+      "phase_5"
+    ],
+    "acceptance_document": "docs/phase_6_acceptance.md"
+  }
+}
