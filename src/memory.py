@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import sys
 import uuid
 from datetime import date, timedelta
@@ -103,6 +104,37 @@ FILES = {
         "id,doi,title,authors,journal,year,status,pdf_path,note_path,project,tags\n"
     ),
 }
+DB_NAME = "memory.sqlite"
+DB_SCHEMA_VERSION = 1
+STATE_DIR_ERROR = "SQLite state directory must be local and outside iCloud and the code repository."
+MEMORIES_COLUMNS = [
+    "id",
+    "type",
+    "title",
+    "content",
+    "tags",
+    "status",
+    "scope",
+    "workspace",
+    "confidentiality",
+    "source",
+    "confidence",
+    "context_id",
+    "project",
+    "valid_from",
+    "valid_until",
+    "created",
+    "updated",
+    "relative_path",
+    "sha256",
+]
+INDEX_STATE_COLUMNS = ["relative_path", "sha256", "mtime_ns", "indexed_at"]
+REQUIRED_INDEXES = {
+    "idx_memories_type",
+    "idx_memories_project",
+    "idx_memories_context",
+    "idx_memories_workspace_status",
+}
 
 
 def _repository_root():
@@ -110,6 +142,22 @@ def _repository_root():
         if (path / ".git").exists():
             return path
     return None
+
+
+def _icloud_root():
+    return Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs"
+
+
+def default_state_dir():
+    return Path.home() / "Library" / "Application Support" / "ResearchAgent"
+
+
+def _contains_or_equals(parent, child):
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
 
 
 def init_store(root):
@@ -939,6 +987,237 @@ def context_transition(args):
     return summary
 
 
+def check_fts5():
+    try:
+        with sqlite3.connect(":memory:") as conn:
+            conn.execute("CREATE VIRTUAL TABLE temp.fts5_probe USING fts5(content)")
+    except sqlite3.DatabaseError as exc:
+        raise ValueError("SQLite FTS5 is not available in this Python build.") from exc
+
+
+def resolve_state_dir(value):
+    return Path(value).expanduser().resolve(strict=False)
+
+
+def check_state_dir(root, state_dir):
+    raw_state = Path(state_dir).expanduser()
+    if raw_state.exists() and (raw_state.is_symlink() or not raw_state.is_dir()):
+        raise ValueError(STATE_DIR_ERROR)
+
+    root = Path(root).expanduser().resolve(strict=True)
+    state = raw_state.resolve(strict=False)
+    repo_root = _repository_root()
+    icloud = _icloud_root().expanduser().resolve(strict=False)
+
+    if (
+        state == root
+        or _contains_or_equals(root, state)
+        or _contains_or_equals(state, root)
+        or (repo_root is not None and _contains_or_equals(repo_root.resolve(), state))
+        or _contains_or_equals(icloud, state)
+    ):
+        raise ValueError(STATE_DIR_ERROR)
+
+    db = state / DB_NAME
+    if db.is_symlink():
+        raise ValueError(STATE_DIR_ERROR)
+    return state, db
+
+
+def _configure_sqlite(conn):
+    conn.execute("PRAGMA foreign_keys = ON")
+    mode = conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+    if str(mode).lower() != "wal":
+        raise ValueError("SQLite journal_mode WAL could not be enabled.")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
+
+
+def _create_schema(conn):
+    conn.executescript(
+        """
+        CREATE TABLE memories (
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            tags TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            workspace TEXT NOT NULL,
+            confidentiality TEXT NOT NULL,
+            source TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            context_id TEXT,
+            project TEXT,
+            valid_from TEXT,
+            valid_until TEXT,
+            created TEXT NOT NULL,
+            updated TEXT NOT NULL,
+            relative_path TEXT NOT NULL UNIQUE,
+            sha256 TEXT NOT NULL
+        );
+        CREATE INDEX idx_memories_type ON memories(type);
+        CREATE INDEX idx_memories_project ON memories(project);
+        CREATE INDEX idx_memories_context ON memories(context_id);
+        CREATE INDEX idx_memories_workspace_status
+            ON memories(workspace, status);
+        CREATE VIRTUAL TABLE memory_fts USING fts5(
+            id UNINDEXED,
+            title,
+            content,
+            tags,
+            tokenize = 'unicode61'
+        );
+        CREATE TABLE index_state (
+            relative_path TEXT PRIMARY KEY,
+            sha256 TEXT NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            indexed_at TEXT NOT NULL
+        );
+        PRAGMA user_version = 1;
+        """
+    )
+
+
+def _table_columns(conn, table):
+    return [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+
+
+def _target_tables(conn):
+    return {
+        name: (object_type, sql or "")
+        for name, object_type, sql in conn.execute(
+            """
+            SELECT name, type, sql
+            FROM sqlite_master
+            WHERE name IN ('memories', 'memory_fts', 'index_state')
+            """
+        )
+    }
+
+
+def inspect_database(db):
+    try:
+        with sqlite3.connect(db) as conn:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            tables = _target_tables(conn)
+            if version != DB_SCHEMA_VERSION:
+                if version == 0 and not tables:
+                    return {"initialized": False, "version": version}
+                raise ValueError("Incompatible SQLite schema version.")
+            if str(mode).lower() != "wal":
+                raise ValueError("SQLite journal_mode WAL could not be verified.")
+            if set(tables) != {"memories", "memory_fts", "index_state"}:
+                raise ValueError("SQLite schema is incomplete.")
+            if "CREATE VIRTUAL TABLE" not in tables["memory_fts"][1].upper():
+                raise ValueError("SQLite FTS5 table is missing.")
+            if _table_columns(conn, "memories") != MEMORIES_COLUMNS:
+                raise ValueError("SQLite memories table columns do not match.")
+            if _table_columns(conn, "index_state") != INDEX_STATE_COLUMNS:
+                raise ValueError("SQLite index_state table columns do not match.")
+            indexes = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_memories_%'"
+                )
+            }
+            if not REQUIRED_INDEXES.issubset(indexes):
+                raise ValueError("SQLite memories indexes are incomplete.")
+            return {"initialized": True, "version": version}
+    except sqlite3.DatabaseError as exc:
+        raise ValueError("Invalid SQLite database.") from exc
+
+
+def _checkpoint_and_close(conn):
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+
+
+def _remove_sqlite_sidecars(path):
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(path) + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+
+
+def checkpoint_database(db):
+    try:
+        with sqlite3.connect(db) as conn:
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.DatabaseError as exc:
+        raise ValueError("Invalid SQLite database.") from exc
+    _remove_sqlite_sidecars(db)
+
+
+def create_database(db):
+    tmp = db.parent / f".tmp-{DB_NAME}-{uuid.uuid4().hex}"
+    conn = None
+    try:
+        conn = sqlite3.connect(tmp)
+        _configure_sqlite(conn)
+        _create_schema(conn)
+        _checkpoint_and_close(conn)
+        conn = None
+        inspect_database(tmp)
+        tmp.replace(db)
+        _remove_sqlite_sidecars(tmp)
+        inspect_database(db)
+        _remove_sqlite_sidecars(db)
+    except Exception:
+        if conn is not None:
+            conn.close()
+        tmp.unlink(missing_ok=True)
+        _remove_sqlite_sidecars(tmp)
+        raise
+
+
+def initialize_empty_database(db):
+    try:
+        conn = sqlite3.connect(db)
+        _configure_sqlite(conn)
+        _create_schema(conn)
+        _checkpoint_and_close(conn)
+        inspect_database(db)
+    except sqlite3.DatabaseError as exc:
+        raise ValueError("Invalid SQLite database.") from exc
+
+
+def db_init(args):
+    root, _, errors, _ = collect_validated_records(args.root)
+    if errors:
+        messages = [f"ERROR {rel_path}: {message}" for rel_path, message in errors]
+        raise ValueError("\n".join(messages + ["Database initialization aborted because validation failed."]))
+
+    check_fts5()
+    state_dir = args.state_dir if args.state_dir else default_state_dir()
+    state, db = check_state_dir(root, state_dir)
+    already = False
+
+    if db.exists():
+        summary = inspect_database(db)
+        if summary["initialized"]:
+            checkpoint_database(db)
+            already = True
+        else:
+            initialize_empty_database(db)
+    else:
+        state.mkdir(parents=True, exist_ok=True)
+        create_database(db)
+
+    return {
+        "already": already,
+        "state_dir": state,
+        "database": db,
+        "version": DB_SCHEMA_VERSION,
+        "tables": ["memories", "memory_fts", "index_state"],
+    }
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Manage file-based research memory.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -968,6 +1247,14 @@ def build_parser():
 
     validate_parser = subparsers.add_parser("validate", help="Validate memory files.")
     validate_parser.add_argument("--root", required=True, help="Initialized data root.")
+
+    db_init_parser = subparsers.add_parser("db-init", help="Initialize the local SQLite FTS5 database.")
+    db_init_parser.add_argument("--root", required=True, help="Initialized data root.")
+    db_init_parser.add_argument(
+        "--state-dir",
+        default=str(default_state_dir()),
+        help="Local state directory for memory.sqlite.",
+    )
 
     export_parser = subparsers.add_parser("export", help="Export memory records.")
     export_parser.add_argument("--root", required=True, help="Initialized data root.")
@@ -1017,6 +1304,18 @@ def main(argv=None):
             print(f"Errors: {len(errors)}")
             print("Warnings: 0")
             return 1 if errors else 0
+        if args.command == "db-init":
+            summary = db_init(args)
+            if summary["already"]:
+                print("Database already initialized")
+            else:
+                print("Database initialized")
+            print(f"State directory: {summary['state_dir']}")
+            print(f"Database: {summary['database']}")
+            print(f"Schema version: {summary['version']}")
+            print("FTS5: available")
+            print("Tables: " + ", ".join(summary["tables"]))
+            return 0
         if args.command == "export":
             summary, errors = export_store(args.root, args.include_internal)
             if errors:

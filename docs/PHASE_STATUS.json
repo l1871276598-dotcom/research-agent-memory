@@ -17,7 +17,7 @@
   },
   "phase_2": {
     "name": "SQLite FTS5 精确检索",
-    "status": "unlocked",
+    "status": "active",
     "label": "v0.2-fts-search",
     "prerequisites": [
       "phase_1"

@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1086,6 +1087,371 @@ class ContextTransitionCommandTests(unittest.TestCase):
 
             self.assertEqual(self.hashes(root), before)
             self.assertFalse([name for name in self.all_names(root) if name.startswith(".tmp-")])
+
+
+class DbInitCommandTests(unittest.TestCase):
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(MEMORY_CLI), *args],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+
+    def run_init(self, root):
+        return self.run_cli("init", "--root", str(root))
+
+    def run_db_init(self, root, state_dir):
+        return self.run_cli("db-init", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_add(self, root):
+        return self.run_cli(
+            "add",
+            "--root",
+            str(root),
+            "--type",
+            "principle",
+            "--title",
+            "代码最少原则",
+            "--scope",
+            "global",
+            "--workspace",
+            "personal",
+            "--confidentiality",
+            "personal",
+            "--source",
+            "user",
+            "--confidence",
+            "confirmed",
+            "--content",
+            "使用尽可能少的代码实现相同功能。",
+        )
+
+    def db_path(self, state_dir):
+        return state_dir / "memory.sqlite"
+
+    def sqlite_objects(self, db):
+        with sqlite3.connect(db) as conn:
+            return dict(
+                conn.execute(
+                    """
+                    SELECT name, type
+                    FROM sqlite_master
+                    WHERE name IN ('memories', 'memory_fts', 'index_state')
+                    """
+                ).fetchall()
+            )
+
+    def columns(self, db, table):
+        with sqlite3.connect(db) as conn:
+            return [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+
+    def test_db_init_creates_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            self.assertEqual(self.run_init(root).returncode, 0)
+
+            result = self.run_db_init(root, state_dir)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(self.db_path(state_dir).is_file())
+            self.assertIn("Database initialized", result.stdout)
+
+    def test_db_init_creates_expected_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_db_init(root, state_dir).returncode, 0)
+            db = self.db_path(state_dir)
+
+            with sqlite3.connect(db) as conn:
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+                objects = self.sqlite_objects(db)
+                conn.execute(
+                    "INSERT INTO memory_fts(id, title, content, tags) VALUES (?, ?, ?, ?)",
+                    ("probe", "代码最少原则", "使用更少代码实现功能", '["coding"]'),
+                )
+                result = conn.execute(
+                    "SELECT id FROM memory_fts WHERE memory_fts MATCH ?",
+                    ("代码*",),
+                ).fetchall()
+
+            self.assertEqual(version, 1)
+            self.assertEqual(mode.lower(), "wal")
+            self.assertEqual(objects, {"memories": "table", "memory_fts": "table", "index_state": "table"})
+            self.assertEqual(
+                self.columns(db, "memories"),
+                [
+                    "id",
+                    "type",
+                    "title",
+                    "content",
+                    "tags",
+                    "status",
+                    "scope",
+                    "workspace",
+                    "confidentiality",
+                    "source",
+                    "confidence",
+                    "context_id",
+                    "project",
+                    "valid_from",
+                    "valid_until",
+                    "created",
+                    "updated",
+                    "relative_path",
+                    "sha256",
+                ],
+            )
+            self.assertEqual(
+                self.columns(db, "index_state"),
+                ["relative_path", "sha256", "mtime_ns", "indexed_at"],
+            )
+            self.assertEqual(result, [("probe",)])
+
+    def test_db_init_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            first = self.run_db_init(root, state_dir)
+            second = self.run_db_init(root, state_dir)
+
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertIn("Database already initialized", second.stdout)
+            self.assertEqual(self.sqlite_objects(self.db_path(state_dir))["memory_fts"], "table")
+
+    def test_db_init_creates_only_database_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            self.assertEqual(self.run_init(root).returncode, 0)
+
+            self.assertEqual(self.run_db_init(root, state_dir).returncode, 0)
+
+            self.assertEqual(sorted(path.name for path in state_dir.iterdir()), ["memory.sqlite"])
+
+    def test_db_init_rejects_uninitialized_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            root.mkdir()
+            state_dir = Path(tmp) / "state"
+
+            result = self.run_db_init(root, state_dir)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(state_dir.exists())
+
+    def test_db_init_rejects_invalid_memory_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add(root).returncode, 0)
+            memory_file = next((root / "memory").rglob("*.md"))
+            memory_file.write_text(
+                memory_file.read_text(encoding="utf-8").replace('title: "代码最少原则"\n', "", 1),
+                encoding="utf-8",
+            )
+
+            result = self.run_db_init(root, state_dir)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Database initialization aborted because validation failed.", result.stderr)
+            self.assertFalse(state_dir.exists())
+
+    def test_db_init_rejects_state_dir_inside_data_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            self.assertEqual(self.run_init(root).returncode, 0)
+
+            result = self.run_db_init(root, root / "state")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("SQLite state directory must be local", result.stderr)
+
+    def test_db_init_rejects_state_dir_equal_data_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            self.assertEqual(self.run_init(root).returncode, 0)
+
+            result = self.run_db_init(root, root)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("SQLite state directory must be local", result.stderr)
+
+    def test_db_init_rejects_data_root_inside_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            root = state_dir / "data"
+            self.assertEqual(self.run_init(root).returncode, 0)
+
+            result = self.run_db_init(root, state_dir)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(self.db_path(state_dir).exists())
+
+    def test_db_init_rejects_repository_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            self.assertEqual(self.run_init(root).returncode, 0)
+
+            result = self.run_db_init(root, REPO_ROOT)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("SQLite state directory must be local", result.stderr)
+
+    def test_db_init_rejects_repository_subdirectory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            self.assertEqual(self.run_init(root).returncode, 0)
+
+            result = self.run_db_init(root, REPO_ROOT / "state")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("SQLite state directory must be local", result.stderr)
+
+    def test_db_init_rejects_icloud_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_memory_module()
+            root = Path(tmp) / "data"
+            fake_icloud = Path(tmp) / "icloud"
+            state_dir = fake_icloud / "state"
+            module.init_store(root)
+            args = mock.Mock(root=str(root), state_dir=str(state_dir))
+
+            with mock.patch.object(module, "_icloud_root", return_value=fake_icloud.resolve()):
+                with self.assertRaisesRegex(ValueError, "SQLite state directory must be local"):
+                    module.db_init(args)
+            self.assertFalse(state_dir.exists())
+
+    def test_db_init_rejects_state_dir_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            target = Path(tmp) / "target"
+            state_dir = Path(tmp) / "state-link"
+            target.mkdir()
+            state_dir.symlink_to(target, target_is_directory=True)
+            self.assertEqual(self.run_init(root).returncode, 0)
+
+            result = self.run_db_init(root, state_dir)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(self.db_path(target).exists())
+
+    def test_db_init_rejects_database_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            target = Path(tmp) / "target.sqlite"
+            state_dir.mkdir()
+            target.write_text("", encoding="utf-8")
+            self.db_path(state_dir).symlink_to(target)
+            self.assertEqual(self.run_init(root).returncode, 0)
+
+            result = self.run_db_init(root, state_dir)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(target.read_text(encoding="utf-8"), "")
+
+    def test_db_init_rejects_incompatible_user_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir()
+            db = self.db_path(state_dir)
+            with sqlite3.connect(db) as conn:
+                conn.execute("PRAGMA user_version = 2")
+            before = db.read_bytes()
+            self.assertEqual(self.run_init(root).returncode, 0)
+
+            result = self.run_db_init(root, state_dir)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(db.read_bytes(), before)
+
+    def test_db_init_rejects_corrupt_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir()
+            db = self.db_path(state_dir)
+            db.write_text("not sqlite", encoding="utf-8")
+            self.assertEqual(self.run_init(root).returncode, 0)
+
+            result = self.run_db_init(root, state_dir)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(db.read_text(encoding="utf-8"), "not sqlite")
+
+    def test_db_init_preserves_existing_valid_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_db_init(root, state_dir).returncode, 0)
+            db = self.db_path(state_dir)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO memories (
+                        id, type, title, content, tags, status, scope, workspace,
+                        confidentiality, source, confidence, created, updated,
+                        relative_path, sha256
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "m1",
+                        "principle",
+                        "原则",
+                        "内容",
+                        "[]",
+                        "active",
+                        "global",
+                        "personal",
+                        "personal",
+                        "user",
+                        "confirmed",
+                        "2026-06-22",
+                        "2026-06-22",
+                        "memory/principles/m1.md",
+                        "abc",
+                    ),
+                )
+
+            result = self.run_db_init(root, state_dir)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            with sqlite3.connect(db) as conn:
+                rows = conn.execute("SELECT id FROM memories").fetchall()
+            self.assertEqual(rows, [("m1",)])
+
+    def test_db_init_handles_missing_fts5(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_memory_module()
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            module.init_store(root)
+            args = mock.Mock(root=str(root), state_dir=str(state_dir))
+
+            with mock.patch.object(module, "check_fts5", side_effect=ValueError("SQLite FTS5 is not available in this Python build.")):
+                with self.assertRaisesRegex(ValueError, "SQLite FTS5 is not available"):
+                    module.db_init(args)
+            self.assertFalse(self.db_path(state_dir).exists())
+
+    def test_db_init_leaves_no_temp_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            self.assertEqual(self.run_init(root).returncode, 0)
+
+            self.assertEqual(self.run_db_init(root, state_dir).returncode, 0)
+
+            self.assertFalse([path.name for path in state_dir.iterdir() if path.name.startswith(".tmp-")])
 
 
 class ExportCommandTests(unittest.TestCase):
