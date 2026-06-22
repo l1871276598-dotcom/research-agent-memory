@@ -180,7 +180,7 @@ def import_chatgpt(args):
         conversation_id = str(conversation.get("id") or conversation.get("conversation_id") or "unknown")
         title = (conversation.get("title") or "Untitled conversation").strip()
         stamp = datetime.fromtimestamp(conversation.get("create_time") or 0, timezone.utc)
-        relative = Path(f"{stamp.year:04d}/{stamp.month:02d}/{safe_slug(conversation_id)}-{safe_slug(title)}.md")
+        relative = Path(f"{stamp.year:04d}/{stamp.month:02d}/{safe_slug(conversation_id)}.md")
         target = output_root / relative
         content, message_count = _render_conversation(conversation)
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
