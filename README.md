@@ -38,12 +38,11 @@ python3 src/memory.py index --root PATH
 
 ### 轻量扩展命令
 
-为避免继续扩大核心 `memory.py`，检索和 ChatGPT 归档暂放在一个轻量入口中：
+为避免继续扩大核心 `memory.py`，检索和 ChatGPT 导入暂放在一个轻量入口中：
 
 ```bash
 python3 src/memory_tools.py search ...
 python3 src/memory_tools.py import-chatgpt ...
-python3 src/memory_tools.py serve-chatgpt ...
 ```
 
 已实现：
@@ -57,11 +56,8 @@ python3 src/memory_tools.py serve-chatgpt ...
 - 使用对话 ID 和内容哈希进行幂等更新
 - `--dry-run` 预演
 - 导入清单生成
-- 通过私有 GPT Action 接收当前对话上下文快照
-- Bearer token 鉴权、请求大小限制和仅 loopback 监听
-- 实时归档的幂等创建与更新
 
-ChatGPT 官方导入和实时归档都只负责原始对话档案，不会自动把每段对话晋升为长期记忆，也不会导入附件或所有分支版本。
+当前 ChatGPT 导入仅负责原始对话归档，不会自动把每段对话晋升为长期记忆，也不会导入附件或所有分支版本。
 
 ## 推荐目录
 
@@ -85,8 +81,7 @@ iCloud 数据目录
 
 Mac 本地运行目录
 └── ~/Library/Application Support/ResearchAgent/
-    ├── memory.sqlite
-    └── chatgpt_archive.token
+    └── memory.sqlite
 ```
 
 ## 快速开始
@@ -206,57 +201,14 @@ imports/chatgpt/import_manifest.json
 
 重复导入相同内容不会重复创建对话文件；对话内容发生变化时会更新原文件。
 
-## 实时归档当前 ChatGPT 对话
+当前限制：
 
-实时归档不依赖官方 ZIP。它使用私有 Custom GPT Action 将当前模型上下文中的可见 `user`/`assistant` 消息发送到 Mac。
-
-生成本地 token：
-
-```bash
-mkdir -p "$STATE_DIR"
-umask 077
-python3.13 -c 'import secrets; print(secrets.token_urlsafe(48))' \
-  > "$STATE_DIR/chatgpt_archive.token"
-```
-
-启动本地接收服务：
-
-```bash
-python3.13 src/memory_tools.py serve-chatgpt \
-  --root "$DATA_ROOT" \
-  --token-file "$STATE_DIR/chatgpt_archive.token"
-```
-
-服务只监听 `127.0.0.1`。通过 Tailscale Funnel 暴露 HTTPS 入口：
-
-```bash
-tailscale funnel --bg 8765
-tailscale funnel status
-```
-
-归档输出：
-
-```text
-imports/chatgpt/live/YYYY/MM/*.md
-```
-
-完整的 Custom GPT 指令、OpenAPI schema、安全要求和限制见：
-
-```text
-docs/chatgpt_live_archive.md
-```
-
-在普通 ChatGPT 对话中可通过 `@你的归档GPT 归档本次` 调用。写操作可能需要在 ChatGPT 中确认。
-
-实时归档的限制：
-
-- 仅保存模型当前可见上下文，不等同于账户级原始导出
-- 只接受可见 `user` 和 `assistant` 消息
-- 不接受 system、developer、tool 或隐藏消息
-- 默认不保证长对话的完整历史
-- Mac 必须在线、本地接收服务与 Funnel 必须运行
-- 官方 ZIP 仍是完整历史的权威归档来源
-- `imports/chatgpt/` 尚未纳入正式 SQLite 记忆索引
+- 只处理官方导出 ZIP 中的文本对话
+- 默认归档 `current_node` 对应的活动分支
+- 不导入图片、附件和语音文件
+- 不自动提取原则、决策或项目长期记忆
+- 原生 ChatGPT App 尚无实时自动同步接口
+- `imports/chatgpt/` 尚未纳入 SQLite 记忆索引
 
 ## 情景迁移
 
@@ -282,8 +234,7 @@ python3 src/memory.py context-transition \
 - `restricted` 永远不导出。
 - `internal` 和 `restricted` 必须属于 `work` workspace。
 - 密码、API key、SSH 私钥和其他凭证不得写入记忆库。
-- 原始 ChatGPT 导出 ZIP、真实记忆、PDF、SQLite 和归档 token 不得提交到 GitHub。
-- 实时接收服务必须只监听 loopback，并通过带 Bearer token 的 HTTPS 隧道访问。
+- 原始 ChatGPT 导出 ZIP、真实记忆、PDF 和 SQLite 不得提交到 GitHub。
 
 ## 自动测试
 
@@ -298,11 +249,10 @@ python3 -m compileall src
 
 ## 尚未实现
 
+- ChatGPT 对话实时同步
 - 对话自动提取并审核候选长期记忆
 - ChatGPT 附件导入
 - 将原始对话纳入统一搜索
-- 官方 ZIP 与实时快照自动对账
-- Mac 离线时的加密云队列
 - PDF 自动解析和文献矩阵自动填充
 - Zotero 或 EndNote 同步
 - Chroma、向量嵌入和语义检索
