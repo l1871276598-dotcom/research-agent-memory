@@ -8,7 +8,7 @@
   },
   "phase_1": {
     "name": "文件型基础记忆库",
-    "status": "unlocked",
+    "status": "active",
     "label": "v0.1-memory-files",
     "prerequisites": [
       "phase_0"
