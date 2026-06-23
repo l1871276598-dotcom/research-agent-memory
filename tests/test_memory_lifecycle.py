@@ -359,6 +359,47 @@ content: |-
         )
         path.chmod(0o755)
 
+    def test_run_uses_noninteractive_exec_for_real_codex_binary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task_dir = Path(tmp) / "task"
+            task_dir.mkdir()
+            source_hash = "abc123"
+            (task_dir / "task.json").write_text(
+                json.dumps({"source_id": "recent-manual-abc", "source_sha256": source_hash}),
+                encoding="utf-8",
+            )
+            (task_dir / "source.md").write_text("临时 recent 内容", encoding="utf-8")
+            (task_dir / "existing_memories.json").write_text("[]", encoding="utf-8")
+            (task_dir / "result_schema.json").write_text('{"schema":"distillation-result/v1"}', encoding="utf-8")
+            fake = Path(tmp) / "codex"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                "pathlib.Path('argv.json').write_text(json.dumps(sys.argv[1:]), encoding='utf-8')\n"
+                "if len(sys.argv) < 2 or sys.argv[1] != 'exec':\n"
+                "    sys.exit(7)\n"
+                "out = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+                "task = json.loads(pathlib.Path('task.json').read_text(encoding='utf-8'))\n"
+                "pathlib.Path(out).write_text(json.dumps({\n"
+                "    'schema': 'distillation-result/v1',\n"
+                "    'source_id': task['source_id'],\n"
+                "    'source_sha256': task['source_sha256'],\n"
+                "    'candidates': [],\n"
+                "    'unresolved_conflicts': []\n"
+                "}), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+
+            run = self.run_cli(DISTILL_CLI, "run", "--task-dir", str(task_dir), "--codex-bin", str(fake), "--timeout", "5", "--json")
+
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            argv = json.loads((task_dir / "argv.json").read_text(encoding="utf-8"))
+            self.assertEqual(argv[0], "exec")
+            self.assertIn("--skip-git-repo-check", argv)
+            self.assertIn("--ephemeral", argv)
+            self.assertIn("--output-last-message", argv)
+
     def test_prepare_run_apply_and_purge_keep_raw_and_delete_only_safe_recent(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "data"
