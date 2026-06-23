@@ -25,6 +25,17 @@ def load_memory_module():
     return module
 
 
+def load_distill_module():
+    spec = importlib.util.spec_from_file_location("memory_distill_module_for_lifecycle_tests", DISTILL_CLI)
+    module = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(DISTILL_CLI.parent))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
+    return module
+
+
 class LifecycleCommandTests(unittest.TestCase):
     def run_cli(self, script, *args):
         return subprocess.run(
@@ -399,6 +410,29 @@ content: |-
             self.assertIn("--skip-git-repo-check", argv)
             self.assertIn("--ephemeral", argv)
             self.assertIn("--output-last-message", argv)
+
+    def test_run_timeout_writes_text_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task_dir = Path(tmp) / "task"
+            task_dir.mkdir()
+            (task_dir / "task.json").write_text("{}", encoding="utf-8")
+            fake = Path(tmp) / "fake_timeout.py"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys, time\n"
+                "sys.stderr.write('starting slow codex\\n')\n"
+                "sys.stderr.flush()\n"
+                "time.sleep(5)\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            module = load_distill_module()
+
+            with self.assertRaisesRegex(ValueError, "timed out"):
+                module.run_task(type("Args", (), {"task_dir": str(task_dir), "codex_bin": str(fake), "timeout": 1})())
+
+            self.assertEqual((task_dir / "codex_exit_code.txt").read_text(encoding="utf-8"), "124\n")
+            self.assertIn("starting slow codex", (task_dir / "codex_stderr.log").read_text(encoding="utf-8"))
 
     def test_prepare_run_apply_and_purge_keep_raw_and_delete_only_safe_recent(self):
         with tempfile.TemporaryDirectory() as tmp:

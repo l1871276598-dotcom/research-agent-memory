@@ -134,6 +134,14 @@ def _codex_command(codex_bin, task_dir, result_path):
     ]
 
 
+def _process_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 def run_task(args):
     task_dir = Path(args.task_dir).resolve(strict=True)
     result_path = task_dir / "distillation_result.json"
@@ -150,8 +158,8 @@ def run_task(args):
     except subprocess.TimeoutExpired as exc:
         result = exc
         timed_out = True
-    stdout = getattr(result, "stdout", "") or ""
-    stderr = getattr(result, "stderr", "") or ""
+    stdout = _process_text(getattr(result, "stdout", None))
+    stderr = _process_text(getattr(result, "stderr", None))
     code = getattr(result, "returncode", 124 if timed_out else 1)
     (task_dir / "codex_stdout.log").write_text(stdout, encoding="utf-8")
     (task_dir / "codex_stderr.log").write_text(stderr, encoding="utf-8")
