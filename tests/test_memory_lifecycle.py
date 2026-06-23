@@ -410,6 +410,10 @@ content: |-
             self.assertIn("--skip-git-repo-check", argv)
             self.assertIn("--ephemeral", argv)
             self.assertIn("--output-last-message", argv)
+            prompt = argv[-1]
+            self.assertIn('"candidates"', prompt)
+            self.assertIn('"unresolved_conflicts"', prompt)
+            self.assertIn("Do not return a memories key", prompt)
 
     def test_run_timeout_writes_text_diagnostics(self):
         with tempfile.TemporaryDirectory() as tmp:
