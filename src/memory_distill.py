@@ -107,10 +107,36 @@ def prepare(args):
 def _codex_command(codex_bin, task_dir, result_path):
     if Path(codex_bin).name != "codex":
         return [codex_bin]
+    task = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
+    example = {
+        "schema": "distillation-result/v1",
+        "source_id": task["source_id"],
+        "source_sha256": task["source_sha256"],
+        "candidates": [
+            {
+                "action": "create",
+                "type": "principle",
+                "title": "Concise durable memory title",
+                "subject": "user",
+                "predicate": "prefers",
+                "object": "minimal reusable code",
+                "content": "One durable memory distilled from source.md.",
+                "evidence": "Short quote or paraphrase from source.md.",
+                "relations": [],
+            }
+        ],
+        "unresolved_conflicts": [],
+    }
     prompt = (
         "Distill this temporary research-agent-memory task. "
-        "Use only the data below. Return only a raw JSON object matching "
-        "distillation-result/v1; do not wrap it in Markdown.\n\n"
+        "Use only the data below. Return only a raw JSON object; do not wrap it in Markdown.\n\n"
+        "Required top-level keys are exactly: schema, source_id, source_sha256, candidates, unresolved_conflicts. "
+        "Use the key \"candidates\" for distilled memories. Do not return a memories key. "
+        "Each candidate action must be one of create, merge, support, supersede, conflict, discard. "
+        "For this validation source, create one principle candidate if the source contains a durable preference.\n\n"
+        "Required JSON shape:\n"
+        + json.dumps(example, ensure_ascii=False, indent=2)
+        + "\n\n"
         "task.json:\n"
         + (task_dir / "task.json").read_text(encoding="utf-8")
         + "\nsource.md:\n"
