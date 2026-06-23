@@ -347,9 +347,13 @@ def apply(args):
         return {"applied": len(created), "status": status, "delete_after": delete_after}
 
 
-def _source_raw_exists(root, record):
+def _source_raw_matches(root, record):
     source = record.get("source_path")
-    return bool(source) and (root / source).exists()
+    expected = record.get("source_sha256")
+    if not source or not expected:
+        return False
+    path = root / source
+    return path.is_file() and _sha(path) == expected
 
 
 def purge(args):
@@ -386,7 +390,7 @@ def purge(args):
                     conn.commit()
                 skipped += 1
                 continue
-            if not _source_raw_exists(root, record):
+            if not _source_raw_matches(root, record):
                 skipped += 1
                 continue
             if memory.validate_store(root)[1]:

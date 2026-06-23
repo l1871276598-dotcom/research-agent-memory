@@ -446,6 +446,40 @@ content: |-
             self.assertEqual(json.loads(missing_raw.stdout)["deleted"], 0)
             self.assertTrue(recent.exists())
 
+    def test_purge_refuses_when_raw_hash_changed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            self.init_store(root, state_dir)
+            recent, raw = self.add_recent_with_raw(root)
+            module = load_memory_module()
+            module.index_store(type("Args", (), {"root": str(root), "state_dir": str(state_dir), "dry_run": False})())
+            with sqlite3.connect(state_dir / "memory.sqlite") as conn:
+                conn.execute(
+                    """
+                    INSERT INTO distillation_audit(recent_id, relative_path, source_sha256, status, result_json, distilled_at, delete_after)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "recent-manual-abc",
+                        recent.relative_to(root).as_posix(),
+                        hashlib.sha256(recent.read_bytes()).hexdigest(),
+                        "pending_delete",
+                        "{}",
+                        date.today().isoformat(),
+                        date.today().isoformat(),
+                    ),
+                )
+                conn.commit()
+            raw.write_text("changed raw evidence", encoding="utf-8")
+
+            changed_raw = self.run_cli(DISTILL_CLI, "purge", "--root", str(root), "--state-dir", str(state_dir), "--today", date.today().isoformat(), "--json")
+
+            self.assertEqual(changed_raw.returncode, 0, changed_raw.stdout + changed_raw.stderr)
+            self.assertEqual(json.loads(changed_raw.stdout)["deleted"], 0)
+            self.assertTrue(recent.exists())
+            self.assertTrue(raw.exists())
+
     def test_purge_dry_run_reports_without_deleting_recent_or_updating_audit(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "data"
