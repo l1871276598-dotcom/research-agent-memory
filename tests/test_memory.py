@@ -479,7 +479,9 @@ class ValidateCommandTests(unittest.TestCase):
             self.assertEqual(self.run_init(root).returncode, 0)
             self.assertEqual(self.run_add(root).returncode, 0)
             path = self.first_memory_file(root)
-            self.replace_in_file(path, 'created: "2026-06-22"', 'created: "2026-02-30"')
+            text = path.read_text(encoding="utf-8")
+            created_line = re.search(r'^created: "\d{4}-\d{2}-\d{2}"$', text, re.MULTILINE).group(0)
+            self.replace_in_file(path, created_line, 'created: "2026-02-30"')
 
             result = self.run_validate(root)
 
@@ -1179,23 +1181,30 @@ class DbInitCommandTests(unittest.TestCase):
                     ("代码*",),
                 ).fetchall()
 
-            self.assertEqual(version, 1)
+            self.assertEqual(version, 2)
             self.assertEqual(mode.lower(), "wal")
             self.assertEqual(objects, {"memories": "table", "memory_fts": "table", "index_state": "table"})
             self.assertEqual(
                 self.columns(db, "memories"),
                 [
                     "id",
+                    "schema",
+                    "tier",
                     "type",
                     "title",
                     "content",
+                    "body",
                     "tags",
+                    "aliases",
                     "status",
                     "scope",
                     "workspace",
                     "confidentiality",
                     "source",
                     "confidence",
+                    "source_id",
+                    "source_path",
+                    "source_sha256",
                     "context_id",
                     "project",
                     "valid_from",
@@ -1204,6 +1213,7 @@ class DbInitCommandTests(unittest.TestCase):
                     "updated",
                     "relative_path",
                     "sha256",
+                    "metadata_json",
                 ],
             )
             self.assertEqual(
@@ -1798,6 +1808,367 @@ class IndexCommandTests(unittest.TestCase):
             self.assertEqual(self.run_index(root, state_dir).returncode, 0)
 
             self.assertEqual(sorted(path.name for path in state_dir.iterdir()), ["memory.sqlite"])
+
+
+class SearchCommandTests(unittest.TestCase):
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(MEMORY_CLI), *args],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+
+    def run_init(self, root):
+        return self.run_cli("init", "--root", str(root))
+
+    def run_db_init(self, root, state_dir):
+        return self.run_cli("db-init", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_index(self, root, state_dir):
+        return self.run_cli("index", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_search(self, root, state_dir, query, *extra):
+        return self.run_cli("search", query, "--root", str(root), "--state-dir", str(state_dir), *extra)
+
+    def run_add(self, root, **kwargs):
+        args = [
+            "add",
+            "--root",
+            str(root),
+            "--type",
+            kwargs.pop("memory_type", "principle"),
+            "--title",
+            kwargs.pop("title", "代码最少原则"),
+            "--scope",
+            kwargs.pop("scope", "global"),
+            "--workspace",
+            kwargs.pop("workspace", "personal"),
+            "--confidentiality",
+            kwargs.pop("confidentiality", "personal"),
+            "--source",
+            "user",
+            "--confidence",
+            "confirmed",
+            "--content",
+            kwargs.pop("content", "使用尽可能少的代码实现相同功能。"),
+            "--status",
+            kwargs.pop("status", "active"),
+        ]
+        for option, value in kwargs.items():
+            flag = "--" + option.replace("_", "-")
+            if isinstance(value, list):
+                args.append(flag)
+                args.extend(value)
+            elif value is not None:
+                args.extend([flag, value])
+        return self.run_cli(*args)
+
+    def setup_store(self, tmp, index=True):
+        root = Path(tmp) / "data"
+        state_dir = Path(tmp) / "state"
+        self.assertEqual(self.run_init(root).returncode, 0)
+        self.assertEqual(self.run_db_init(root, state_dir).returncode, 0)
+        if index:
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+        return root, state_dir, state_dir / "memory.sqlite"
+
+    def setup_one_memory(self, tmp, **kwargs):
+        root, state_dir, db = self.setup_store(tmp, index=False)
+        self.assertEqual(self.run_add(root, **kwargs).returncode, 0)
+        self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+        return root, state_dir, db
+
+    def memory_files(self, root):
+        return sorted(path for path in (root / "memory").rglob("*.md") if path.is_file())
+
+    def db_hash(self, db):
+        return hashlib.sha256(db.read_bytes()).hexdigest()
+
+    def db_sidecars(self, db):
+        return [Path(str(db) + suffix) for suffix in ("-wal", "-shm")]
+
+    def source_hashes(self, root):
+        return {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in self.memory_files(root)}
+
+    def replace_in_file(self, path, old, new):
+        text = path.read_text(encoding="utf-8")
+        self.assertIn(old, text)
+        path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+    def json_search(self, root, state_dir, query, *extra):
+        result = self.run_search(root, state_dir, query, "--json", *extra)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return json.loads(result.stdout), result.stdout
+
+    def test_search_finds_chinese_term(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_one_memory(tmp)
+            result = self.run_search(root, state_dir, "代码")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Results: 1", result.stdout)
+            self.assertIn("代码最少原则", result.stdout)
+
+    def test_search_finds_long_chinese_query(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_one_memory(tmp)
+            result = self.run_search(root, state_dir, "代码最少原则")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Results: 1", result.stdout)
+
+    def test_search_rejects_single_chinese_character(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_one_memory(tmp)
+            before = self.db_hash(db)
+            result = self.run_search(root, state_dir, "代")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Chinese search terms must contain at least 2 consecutive characters.", result.stderr)
+            self.assertEqual(self.db_hash(db), before)
+
+    def test_search_finds_english_term(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_one_memory(tmp, title="Minimal Code Principle", content="Prefer simple code.")
+            result = self.run_search(root, state_dir, "simple")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Minimal Code Principle", result.stdout)
+
+    def test_search_returns_zero_for_no_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_one_memory(tmp)
+            result = self.run_search(root, state_dir, "不存在")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.strip(), "Results: 0")
+
+    def test_search_default_workspace_is_personal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp, index=False)
+            self.assertEqual(self.run_add(root, title="个人代码原则").returncode, 0)
+            self.assertEqual(self.run_add(root, title="工作代码原则", workspace="work", confidentiality="internal").returncode, 0)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            result = self.run_search(root, state_dir, "代码")
+            self.assertIn("个人代码原则", result.stdout)
+            self.assertNotIn("工作代码原则", result.stdout)
+
+    def test_search_work_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_one_memory(tmp, title="工作代码原则", workspace="work", confidentiality="internal")
+            result = self.run_search(root, state_dir, "代码", "--workspace", "work")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("工作代码原则", result.stdout)
+
+    def test_search_excludes_restricted_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_one_memory(tmp, title="受限代码原则", workspace="work", confidentiality="restricted")
+            result = self.run_search(root, state_dir, "代码", "--workspace", "work")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.strip(), "Results: 0")
+
+    def test_search_includes_restricted_when_explicit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_one_memory(tmp, title="受限代码原则", workspace="work", confidentiality="restricted")
+            result = self.run_search(root, state_dir, "代码", "--workspace", "work", "--include-restricted")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("受限代码原则", result.stdout)
+
+    def test_search_rejects_restricted_in_personal_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            result = self.run_search(root, state_dir, "代码", "--include-restricted")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--include-restricted requires --workspace work", result.stderr)
+
+    def test_search_filters_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp, index=False)
+            self.assertEqual(self.run_add(root, title="原则代码", memory_type="principle").returncode, 0)
+            self.assertEqual(self.run_add(root, title="会话代码", memory_type="session", scope="project", project="demo").returncode, 0)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            result = self.run_search(root, state_dir, "代码", "--type", "session")
+            self.assertIn("会话代码", result.stdout)
+            self.assertNotIn("原则代码", result.stdout)
+
+    def test_search_filters_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp, index=False)
+            self.assertEqual(self.run_add(root, title="Alpha 代码", memory_type="session", scope="project", project="alpha").returncode, 0)
+            self.assertEqual(self.run_add(root, title="Beta 代码", memory_type="session", scope="project", project="beta").returncode, 0)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            result = self.run_search(root, state_dir, "代码", "--project", "alpha")
+            self.assertIn("Alpha 代码", result.stdout)
+            self.assertNotIn("Beta 代码", result.stdout)
+
+    def test_search_filters_context_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_one_memory(tmp, title="情景代码", memory_type="context", scope="context", context_id="ctx-a")
+            result = self.run_search(root, state_dir, "代码", "--context-id", "ctx-a")
+            self.assertIn("情景代码", result.stdout)
+
+    def test_search_default_status_is_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp, index=False)
+            self.assertEqual(self.run_add(root, title="Active 代码").returncode, 0)
+            self.assertEqual(self.run_add(root, title="Historical 代码", status="historical").returncode, 0)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            result = self.run_search(root, state_dir, "代码")
+            self.assertIn("Active 代码", result.stdout)
+            self.assertNotIn("Historical 代码", result.stdout)
+
+    def test_search_include_historical(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp, index=False)
+            self.assertEqual(self.run_add(root, title="Active 代码").returncode, 0)
+            self.assertEqual(self.run_add(root, title="Historical 代码", status="historical").returncode, 0)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            result = self.run_search(root, state_dir, "代码", "--include-historical")
+            self.assertIn("Active 代码", result.stdout)
+            self.assertIn("Historical 代码", result.stdout)
+
+    def test_search_explicit_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_one_memory(tmp, title="Archived 代码", status="archived")
+            result = self.run_search(root, state_dir, "代码", "--status", "archived")
+            self.assertIn("Archived 代码", result.stdout)
+
+    def test_search_respects_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp, index=False)
+            for title in ["A 代码", "B 代码", "C 代码"]:
+                self.assertEqual(self.run_add(root, title=title).returncode, 0)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            data, _ = self.json_search(root, state_dir, "代码", "--limit", "2")
+            self.assertEqual(data["count"], 2)
+            self.assertEqual([row["id"] for row in data["results"]], sorted(row["id"] for row in data["results"]))
+
+    def test_search_rejects_invalid_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            for value in ["0", "101", "not-int"]:
+                result = self.run_search(root, state_dir, "代码", "--limit", value)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_search_json_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_one_memory(tmp)
+            data, text = self.json_search(root, state_dir, "代码")
+            self.assertTrue(text.endswith("\n"))
+            self.assertEqual(data["query"], "代码")
+            self.assertEqual(data["workspace"], "personal")
+            self.assertEqual(data["count"], 1)
+            self.assertEqual(set(data["results"][0]), {"id", "title", "type", "status", "scope", "workspace", "confidentiality", "project", "context_id", "updated", "relative_path", "score", "excerpt"})
+            self.assertNotIn("content", data["results"][0])
+
+    def test_search_json_is_deterministic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_one_memory(tmp)
+            first = self.run_search(root, state_dir, "代码", "--json")
+            second = self.run_search(root, state_dir, "代码", "--json")
+            self.assertEqual(first.stdout.encode("utf-8"), second.stdout.encode("utf-8"))
+
+    def test_search_excerpt_uses_original_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            content = "前缀" * 80 + "使用尽可能少的代码实现相同功能。" + "后缀" * 80
+            root, state_dir, _ = self.setup_one_memory(tmp, content=content)
+            data, _ = self.json_search(root, state_dir, "代码")
+            excerpt = data["results"][0]["excerpt"]
+            self.assertLessEqual(len(excerpt), 180)
+            self.assertNotIn("代 码", excerpt)
+            self.assertIn("代码", excerpt)
+
+    def test_search_ranks_title_match_above_content_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp, index=False)
+            self.assertEqual(self.run_add(root, title="无关标题", content="内容包含代码关键词。").returncode, 0)
+            self.assertEqual(self.run_add(root, title="代码标题", content="普通内容。").returncode, 0)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            data, _ = self.json_search(root, state_dir, "代码")
+            self.assertEqual(data["results"][0]["title"], "代码标题")
+
+    def test_search_rejects_stale_index_after_add(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_one_memory(tmp)
+            self.assertEqual(self.run_add(root, title="新增代码").returncode, 0)
+            result = self.run_search(root, state_dir, "代码")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Search aborted because the index is stale. Run index first.", result.stderr)
+
+    def test_search_rejects_stale_index_after_edit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_one_memory(tmp)
+            self.replace_in_file(self.memory_files(root)[0], "使用尽可能少的代码实现相同功能。", "内容已经变化。")
+            result = self.run_search(root, state_dir, "代码")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Search aborted because the index is stale. Run index first.", result.stderr)
+
+    def test_search_rejects_stale_index_after_delete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_one_memory(tmp)
+            self.memory_files(root)[0].unlink()
+            result = self.run_search(root, state_dir, "代码")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Search aborted because the index is stale. Run index first.", result.stderr)
+
+    def test_search_rejects_missing_fts_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_one_memory(tmp)
+            with sqlite3.connect(db) as conn:
+                conn.execute("DELETE FROM memory_fts")
+                conn.commit()
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            for sidecar in self.db_sidecars(db):
+                sidecar.unlink(missing_ok=True)
+            result = self.run_search(root, state_dir, "代码")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Search aborted because the index is stale. Run index first.", result.stderr)
+
+    def test_search_requires_initialized_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            result = self.run_search(root, state_dir, "代码")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Database is not initialized. Run db-init first.", result.stderr)
+
+    def test_search_requires_indexed_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp, index=False)
+            self.assertEqual(self.run_add(root).returncode, 0)
+            result = self.run_search(root, state_dir, "代码")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Search aborted because the index is stale. Run index first.", result.stderr)
+
+    def test_search_empty_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            result = self.run_search(root, state_dir, "code")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.strip(), "Results: 0")
+
+    def test_search_does_not_modify_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_one_memory(tmp)
+            before_hash = self.db_hash(db)
+            before_mtime = db.stat().st_mtime_ns
+            self.assertFalse(any(path.exists() for path in self.db_sidecars(db)))
+            result = self.run_search(root, state_dir, "代码")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.db_hash(db), before_hash)
+            self.assertEqual(db.stat().st_mtime_ns, before_mtime)
+            self.assertFalse(any(path.exists() for path in self.db_sidecars(db)))
+
+    def test_search_does_not_modify_source_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_one_memory(tmp)
+            before = self.source_hashes(root)
+            self.assertEqual(self.run_search(root, state_dir, "代码").returncode, 0)
+            self.assertEqual(self.source_hashes(root), before)
+
+    def test_search_escapes_fts_syntax(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_one_memory(tmp, title="OR NEAR star 代码", content="safe query text")
+            result = self.run_search(root, state_dir, '" OR (NEAR*) 代码')
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class ExportCommandTests(unittest.TestCase):
