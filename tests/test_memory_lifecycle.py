@@ -446,6 +446,59 @@ content: |-
             self.assertEqual(json.loads(missing_raw.stdout)["deleted"], 0)
             self.assertTrue(recent.exists())
 
+    def test_purge_dry_run_reports_without_deleting_recent_or_updating_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            self.init_store(root, state_dir)
+            recent, raw = self.add_recent_with_raw(root)
+            module = load_memory_module()
+            module.index_store(type("Args", (), {"root": str(root), "state_dir": str(state_dir), "dry_run": False})())
+            with sqlite3.connect(state_dir / "memory.sqlite") as conn:
+                conn.execute(
+                    """
+                    INSERT INTO distillation_audit(recent_id, relative_path, source_sha256, status, result_json, distilled_at, delete_after)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "recent-manual-abc",
+                        recent.relative_to(root).as_posix(),
+                        hashlib.sha256(recent.read_bytes()).hexdigest(),
+                        "pending_delete",
+                        '{"schema":"distillation-result/v1","unresolved_conflicts":[]}',
+                        date.today().isoformat(),
+                        date.today().isoformat(),
+                    ),
+                )
+                conn.commit()
+
+            dry_run = self.run_cli(
+                DISTILL_CLI,
+                "purge",
+                "--root",
+                str(root),
+                "--state-dir",
+                str(state_dir),
+                "--today",
+                date.today().isoformat(),
+                "--dry-run",
+                "--json",
+            )
+
+            self.assertEqual(dry_run.returncode, 0, dry_run.stdout + dry_run.stderr)
+            summary = json.loads(dry_run.stdout)
+            self.assertTrue(summary["dry_run"])
+            self.assertEqual(summary["deleted"], 0)
+            self.assertEqual(summary["would_delete"], 1)
+            self.assertTrue(recent.exists())
+            self.assertTrue(raw.exists())
+            with sqlite3.connect(state_dir / "memory.sqlite") as conn:
+                status = conn.execute(
+                    "SELECT status FROM distillation_audit WHERE recent_id = ?",
+                    ("recent-manual-abc",),
+                ).fetchone()[0]
+            self.assertEqual(status, "pending_delete")
+
     def test_distillation_failure_paths_do_not_write_or_delete(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "data"

@@ -355,8 +355,10 @@ def _source_raw_exists(root, record):
 def purge(args):
     root, state, db = _state(args.root, Path(args.state_dir))
     today = _today(args.today)
+    dry_run = getattr(args, "dry_run", False)
     deleted = 0
     skipped = 0
+    would_delete = 0
     with memory.write_lock(root, state):
         with _db_connect(db) as conn:
             rows = [
@@ -394,6 +396,9 @@ def purge(args):
             if result.get("unresolved_conflicts"):
                 skipped += 1
                 continue
+            if dry_run:
+                would_delete += 1
+                continue
             path.unlink()
             memory.index_store(type("Args", (), {"root": str(root), "state_dir": str(state), "dry_run": False})())
             with _db_connect(db) as conn:
@@ -403,7 +408,7 @@ def purge(args):
                 )
                 conn.commit()
             deleted += 1
-    return {"deleted": deleted, "skipped": skipped}
+    return {"deleted": deleted, "skipped": skipped, "would_delete": would_delete, "dry_run": dry_run}
 
 
 def status(args):
@@ -428,6 +433,8 @@ def build_parser():
         item.add_argument("--today")
         item.add_argument("--json", action="store_true", dest="json_output")
         if name == "prepare":
+            item.add_argument("--dry-run", action="store_true")
+        if name == "purge":
             item.add_argument("--dry-run", action="store_true")
         if name == "apply":
             item.add_argument("--task-dir", required=True)
