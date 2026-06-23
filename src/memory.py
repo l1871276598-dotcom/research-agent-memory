@@ -1,4 +1,6 @@
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -19,6 +21,11 @@ DIRECTORIES = [
     "memory/decisions",
     "memory/procedures",
     "memory/sessions",
+    "memory/recent",
+    "imports/chatgpt/conversations",
+    "imports/manual/inbox",
+    "imports/manual/raw",
+    "imports/manual/quarantine",
     "literature/inbox",
     "literature/pdf",
     "literature/notes",
@@ -100,25 +107,38 @@ FILES = {
         indent=2,
     )
     + "\n",
+    "imports/manual/import_manifest.json": json.dumps(
+        {"format_version": 1, "imports": []},
+        ensure_ascii=False,
+        indent=2,
+    )
+    + "\n",
     "literature/literature_matrix.csv": (
         "id,doi,title,authors,journal,year,status,pdf_path,note_path,project,tags\n"
     ),
 }
 DB_NAME = "memory.sqlite"
-DB_SCHEMA_VERSION = 1
+DB_SCHEMA_VERSION = 2
 STATE_DIR_ERROR = "SQLite state directory must be local and outside iCloud and the code repository."
 MEMORIES_COLUMNS = [
     "id",
+    "schema",
+    "tier",
     "type",
     "title",
     "content",
+    "body",
     "tags",
+    "aliases",
     "status",
     "scope",
     "workspace",
     "confidentiality",
     "source",
     "confidence",
+    "source_id",
+    "source_path",
+    "source_sha256",
     "context_id",
     "project",
     "valid_from",
@@ -127,8 +147,31 @@ MEMORIES_COLUMNS = [
     "updated",
     "relative_path",
     "sha256",
+    "metadata_json",
 ]
 INDEX_STATE_COLUMNS = ["relative_path", "sha256", "mtime_ns", "indexed_at"]
+LINK_COLUMNS = [
+    "source_id",
+    "target_id",
+    "target_ref",
+    "relation",
+    "source_kind",
+    "target_heading",
+    "target_block",
+    "context",
+    "resolved",
+]
+AUDIT_COLUMNS = [
+    "recent_id",
+    "relative_path",
+    "source_sha256",
+    "status",
+    "result_json",
+    "distilled_at",
+    "delete_after",
+    "deleted_at",
+    "error",
+]
 REQUIRED_INDEXES = {
     "idx_memories_type",
     "idx_memories_project",
@@ -136,6 +179,45 @@ REQUIRED_INDEXES = {
     "idx_memories_workspace_status",
 }
 CJK_RUN = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF]+")
+LOCK_NAME = "memory-write.lock"
+_LOCK_STACK = []
+RECENT_DIR = "memory/recent"
+RECENT_BODY_DAYS = 30
+DELETION_GRACE_DAYS = 7
+RELATION_CHOICES = {
+    "belongs_to",
+    "applies_to",
+    "depends_on",
+    "derived_from",
+    "supports",
+    "contradicts",
+    "supersedes",
+    "superseded_by",
+    "related_to",
+}
+AGENT_FIELDS = {
+    "schema",
+    "tier",
+    "subject",
+    "predicate",
+    "object",
+    "aliases",
+    "relations",
+    "source_id",
+    "source_path",
+    "source_sha256",
+    "source_refs",
+    "retention_until",
+    "distillation_status",
+    "distilled_at",
+    "protected",
+    "original_name",
+    "media_type",
+    "extractor",
+    "imported_at",
+}
+ALLOWED_FIELDS = ALLOWED_FIELDS | AGENT_FIELDS
+LIST_FIELDS = LIST_FIELDS | {"aliases", "relations", "source_refs"}
 
 
 def _repository_root():
@@ -281,8 +363,10 @@ def _quoted(value):
 def render_front_matter(record):
     lines = ["---"]
     for field in [
+        "schema",
         "id",
         "type",
+        "tier",
         "title",
         "created",
         "updated",
@@ -300,11 +384,25 @@ def render_front_matter(record):
         "to_context",
         "effective_date",
         "reason",
+        "subject",
+        "predicate",
+        "object",
+        "source_id",
+        "source_path",
+        "source_sha256",
+        "retention_until",
+        "distillation_status",
+        "distilled_at",
+        "protected",
+        "original_name",
+        "media_type",
+        "extractor",
+        "imported_at",
     ]:
         if field in record:
             lines.append(f"{field}: {_quoted(record[field])}")
 
-    for field in ["supersedes", "superseded_by", "tags"]:
+    for field in ["aliases", "relations", "source_refs", "supersedes", "superseded_by", "tags"]:
         if field not in record:
             continue
         values = record.get(field, [])
@@ -314,10 +412,11 @@ def render_front_matter(record):
         if not values:
             lines[-1] = f"{field}: []"
 
-    lines.append("content: |-")
-    content_lines = record["content"].splitlines() or [""]
-    for line in content_lines:
-        lines.append(f"  {line}")
+    if "content" in record:
+        lines.append("content: |-")
+        content_lines = record["content"].splitlines() or [""]
+        for line in content_lines:
+            lines.append(f"  {line}")
     lines.append("---")
     return "\n".join(lines)
 
@@ -507,6 +606,25 @@ def parse_front_matter(path):
     return record, errors
 
 
+def parse_memory_document(path):
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return None, "", ["file is not valid UTF-8"]
+    except OSError as exc:
+        return None, "", [f"cannot read file: {exc}"]
+    lines = text.splitlines()
+    if not lines or lines[0] != "---":
+        return None, "", ["missing opening front matter delimiter"]
+    try:
+        end = lines.index("---", 1)
+    except ValueError:
+        return None, "", ["unclosed front matter"]
+    record, errors = parse_front_matter(path)
+    body = "\n".join(lines[end + 1 :]).strip()
+    return record, body, errors
+
+
 def _real_date(value):
     if not isinstance(value, str):
         return None
@@ -518,9 +636,38 @@ def _real_date(value):
         return None
 
 
+def _relation_parts(value):
+    if not isinstance(value, str) or ":" not in value:
+        return None, None
+    relation, target = value.split(":", 1)
+    return relation.strip(), target.strip()
+
+
 def validate_record(record, path, rel_path, expected_type):
     errors = []
-    for field in REQUIRED_FIELDS:
+    schema = record.get("schema", "memory/v1")
+    is_recent = schema == "recent/v1" or expected_type == "recent"
+    required = [
+        "schema",
+        "id",
+        "type",
+        "tier",
+        "title",
+        "created",
+        "updated",
+        "status",
+        "source",
+        "source_id",
+        "source_path",
+        "source_sha256",
+        "retention_until",
+        "distillation_status",
+        "protected",
+        "content",
+    ] if is_recent else REQUIRED_FIELDS
+    if schema == "memory/v2":
+        required = list(dict.fromkeys(required + ["schema", "subject", "predicate", "object", "relations"]))
+    for field in required:
         if field not in record:
             errors.append(f"missing required field: {field}")
     for field in record:
@@ -532,7 +679,7 @@ def validate_record(record, path, rel_path, expected_type):
         errors.append("id must be a string")
     elif not (3 <= len(memory_id) <= 128) or not ID_PATTERN.fullmatch(memory_id):
         errors.append("id does not match required pattern")
-    elif not path.name.startswith(f"{memory_id}-"):
+    elif not (path.name.startswith(f"{memory_id}-") or path.name == f"{memory_id}.md"):
         errors.append("filename must start with id-")
 
     for field, choices in [
@@ -545,8 +692,14 @@ def validate_record(record, path, rel_path, expected_type):
     ]:
         if field in record and record[field] not in choices:
             errors.append(f"{field} has invalid value")
+    if schema not in {"memory/v1", "memory/v2", "recent/v1"}:
+        errors.append("schema has invalid value")
+    if is_recent and record.get("tier") != "recent":
+        errors.append("recent memory requires tier recent")
+    if not is_recent and "tier" in record and record.get("tier") not in {"long", "recent"}:
+        errors.append("tier has invalid value")
 
-    for field in ("title", "source"):
+    for field in ("title", "source", "subject", "predicate", "object", "source_id", "source_path", "source_sha256"):
         if field in record and (not isinstance(record[field], str) or not record[field]):
             errors.append(f"{field} must be a non-empty string")
     if "content" in record and not isinstance(record["content"], str):
@@ -578,11 +731,19 @@ def validate_record(record, path, rel_path, expected_type):
                     elif item in seen:
                         errors.append(f"{field} contains duplicate item: {item}")
                     seen.add(item)
+    for value in record.get("relations", []) if isinstance(record.get("relations"), list) else []:
+        relation, target = _relation_parts(value)
+        if not relation or not target:
+            errors.append("relation must use relation:target format")
+        elif relation not in RELATION_CHOICES:
+            errors.append("relation has invalid predicate")
 
     memory_type = record.get("type")
     scope = record.get("scope")
-    if memory_type != expected_type:
+    if not is_recent and memory_type != expected_type:
         errors.append("type does not match directory")
+    if is_recent:
+        return [(rel_path, message) for message in errors]
     if memory_type == "context":
         if scope != "context":
             errors.append("type context requires scope context")
@@ -611,7 +772,7 @@ def validate_record(record, path, rel_path, expected_type):
 
 def _memory_paths(root):
     paths = []
-    for relative_dir in TYPE_DIRS.values():
+    for relative_dir in list(TYPE_DIRS.values()) + [RECENT_DIR]:
         directory = root / relative_dir
         if not directory.exists():
             continue
@@ -643,13 +804,15 @@ def collect_validated_records(root):
             if rel_path == relative_dir or rel_path.startswith(relative_dir + "/"):
                 expected_type = memory_type
                 break
-        record, parse_errors = parse_front_matter(path)
+        if expected_type is None and (rel_path == RECENT_DIR or rel_path.startswith(RECENT_DIR + "/")):
+            expected_type = "recent"
+        record, body, parse_errors = parse_memory_document(path)
         for message in parse_errors:
             errors.append((rel_path, message))
         if record is None:
             continue
         errors.extend(validate_record(record, path, rel_path, expected_type))
-        records.append({"relative_path": rel_path, "record": record, "path": path})
+        records.append({"relative_path": rel_path, "record": record, "body": body, "path": path})
 
     errors.extend(_validate_cross_file([(item["relative_path"], item["record"]) for item in records]))
     return root, records, errors, len(paths)
@@ -801,6 +964,8 @@ def _expected_type_for_path(root, path):
     for relative_dir, memory_type in DIR_TYPES.items():
         if rel_path == relative_dir or rel_path.startswith(relative_dir + "/"):
             return memory_type
+    if rel_path == RECENT_DIR or rel_path.startswith(RECENT_DIR + "/"):
+        return "recent"
     return None
 
 
@@ -1025,6 +1190,29 @@ def check_state_dir(root, state_dir):
     return state, db
 
 
+@contextlib.contextmanager
+def write_lock(root, state_dir):
+    state, _ = check_state_dir(_require_data_root(root), state_dir or default_state_dir())
+    state.mkdir(parents=True, exist_ok=True)
+    lock_path = state / LOCK_NAME
+    if lock_path in _LOCK_STACK:
+        _LOCK_STACK.append(lock_path)
+        try:
+            yield
+        finally:
+            _LOCK_STACK.pop()
+        return
+    with lock_path.open("w", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        _LOCK_STACK.append(lock_path)
+        try:
+            yield
+        finally:
+            _LOCK_STACK.pop()
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    lock_path.unlink(missing_ok=True)
+
+
 def _configure_sqlite(conn):
     conn.execute("PRAGMA foreign_keys = ON")
     mode = conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
@@ -1039,16 +1227,23 @@ def _create_schema(conn):
         """
         CREATE TABLE memories (
             id TEXT PRIMARY KEY,
+            schema TEXT NOT NULL DEFAULT 'memory/v1',
+            tier TEXT NOT NULL DEFAULT 'long',
             type TEXT NOT NULL,
             title TEXT NOT NULL,
             content TEXT NOT NULL,
+            body TEXT NOT NULL DEFAULT '',
             tags TEXT NOT NULL DEFAULT '[]',
+            aliases TEXT NOT NULL DEFAULT '[]',
             status TEXT NOT NULL,
             scope TEXT NOT NULL,
             workspace TEXT NOT NULL,
             confidentiality TEXT NOT NULL,
             source TEXT NOT NULL,
             confidence TEXT NOT NULL,
+            source_id TEXT,
+            source_path TEXT,
+            source_sha256 TEXT,
             context_id TEXT,
             project TEXT,
             valid_from TEXT,
@@ -1056,7 +1251,8 @@ def _create_schema(conn):
             created TEXT NOT NULL,
             updated TEXT NOT NULL,
             relative_path TEXT NOT NULL UNIQUE,
-            sha256 TEXT NOT NULL
+            sha256 TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}'
         );
         CREATE INDEX idx_memories_type ON memories(type);
         CREATE INDEX idx_memories_project ON memories(project);
@@ -1067,7 +1263,9 @@ def _create_schema(conn):
             id UNINDEXED,
             title,
             content,
+            body,
             tags,
+            aliases,
             tokenize = 'unicode61'
         );
         CREATE TABLE index_state (
@@ -1076,7 +1274,32 @@ def _create_schema(conn):
             mtime_ns INTEGER NOT NULL,
             indexed_at TEXT NOT NULL
         );
-        PRAGMA user_version = 1;
+        CREATE TABLE links (
+            source_id TEXT NOT NULL,
+            target_id TEXT,
+            target_ref TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            target_heading TEXT,
+            target_block TEXT,
+            context TEXT,
+            resolved INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX idx_links_source ON links(source_id);
+        CREATE INDEX idx_links_target ON links(target_id);
+        CREATE INDEX idx_links_ref ON links(target_ref);
+        CREATE TABLE distillation_audit (
+            recent_id TEXT PRIMARY KEY,
+            relative_path TEXT NOT NULL,
+            source_sha256 TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result_json TEXT NOT NULL DEFAULT '{}',
+            distilled_at TEXT,
+            delete_after TEXT,
+            deleted_at TEXT,
+            error TEXT
+        );
+        PRAGMA user_version = 2;
         """
     )
 
@@ -1092,43 +1315,59 @@ def _target_tables(conn):
             """
             SELECT name, type, sql
             FROM sqlite_master
-            WHERE name IN ('memories', 'memory_fts', 'index_state')
+            WHERE name IN ('memories', 'memory_fts', 'index_state', 'links', 'distillation_audit')
             """
         )
     }
 
 
+def _inspect_database_connection(conn, verify_wal=True):
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    mode = conn.execute("PRAGMA journal_mode").fetchone()[0] if verify_wal else "wal"
+    tables = _target_tables(conn)
+    if version != DB_SCHEMA_VERSION:
+        if version == 0 and not tables:
+            return {"initialized": False, "version": version}
+        raise ValueError("Incompatible SQLite schema version.")
+    if str(mode).lower() != "wal":
+        raise ValueError("SQLite journal_mode WAL could not be verified.")
+    if set(tables) != {"memories", "memory_fts", "index_state", "links", "distillation_audit"}:
+        raise ValueError("SQLite schema is incomplete.")
+    if "CREATE VIRTUAL TABLE" not in tables["memory_fts"][1].upper():
+        raise ValueError("SQLite FTS5 table is missing.")
+    if _table_columns(conn, "memories") != MEMORIES_COLUMNS:
+        raise ValueError("SQLite memories table columns do not match.")
+    if _table_columns(conn, "index_state") != INDEX_STATE_COLUMNS:
+        raise ValueError("SQLite index_state table columns do not match.")
+    if _table_columns(conn, "links") != LINK_COLUMNS:
+        raise ValueError("SQLite links table columns do not match.")
+    if _table_columns(conn, "distillation_audit") != AUDIT_COLUMNS:
+        raise ValueError("SQLite distillation_audit table columns do not match.")
+    indexes = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_memories_%'"
+        )
+    }
+    if not REQUIRED_INDEXES.issubset(indexes):
+        raise ValueError("SQLite memories indexes are incomplete.")
+    return {"initialized": True, "version": version}
+
+
 def inspect_database(db):
     try:
         with sqlite3.connect(db) as conn:
-            version = conn.execute("PRAGMA user_version").fetchone()[0]
-            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
-            tables = _target_tables(conn)
-            if version != DB_SCHEMA_VERSION:
-                if version == 0 and not tables:
-                    return {"initialized": False, "version": version}
-                raise ValueError("Incompatible SQLite schema version.")
-            if str(mode).lower() != "wal":
-                raise ValueError("SQLite journal_mode WAL could not be verified.")
-            if set(tables) != {"memories", "memory_fts", "index_state"}:
-                raise ValueError("SQLite schema is incomplete.")
-            if "CREATE VIRTUAL TABLE" not in tables["memory_fts"][1].upper():
-                raise ValueError("SQLite FTS5 table is missing.")
-            if _table_columns(conn, "memories") != MEMORIES_COLUMNS:
-                raise ValueError("SQLite memories table columns do not match.")
-            if _table_columns(conn, "index_state") != INDEX_STATE_COLUMNS:
-                raise ValueError("SQLite index_state table columns do not match.")
-            indexes = {
-                row[0]
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_memories_%'"
-                )
-            }
-            if not REQUIRED_INDEXES.issubset(indexes):
-                raise ValueError("SQLite memories indexes are incomplete.")
-            return {"initialized": True, "version": version}
+            return _inspect_database_connection(conn)
     except sqlite3.DatabaseError as exc:
         raise ValueError("Invalid SQLite database.") from exc
+
+
+def database_has_wal_header(db):
+    try:
+        header = db.read_bytes()[:100]
+    except OSError as exc:
+        raise ValueError("Invalid SQLite database.") from exc
+    return len(header) >= 100 and header[18] == 2 and header[19] == 2
 
 
 def _checkpoint_and_close(conn):
@@ -1138,9 +1377,12 @@ def _checkpoint_and_close(conn):
         conn.close()
 
 
+def sqlite_sidecars(path):
+    return [Path(str(path) + suffix) for suffix in ("-wal", "-shm")]
+
+
 def _remove_sqlite_sidecars(path):
-    for suffix in ("-wal", "-shm"):
-        sidecar = Path(str(path) + suffix)
+    for sidecar in sqlite_sidecars(path):
         if sidecar.exists():
             sidecar.unlink()
 
@@ -1215,7 +1457,7 @@ def db_init(args):
         "state_dir": state,
         "database": db,
         "version": DB_SCHEMA_VERSION,
-        "tables": ["memories", "memory_fts", "index_state"],
+        "tables": ["memories", "memory_fts", "index_state", "links", "distillation_audit"],
     }
 
 
@@ -1242,20 +1484,69 @@ def _record_tags(record):
     return tags if isinstance(tags, list) else []
 
 
+def _record_aliases(record):
+    aliases = record.get("aliases", [])
+    return aliases if isinstance(aliases, list) else []
+
+
+def _record_schema(record):
+    return record.get("schema", "memory/v1")
+
+
+def _record_tier(record):
+    if _record_schema(record) == "recent/v1":
+        return "recent"
+    return record.get("tier", "long")
+
+
+def _metadata_json(record):
+    structured = {
+        key: value
+        for key, value in record.items()
+        if key
+        in {
+            "subject",
+            "predicate",
+            "object",
+            "relations",
+            "source_id",
+            "source_path",
+            "source_sha256",
+            "source_refs",
+            "retention_until",
+            "distillation_status",
+            "distilled_at",
+            "protected",
+            "original_name",
+            "media_type",
+            "extractor",
+            "imported_at",
+        }
+    }
+    return json.dumps(structured, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def _record_to_db_values(item):
     record = item["record"]
     return {
         "id": record["id"],
+        "schema": _record_schema(record),
+        "tier": _record_tier(record),
         "type": record["type"],
         "title": record["title"],
         "content": record["content"],
+        "body": item.get("body", ""),
         "tags": json.dumps(_record_tags(record), ensure_ascii=False, separators=(",", ":")),
+        "aliases": json.dumps(_record_aliases(record), ensure_ascii=False, separators=(",", ":")),
         "status": record["status"],
-        "scope": record["scope"],
-        "workspace": record["workspace"],
-        "confidentiality": record["confidentiality"],
+        "scope": record.get("scope", "global"),
+        "workspace": record.get("workspace", "personal"),
+        "confidentiality": record.get("confidentiality", "personal"),
         "source": record["source"],
-        "confidence": record["confidence"],
+        "confidence": record.get("confidence", "inferred"),
+        "source_id": record.get("source_id"),
+        "source_path": record.get("source_path"),
+        "source_sha256": record.get("source_sha256"),
         "context_id": record.get("context_id"),
         "project": record.get("project"),
         "valid_from": record.get("valid_from"),
@@ -1264,6 +1555,7 @@ def _record_to_db_values(item):
         "updated": record["updated"],
         "relative_path": item["relative_path"],
         "sha256": item["sha256"],
+        "metadata_json": _metadata_json(record),
     }
 
 
@@ -1273,8 +1565,60 @@ def _fts_values(item):
         record["id"],
         normalize_fts_text(record["title"]),
         normalize_fts_text(record["content"]),
+        normalize_fts_text(item.get("body", "")),
         normalize_fts_text(" ".join(_record_tags(record))),
+        normalize_fts_text(" ".join(_record_aliases(record))),
     )
+
+
+WIKILINK_PATTERN = re.compile(r"!?\[\[([^\]|#\^]+)(?:#([^\]|\^]+))?(?:\^([^\]|]+))?(?:\|[^\]]*)?\]\]")
+
+
+def _identity_maps(items):
+    ids = {}
+    aliases = {}
+    for item in items:
+        record = item["record"]
+        memory_id = record.get("id")
+        if isinstance(memory_id, str):
+            ids[memory_id] = memory_id
+        for alias in _record_aliases(record):
+            aliases.setdefault(alias, memory_id)
+    return ids, aliases
+
+
+def _resolve_ref(target_ref, ids, aliases):
+    if target_ref in ids:
+        return ids[target_ref], 1
+    if target_ref in aliases:
+        return aliases[target_ref], 1
+    return None, 0
+
+
+def _links_for_item(item, ids, aliases):
+    record = item["record"]
+    source_id = record["id"]
+    links = []
+    seen = set()
+    for value in record.get("relations", []) if isinstance(record.get("relations"), list) else []:
+        relation, target_ref = _relation_parts(value)
+        if relation not in RELATION_CHOICES or not target_ref:
+            continue
+        target_id, resolved = _resolve_ref(target_ref, ids, aliases)
+        key = (source_id, target_ref, relation, "frontmatter", None, None)
+        if key not in seen:
+            links.append((source_id, target_id, target_ref, relation, "frontmatter", None, None, value, resolved))
+            seen.add(key)
+    for match in WIKILINK_PATTERN.finditer(item.get("body", "")):
+        target_ref = match.group(1).strip()
+        heading = (match.group(2) or "").strip() or None
+        block = (match.group(3) or "").strip() or None
+        target_id, resolved = _resolve_ref(target_ref, ids, aliases)
+        key = (source_id, target_ref, "related_to", "body", heading, block)
+        if key not in seen:
+            links.append((source_id, target_id, target_ref, "related_to", "body", heading, block, match.group(0), resolved))
+            seen.add(key)
+    return links
 
 
 def _current_index_items(root, records):
@@ -1286,6 +1630,7 @@ def _current_index_items(root, records):
             {
                 "relative_path": item["relative_path"],
                 "record": item["record"],
+                "body": item.get("body", ""),
                 "path": path,
                 "sha256": hashlib.sha256(raw).hexdigest(),
                 "mtime_ns": path.stat().st_mtime_ns,
@@ -1376,7 +1721,7 @@ def _upsert_memory(conn, item, indexed_at):
         tuple(values[column] for column in columns),
     )
     conn.execute(
-        "INSERT INTO memory_fts(id, title, content, tags) VALUES (?, ?, ?, ?)",
+        "INSERT INTO memory_fts(id, title, content, body, tags, aliases) VALUES (?, ?, ?, ?, ?, ?)",
         _fts_values(item),
     )
     conn.execute(
@@ -1390,6 +1735,19 @@ def _upsert_memory(conn, item, indexed_at):
         """,
         (item["relative_path"], item["sha256"], item["mtime_ns"], indexed_at),
     )
+
+
+def rebuild_links(conn, items):
+    ids, aliases = _identity_maps(items)
+    conn.execute("DELETE FROM links")
+    for item in items:
+        conn.executemany(
+            """
+            INSERT INTO links(source_id, target_id, target_ref, relation, source_kind, target_heading, target_block, context, resolved)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            _links_for_item(item, ids, aliases),
+        )
 
 
 def check_index_consistency(conn, expected_count):
@@ -1431,7 +1789,7 @@ def check_index_consistency(conn, expected_count):
         raise ValueError("SQLite index consistency check failed.")
 
 
-def apply_index_changes(conn, plan, expected_count):
+def apply_index_changes(conn, plan, items, expected_count):
     indexed_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     for item in plan["deleted"]:
         if item["id"]:
@@ -1455,6 +1813,7 @@ def apply_index_changes(conn, plan, expected_count):
         conn.execute("DELETE FROM memory_fts WHERE id = ?", (memory_id,))
         _upsert_memory(conn, item, indexed_at)
 
+    rebuild_links(conn, items)
     check_index_consistency(conn, expected_count)
 
 
@@ -1468,34 +1827,321 @@ def index_store(args):
     state, db = check_state_dir(root, state_dir)
     if not db.exists():
         raise ValueError("Database is not initialized. Run db-init first.")
-    summary = inspect_database(db)
-    if not summary["initialized"]:
+    with write_lock(root, state):
+        summary = inspect_database(db)
+        if not summary["initialized"]:
+            raise ValueError("Database is not initialized. Run db-init first.")
+
+        items = _current_index_items(root, records)
+        with sqlite3.connect(db) as conn:
+            conn.execute("PRAGMA busy_timeout = 5000")
+            plan = plan_index_changes(conn, items)
+            result = {
+                "added": len(plan["added"]),
+                "updated": len(plan["updated"]),
+                "deleted": len(plan["deleted"]),
+                "unchanged": len(plan["unchanged"]),
+                "database": db,
+                "dry_run": args.dry_run,
+            }
+            if args.dry_run:
+                return result
+            try:
+                conn.execute("BEGIN")
+                apply_index_changes(conn, plan, items, len(items))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        checkpoint_database(db)
+        return result
+
+
+def db_rebuild(args):
+    root, records, errors, _ = collect_validated_records(args.root)
+    if errors:
+        messages = [f"ERROR {rel_path}: {message}" for rel_path, message in errors]
+        raise ValueError("\n".join(messages + ["Database rebuild aborted because validation failed."]))
+    check_fts5()
+    state_dir = args.state_dir if args.state_dir else default_state_dir()
+    state, db = check_state_dir(root, state_dir)
+    state.mkdir(parents=True, exist_ok=True)
+    with write_lock(root, state):
+        tmp = state / f".tmp-{DB_NAME}-{uuid.uuid4().hex}"
+        try:
+            conn = sqlite3.connect(tmp)
+            _configure_sqlite(conn)
+            _create_schema(conn)
+            items = _current_index_items(root, records)
+            try:
+                conn.execute("BEGIN")
+                plan = plan_index_changes(conn, items)
+                apply_index_changes(conn, plan, items, len(items))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                _checkpoint_and_close(conn)
+            inspect_database(tmp)
+            tmp.replace(db)
+            _remove_sqlite_sidecars(tmp)
+            checkpoint_database(db)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            _remove_sqlite_sidecars(tmp)
+            raise
+    return {"database": db, "records": len(records), "version": DB_SCHEMA_VERSION}
+
+
+def extract_search_terms(query):
+    cjk_matches = list(CJK_RUN.finditer(query))
+    if any(len(match.group(0)) == 1 for match in cjk_matches):
+        raise ValueError("Chinese search terms must contain at least 2 consecutive characters.")
+    terms = []
+    for match in cjk_matches:
+        run = match.group(0)
+        if len(run) == 2:
+            terms.append(run)
+        else:
+            terms.extend(run[index : index + 2] for index in range(len(run) - 1))
+    without_cjk = CJK_RUN.sub(" ", query)
+    terms.extend(re.findall(r"[A-Za-z0-9_-]+", without_cjk))
+    return terms
+
+
+def build_fts_query(query):
+    terms = extract_search_terms(query)
+    if not terms:
+        raise ValueError("Search query has no valid terms.")
+    return " AND ".join(f'"{term.replace(chr(34), chr(34) + chr(34))}"' for term in terms)
+
+
+def _readonly_connection(db):
+    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+    conn.execute("PRAGMA query_only = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
+
+
+def check_search_freshness(conn, items):
+    expected = len(items)
+    state = _database_index_state(conn)
+    current_paths = {item["relative_path"] for item in items}
+    current_ids = {item["record"]["id"] for item in items}
+
+    counts = {
+        "memories": conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0],
+        "index_state": conn.execute("SELECT COUNT(*) FROM index_state").fetchone()[0],
+        "fts_distinct": conn.execute("SELECT COUNT(DISTINCT id) FROM memory_fts").fetchone()[0],
+    }
+    if any(value != expected for value in counts.values()):
+        raise ValueError("Search aborted because the index is stale. Run index first.")
+    if conn.execute("SELECT id FROM memory_fts GROUP BY id HAVING COUNT(*) != 1").fetchone():
+        raise ValueError("Search aborted because the index is stale. Run index first.")
+    if set(state["index_state"]) != current_paths:
+        raise ValueError("Search aborted because the index is stale. Run index first.")
+    if set(state["memories_by_id"]) != current_ids:
+        raise ValueError("Search aborted because the index is stale. Run index first.")
+
+    for item in items:
+        state_row = state["index_state"].get(item["relative_path"])
+        memory_row = state["memories_by_id"].get(item["record"]["id"])
+        if not state_row or state_row["sha256"] != item["sha256"]:
+            raise ValueError("Search aborted because the index is stale. Run index first.")
+        if not memory_row or memory_row["relative_path"] != item["relative_path"]:
+            raise ValueError("Search aborted because the index is stale. Run index first.")
+        if state["fts_counts"].get(item["record"]["id"]) != 1:
+            raise ValueError("Search aborted because the index is stale. Run index first.")
+
+
+def _search_statuses(args):
+    statuses = list(args.status or ["active"])
+    if args.include_historical and "historical" not in statuses:
+        statuses.append("historical")
+    return statuses
+
+
+def _allowed_confidentiality(args):
+    if args.include_restricted and args.workspace != "work":
+        raise ValueError("--include-restricted requires --workspace work.")
+    if args.workspace == "personal":
+        return ["public", "personal"]
+    values = ["public", "personal", "internal"]
+    if args.include_restricted:
+        values.append("restricted")
+    return values
+
+
+def _validate_search_args(args):
+    if not (1 <= args.limit <= 100):
+        raise ValueError("--limit must be between 1 and 100.")
+    _allowed_confidentiality(args)
+
+
+def make_excerpt(content, query):
+    text = re.sub(r"\s+", " ", content or "").strip()
+    if len(text) <= 180:
+        return text
+    fragments = re.findall(r"[\u3400-\u4DBF\u4E00-\u9FFF]{2,}|[A-Za-z0-9_-]+", query)
+    center = -1
+    for fragment in fragments:
+        center = text.lower().find(fragment.lower())
+        if center >= 0:
+            break
+    if center < 0:
+        start = 0
+    else:
+        start = max(0, center - 80)
+    end = min(len(text), start + 180)
+    start = max(0, end - 180)
+    excerpt = text[start:end]
+    if start > 0:
+        excerpt = "…" + excerpt[1:]
+    if end < len(text):
+        excerpt = excerpt[:-1] + "…"
+    return excerpt
+
+
+def _row_to_result(row, query):
+    keys = [
+        "id",
+        "title",
+        "type",
+        "status",
+        "scope",
+        "workspace",
+        "confidentiality",
+        "project",
+        "context_id",
+        "updated",
+        "relative_path",
+        "score",
+        "content",
+    ]
+    data = dict(zip(keys, row))
+    return {
+        "id": data["id"],
+        "title": data["title"],
+        "type": data["type"],
+        "status": data["status"],
+        "scope": data["scope"],
+        "workspace": data["workspace"],
+        "confidentiality": data["confidentiality"],
+        "project": data["project"],
+        "context_id": data["context_id"],
+        "updated": data["updated"],
+        "relative_path": data["relative_path"],
+        "score": round(float(data["score"]), 6),
+        "excerpt": make_excerpt(data["content"], query),
+    }
+
+
+def search_store(args):
+    _validate_search_args(args)
+    root, records, errors, _ = collect_validated_records(args.root)
+    if errors:
+        messages = [f"ERROR {rel_path}: {message}" for rel_path, message in errors]
+        raise ValueError("\n".join(messages + ["Search aborted because validation failed."]))
+
+    fts_query = build_fts_query(args.query)
+    state_dir = args.state_dir if args.state_dir else default_state_dir()
+    _, db = check_state_dir(root, state_dir)
+    if not db.exists():
         raise ValueError("Database is not initialized. Run db-init first.")
+    if any(sidecar.exists() for sidecar in sqlite_sidecars(db)):
+        raise ValueError("Search aborted because the index is stale. Run index first.")
+    if not database_has_wal_header(db):
+        raise ValueError("SQLite journal_mode WAL could not be verified.")
 
     items = _current_index_items(root, records)
-    with sqlite3.connect(db) as conn:
-        conn.execute("PRAGMA busy_timeout = 5000")
-        plan = plan_index_changes(conn, items)
-        result = {
-            "added": len(plan["added"]),
-            "updated": len(plan["updated"]),
-            "deleted": len(plan["deleted"]),
-            "unchanged": len(plan["unchanged"]),
-            "database": db,
-            "dry_run": args.dry_run,
-        }
-        if args.dry_run:
-            return result
-        try:
-            conn.execute("BEGIN")
-            apply_index_changes(conn, plan, len(items))
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+    try:
+        with _readonly_connection(db) as conn:
+            summary = _inspect_database_connection(conn, verify_wal=False)
+            if not summary["initialized"]:
+                raise ValueError("Database is not initialized. Run db-init first.")
+            check_search_freshness(conn, items)
 
-    checkpoint_database(db)
-    return result
+            where = ["memory_fts MATCH ?", "memories.workspace = ?"]
+            params = [fts_query, args.workspace]
+            confidentialities = _allowed_confidentiality(args)
+            where.append("memories.confidentiality IN (" + ", ".join("?" for _ in confidentialities) + ")")
+            params.extend(confidentialities)
+            statuses = _search_statuses(args)
+            where.append("memories.status IN (" + ", ".join("?" for _ in statuses) + ")")
+            params.extend(statuses)
+            for column, value in [("type", args.type), ("project", args.project), ("context_id", args.context_id)]:
+                if value is not None:
+                    where.append(f"memories.{column} = ?")
+                    params.append(value)
+            params.append(args.limit)
+            rows = conn.execute(
+                f"""
+                SELECT
+                    memories.id,
+                    memories.title,
+                    memories.type,
+                    memories.status,
+                    memories.scope,
+                    memories.workspace,
+                    memories.confidentiality,
+                    memories.project,
+                    memories.context_id,
+                    memories.updated,
+                    memories.relative_path,
+                    bm25(memory_fts, 0.0, 5.0, 1.0, 1.0, 2.0, 4.0) AS score,
+                    memories.content
+                FROM memory_fts
+                JOIN memories ON memories.id = memory_fts.id
+                WHERE {" AND ".join(where)}
+                ORDER BY score ASC, memories.updated DESC, memories.id ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+    except sqlite3.DatabaseError as exc:
+        raise ValueError(f"Search failed: {exc}") from exc
+
+    results = [_row_to_result(row, args.query) for row in rows]
+    return {
+        "query": args.query,
+        "workspace": args.workspace,
+        "filters": {
+            "type": args.type,
+            "project": args.project,
+            "context_id": args.context_id,
+            "statuses": statuses,
+            "include_restricted": args.include_restricted,
+        },
+        "count": len(results),
+        "results": results,
+    }
+
+
+def render_search_text(summary):
+    if not summary["results"]:
+        return "Results: 0\n"
+    lines = [f"Results: {summary['count']}", ""]
+    for index, row in enumerate(summary["results"], start=1):
+        lines.extend(
+            [
+                f"{index}. {row['title']}",
+                f"   ID: {row['id']}",
+                f"   Type: {row['type']}",
+                f"   Status: {row['status']}",
+                f"   Workspace: {row['workspace']}",
+                f"   Confidentiality: {row['confidentiality']}",
+                f"   Project: {row['project'] or '-'}",
+                f"   Context: {row['context_id'] or '-'}",
+                f"   Updated: {row['updated']}",
+                f"   Path: {row['relative_path']}",
+                f"   Score: {row['score']:.6f}",
+                f"   Excerpt: {row['excerpt']}",
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def build_parser():
@@ -1544,6 +2190,32 @@ def build_parser():
         help="Local state directory for memory.sqlite.",
     )
     index_parser.add_argument("--dry-run", action="store_true")
+
+    rebuild_parser = subparsers.add_parser("db-rebuild", help="Safely rebuild the local SQLite database.")
+    rebuild_parser.add_argument("--root", required=True, help="Initialized data root.")
+    rebuild_parser.add_argument(
+        "--state-dir",
+        default=str(default_state_dir()),
+        help="Local state directory for memory.sqlite.",
+    )
+
+    search_parser = subparsers.add_parser("search", help="Search indexed memory records.")
+    search_parser.add_argument("query")
+    search_parser.add_argument("--root", required=True, help="Initialized data root.")
+    search_parser.add_argument(
+        "--state-dir",
+        default=str(default_state_dir()),
+        help="Local state directory for memory.sqlite.",
+    )
+    search_parser.add_argument("--workspace", default="personal", choices=WORKSPACE_CHOICES)
+    search_parser.add_argument("--type", choices=TYPE_CHOICES)
+    search_parser.add_argument("--project")
+    search_parser.add_argument("--context-id", dest="context_id")
+    search_parser.add_argument("--status", action="append", choices=STATUS_CHOICES)
+    search_parser.add_argument("--include-historical", action="store_true")
+    search_parser.add_argument("--include-restricted", action="store_true")
+    search_parser.add_argument("--limit", type=int, default=10)
+    search_parser.add_argument("--json", action="store_true", dest="json_output")
 
     export_parser = subparsers.add_parser("export", help="Export memory records.")
     export_parser.add_argument("--root", required=True, help="Initialized data root.")
@@ -1619,6 +2291,20 @@ def main(argv=None):
                 print(f"Deleted: {summary['deleted']}")
             print(f"Unchanged: {summary['unchanged']}")
             print(f"Database: {summary['database']}")
+            return 0
+        if args.command == "db-rebuild":
+            summary = db_rebuild(args)
+            print("Database rebuilt")
+            print(f"Records: {summary['records']}")
+            print(f"Schema version: {summary['version']}")
+            print(f"Database: {summary['database']}")
+            return 0
+        if args.command == "search":
+            summary = search_store(args)
+            if args.json_output:
+                print(json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2))
+            else:
+                print(render_search_text(summary), end="")
             return 0
         if args.command == "export":
             summary, errors = export_store(args.root, args.include_internal)
