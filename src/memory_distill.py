@@ -104,12 +104,43 @@ def prepare(args):
     return {"tasks": tasks, "count": len(tasks), "dry_run": args.dry_run}
 
 
+def _codex_command(codex_bin, task_dir, result_path):
+    if Path(codex_bin).name != "codex":
+        return [codex_bin]
+    prompt = (
+        "Distill this temporary research-agent-memory task. "
+        "Use only the data below. Return only a raw JSON object matching "
+        "distillation-result/v1; do not wrap it in Markdown.\n\n"
+        "task.json:\n"
+        + (task_dir / "task.json").read_text(encoding="utf-8")
+        + "\nsource.md:\n"
+        + (task_dir / "source.md").read_text(encoding="utf-8")
+        + "\nexisting_memories.json:\n"
+        + (task_dir / "existing_memories.json").read_text(encoding="utf-8")
+    )
+    return [
+        codex_bin,
+        "exec",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--ignore-rules",
+        "--sandbox",
+        "workspace-write",
+        "--output-last-message",
+        str(result_path),
+        "-C",
+        str(task_dir),
+        prompt,
+    ]
+
+
 def run_task(args):
     task_dir = Path(args.task_dir).resolve(strict=True)
     result_path = task_dir / "distillation_result.json"
+    command = _codex_command(args.codex_bin, task_dir, result_path)
     try:
         result = subprocess.run(
-            [args.codex_bin],
+            command,
             cwd=task_dir,
             text=True,
             capture_output=True,
