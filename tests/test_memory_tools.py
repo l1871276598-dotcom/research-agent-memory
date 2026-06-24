@@ -57,7 +57,32 @@ class MemoryToolsTests(unittest.TestCase):
                     relative_path TEXT PRIMARY KEY, sha256 TEXT NOT NULL,
                     mtime_ns INTEGER NOT NULL, indexed_at TEXT NOT NULL
                 );
-                PRAGMA user_version = 1;
+                CREATE TABLE documents (
+                    id TEXT PRIMARY KEY,
+                    source_kind TEXT NOT NULL,
+                    source_id TEXT,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    workspace TEXT NOT NULL,
+                    confidentiality TEXT NOT NULL,
+                    project TEXT,
+                    context_id TEXT,
+                    updated TEXT,
+                    relative_path TEXT NOT NULL UNIQUE,
+                    sha256 TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX idx_documents_source_kind ON documents(source_kind);
+                CREATE INDEX idx_documents_project ON documents(project);
+                CREATE INDEX idx_documents_workspace_confidentiality ON documents(workspace, confidentiality);
+                CREATE VIRTUAL TABLE document_fts USING fts5(
+                    id UNINDEXED, title, content, source_kind, project, tokenize='unicode61'
+                );
+                CREATE TABLE document_index_state (
+                    relative_path TEXT PRIMARY KEY, sha256 TEXT NOT NULL,
+                    mtime_ns INTEGER NOT NULL, indexed_at TEXT NOT NULL
+                );
+                PRAGMA user_version = 3;
                 """
             )
             row = (

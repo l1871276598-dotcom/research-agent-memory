@@ -479,7 +479,8 @@ class ValidateCommandTests(unittest.TestCase):
             self.assertEqual(self.run_init(root).returncode, 0)
             self.assertEqual(self.run_add(root).returncode, 0)
             path = self.first_memory_file(root)
-            self.replace_in_file(path, 'created: "2026-06-22"', 'created: "2026-02-30"')
+            line = re.search(r'^created: "\d{4}-\d{2}-\d{2}"\n', path.read_text(encoding="utf-8"), re.MULTILINE).group(0)
+            self.replace_in_file(path, line, 'created: "2026-02-30"\n')
 
             result = self.run_validate(root)
 
@@ -1137,7 +1138,10 @@ class DbInitCommandTests(unittest.TestCase):
                     """
                     SELECT name, type
                     FROM sqlite_master
-                    WHERE name IN ('memories', 'memory_fts', 'index_state')
+                    WHERE name IN (
+                        'memories', 'memory_fts', 'index_state',
+                        'documents', 'document_fts', 'document_index_state'
+                    )
                     """
                 ).fetchall()
             )
@@ -1179,9 +1183,19 @@ class DbInitCommandTests(unittest.TestCase):
                     ("代码*",),
                 ).fetchall()
 
-            self.assertEqual(version, 1)
+            self.assertEqual(version, 3)
             self.assertEqual(mode.lower(), "wal")
-            self.assertEqual(objects, {"memories": "table", "memory_fts": "table", "index_state": "table"})
+            self.assertEqual(
+                objects,
+                {
+                    "memories": "table",
+                    "memory_fts": "table",
+                    "index_state": "table",
+                    "documents": "table",
+                    "document_fts": "table",
+                    "document_index_state": "table",
+                },
+            )
             self.assertEqual(
                 self.columns(db, "memories"),
                 [
@@ -1208,6 +1222,28 @@ class DbInitCommandTests(unittest.TestCase):
             )
             self.assertEqual(
                 self.columns(db, "index_state"),
+                ["relative_path", "sha256", "mtime_ns", "indexed_at"],
+            )
+            self.assertEqual(
+                self.columns(db, "documents"),
+                [
+                    "id",
+                    "source_kind",
+                    "source_id",
+                    "title",
+                    "content",
+                    "workspace",
+                    "confidentiality",
+                    "project",
+                    "context_id",
+                    "updated",
+                    "relative_path",
+                    "sha256",
+                    "metadata_json",
+                ],
+            )
+            self.assertEqual(
+                self.columns(db, "document_index_state"),
                 ["relative_path", "sha256", "mtime_ns", "indexed_at"],
             )
             self.assertEqual(result, [("probe",)])
@@ -1798,6 +1834,263 @@ class IndexCommandTests(unittest.TestCase):
             self.assertEqual(self.run_index(root, state_dir).returncode, 0)
 
             self.assertEqual(sorted(path.name for path in state_dir.iterdir()), ["memory.sqlite"])
+
+
+class UnifiedSearchCommandTests(unittest.TestCase):
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(MEMORY_CLI), *args],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+
+    def run_init(self, root):
+        return self.run_cli("init", "--root", str(root))
+
+    def run_db_init(self, root, state_dir):
+        return self.run_cli("db-init", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_db_rebuild(self, root, state_dir):
+        return self.run_cli("db-rebuild", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_index(self, root, state_dir, *extra):
+        return self.run_cli("index", "--root", str(root), "--state-dir", str(state_dir), *extra)
+
+    def run_search(self, root, state_dir, query, *extra):
+        return self.run_cli(
+            "search",
+            query,
+            "--root",
+            str(root),
+            "--state-dir",
+            str(state_dir),
+            "--json",
+            *extra,
+        )
+
+    def run_add(self, root, **kwargs):
+        args = [
+            "add",
+            "--root",
+            str(root),
+            "--type",
+            kwargs.pop("memory_type", "principle"),
+            "--title",
+            kwargs.pop("title", "代码最少原则"),
+            "--scope",
+            kwargs.pop("scope", "global"),
+            "--workspace",
+            kwargs.pop("workspace", "personal"),
+            "--confidentiality",
+            kwargs.pop("confidentiality", "personal"),
+            "--source",
+            "user",
+            "--confidence",
+            "confirmed",
+            "--content",
+            kwargs.pop("content", "使用尽可能少的代码实现相同功能。"),
+        ]
+        for option, value in kwargs.items():
+            flag = "--" + option.replace("_", "-")
+            if isinstance(value, list):
+                args.append(flag)
+                args.extend(value)
+            elif value is not None:
+                args.extend([flag, value])
+        return self.run_cli(*args)
+
+    def setup_store(self, tmp):
+        root = Path(tmp) / "data"
+        state_dir = Path(tmp) / "state"
+        self.assertEqual(self.run_init(root).returncode, 0)
+        self.assertEqual(self.run_db_init(root, state_dir).returncode, 0)
+        return root, state_dir, state_dir / "memory.sqlite"
+
+    def rows(self, db, sql, params=()):
+        with sqlite3.connect(db) as conn:
+            return conn.execute(sql, params).fetchall()
+
+    def write_document(self, root, relative, body, front_matter=None):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if front_matter:
+            lines = ["---"]
+            for key, value in front_matter.items():
+                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+            lines.extend(["---", "", body])
+            path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        else:
+            path.write_text(body, encoding="utf-8")
+        return path
+
+    def test_db_init_creates_schema_v3_document_tables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _, db = self.setup_store(tmp)
+
+            [(version,)] = self.rows(db, "PRAGMA user_version")
+            tables = {name for (name,) in self.rows(db, "SELECT name FROM sqlite_master WHERE type IN ('table', 'virtual table')")}
+
+            self.assertEqual(version, 3)
+            self.assertIn("documents", tables)
+            self.assertIn("document_fts", tables)
+            self.assertIn("document_index_state", tables)
+
+    def test_db_rebuild_creates_schema_v3_and_indexes_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add(root, title="代码最少原则", content="使用尽可能少的代码实现相同功能。").returncode, 0)
+            self.write_document(root, "imports/chatgpt/conversations/2026/06/thread.md", "PDC raw conversation evidence")
+
+            result = self.run_db_rebuild(root, state_dir)
+            db = state_dir / "memory.sqlite"
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Database rebuilt", result.stdout)
+            [(version,)] = self.rows(db, "PRAGMA user_version")
+            self.assertEqual(version, 3)
+            self.assertEqual(self.rows(db, "SELECT COUNT(*) FROM memories"), [(1,)])
+            self.assertEqual(self.rows(db, "SELECT COUNT(*) FROM documents"), [(1,)])
+
+    def test_index_adds_memory_and_documents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root, project="ljq", scope="project").returncode, 0)
+            self.write_document(root, "imports/chatgpt/conversations/2026/06/thread.md", "PDC raw conversation evidence")
+            self.write_document(root, "imports/manual/raw/note.txt", "Manual raw note about PDC review cadence")
+            self.write_document(root, "literature/notes/pdc-note.md", "PDC literature note for target journal", {"project": "ljq"})
+            self.write_document(root, "manuscripts/current/paper.md", "Manuscript sentence about impact angle", {"project": "ljq"})
+
+            result = self.run_index(root, state_dir)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.rows(db, "SELECT COUNT(*) FROM memories"), [(1,)])
+            self.assertEqual(self.rows(db, "SELECT COUNT(*) FROM documents"), [(4,)])
+            self.assertIn("Documents added: 4", result.stdout)
+
+    def test_search_defaults_to_memory_and_documents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root, title="PDC principle", content="PDC evidence must be traceable.").returncode, 0)
+            self.write_document(root, "manuscripts/current/pdc-paper.md", "PDC manuscript sentence with traceable evidence")
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            result = self.run_search(root, state_dir, "PDC")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            rows = json.loads(result.stdout)
+            kinds = {row["kind"] for row in rows}
+            self.assertIn("memory", kinds)
+            self.assertIn("document", kinds)
+            self.assertTrue(all(row["confidentiality"] != "restricted" for row in rows))
+
+    def test_search_supports_kind_source_and_project_filters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            self.write_document(root, "literature/notes/pdc-note.md", "PDC literature note", {"project": "ljq"})
+            self.write_document(root, "manuscripts/current/pdc-paper.md", "PDC manuscript sentence", {"project": "other"})
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            result = self.run_search(root, state_dir, "PDC", "--kind", "document", "--source-kind", "literature", "--project", "ljq")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            rows = json.loads(result.stdout)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["kind"], "document")
+            self.assertEqual(rows[0]["source_kind"], "literature")
+            self.assertEqual(rows[0]["project"], "ljq")
+
+    def test_search_does_not_return_restricted_documents_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            self.write_document(root, "manuscripts/current/public.md", "PDC public manuscript", {"project": "ljq"})
+            self.write_document(
+                root,
+                "manuscripts/evidence/restricted.md",
+                "PDC restricted evidence",
+                {"workspace": "work", "confidentiality": "restricted", "project": "ljq"},
+            )
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            result = self.run_search(root, state_dir, "PDC", "--kind", "document", "--project", "ljq")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            rows = json.loads(result.stdout)
+            self.assertEqual([row["relative_path"] for row in rows], ["manuscripts/current/public.md"])
+
+    def test_search_supports_manual_raw_chatgpt_literature_and_manuscript_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            self.write_document(
+                root,
+                "imports/chatgpt/conversations/2026/06/thread.md",
+                "PDC ChatGPT archive discussion",
+                {"conversation_id": "thread-1", "title": "Archive Thread"},
+            )
+            self.write_document(root, "imports/manual/raw/note.txt", "PDC manual raw note")
+            self.write_document(root, "literature/notes/pdc-note.md", "PDC literature note")
+            self.write_document(root, "manuscripts/current/paper.md", "PDC manuscript sentence")
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            for source_kind, expected_path in [
+                ("chatgpt", "imports/chatgpt/conversations/2026/06/thread.md"),
+                ("manual", "imports/manual/raw/note.txt"),
+                ("literature", "literature/notes/pdc-note.md"),
+                ("manuscript", "manuscripts/current/paper.md"),
+            ]:
+                with self.subTest(source_kind=source_kind):
+                    result = self.run_search(root, state_dir, "PDC", "--kind", "document", "--source-kind", source_kind)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    rows = json.loads(result.stdout)
+                    self.assertEqual([row["relative_path"] for row in rows], [expected_path])
+
+    def test_index_tracks_document_update_delete_and_avoids_duplicate_fts_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            note = self.write_document(root, "imports/manual/raw/note.txt", "PDC first version")
+
+            first = self.run_index(root, state_dir)
+            second = self.run_index(root, state_dir)
+
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertIn("Documents added: 1", first.stdout)
+            self.assertIn("Documents unchanged: 1", second.stdout)
+            self.assertEqual(self.rows(db, "SELECT COUNT(*) FROM document_fts"), [(1,)])
+
+            note.write_text("PDC second version", encoding="utf-8")
+            updated = self.run_index(root, state_dir)
+            self.assertEqual(updated.returncode, 0, updated.stdout + updated.stderr)
+            self.assertIn("Documents updated: 1", updated.stdout)
+            self.assertEqual(self.rows(db, "SELECT COUNT(*) FROM document_fts"), [(1,)])
+
+            note.unlink()
+            deleted = self.run_index(root, state_dir)
+            self.assertEqual(deleted.returncode, 0, deleted.stdout + deleted.stderr)
+            self.assertIn("Documents deleted: 1", deleted.stdout)
+            self.assertEqual(self.rows(db, "SELECT COUNT(*) FROM documents"), [(0,)])
+            self.assertEqual(self.rows(db, "SELECT COUNT(*) FROM document_fts"), [(0,)])
+
+    def test_search_supports_workspace_filter_and_rejects_stale_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            doc = self.write_document(root, "manuscripts/current/work.md", "PDC work manuscript", {"workspace": "work"})
+            self.write_document(root, "manuscripts/current/personal.md", "PDC personal manuscript", {"workspace": "personal"})
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            filtered = self.run_search(root, state_dir, "PDC", "--kind", "document", "--workspace", "work")
+
+            self.assertEqual(filtered.returncode, 0, filtered.stdout + filtered.stderr)
+            rows = json.loads(filtered.stdout)
+            self.assertEqual([row["relative_path"] for row in rows], ["manuscripts/current/work.md"])
+
+            doc.write_text("PDC changed work manuscript", encoding="utf-8")
+            stale = self.run_search(root, state_dir, "PDC", "--kind", "document")
+
+            self.assertNotEqual(stale.returncode, 0)
+            self.assertIn("Search aborted because the index is stale. Run index first.", stale.stderr)
 
 
 class ExportCommandTests(unittest.TestCase):

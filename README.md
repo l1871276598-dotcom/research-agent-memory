@@ -22,6 +22,8 @@ python3 src/memory.py export --root PATH
 python3 src/memory.py context-transition ...
 python3 src/memory.py db-init --root PATH
 python3 src/memory.py index --root PATH
+python3 src/memory.py db-rebuild --root PATH
+python3 src/memory.py search "QUERY" --root PATH
 ```
 
 已实现：
@@ -33,25 +35,21 @@ python3 src/memory.py index --root PATH
 - 确定性 JSONL 导出和 SHA-256 清单
 - 事务式情景迁移
 - 本地 SQLite FTS5 初始化
-- Markdown 记忆增量索引
+- Markdown 记忆、ChatGPT 原始归档、手工原文、文献笔记和稿件文件增量索引
+- 统一全文搜索，可按记忆/文档、来源、项目和 workspace 过滤
 - 中文二元词索引预处理
 
 ### 轻量扩展命令
 
-为避免继续扩大核心 `memory.py`，检索和 ChatGPT 归档暂放在一个轻量入口中：
+ChatGPT 导入和实时归档暂放在一个轻量入口中：
 
 ```bash
-python3 src/memory_tools.py search ...
 python3 src/memory_tools.py import-chatgpt ...
 python3 src/memory_tools.py serve-chatgpt ...
 ```
 
 已实现：
 
-- SQLite FTS5 全文检索
-- 中文部分短语检索
-- 按类型、项目、workspace 和状态过滤
-- 文本或 JSON 输出
 - 从 ChatGPT 官方导出 ZIP 中识别 `conversations.json`
 - 将当前活动分支的文本消息归档为 Markdown
 - 使用对话 ID 和内容哈希进行幂等更新
@@ -147,38 +145,66 @@ python3 src/memory.py index \
   --dry-run
 ```
 
+如需从 Markdown 和原始文本证据重建 SQLite 派生索引：
+
+```bash
+python3 src/memory.py db-rebuild \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR"
+```
+
 ## 搜索记忆
 
 基础搜索：
 
 ```bash
-python3 src/memory_tools.py search "代码最少" \
+python3 src/memory.py search "代码最少" \
   --root "$DATA_ROOT" \
   --state-dir "$STATE_DIR"
 ```
 
-按项目和类型过滤：
+按项目和来源过滤：
 
 ```bash
-python3 src/memory_tools.py search "论文证据链" \
+python3 src/memory.py search "论文证据链" \
   --root "$DATA_ROOT" \
   --state-dir "$STATE_DIR" \
   --project pdc-rock-manuscript \
-  --type procedure
+  --kind document \
+  --source-kind manuscript
 ```
 
 输出 JSON：
 
 ```bash
-python3 src/memory_tools.py search "RMRE" \
+python3 src/memory.py search "RMRE" \
   --root "$DATA_ROOT" \
   --state-dir "$STATE_DIR" \
   --json
 ```
 
-搜索前必须先完成 `db-init` 和 `index`。
+搜索前必须先完成 `db-init` 和 `index`。索引过期时搜索会拒绝返回结果，并提示先重新运行 `index`。
+
+默认搜索会合并结构化记忆和已索引文档。文档来源包括：
+
+- `imports/chatgpt/conversations/`
+- `imports/manual/raw/`
+- `literature/notes/`
+- `literature/journals/`
+- `manuscripts/current/`
+- `manuscripts/evidence/`
+- `manuscripts/archive/`
 
 ## 导入 ChatGPT 官方导出
+
+手动流程：
+
+```text
+用户在 ChatGPT 中申请数据导出
+→ 用户自行从邮件下载 ZIP
+→ 手动运行 import-chatgpt
+→ 归档为 Markdown
+```
 
 先预演：
 
@@ -205,6 +231,8 @@ imports/chatgpt/import_manifest.json
 ```
 
 重复导入相同内容不会重复创建对话文件；对话内容发生变化时会更新原文件。
+
+该仓库不接入 Gmail，不需要 Google OAuth，不自动下载 ZIP，也不安装同步 LaunchAgent。用户自行下载官方导出 ZIP 后再运行 `import-chatgpt`；重复导入保持幂等。
 
 ## 实时归档当前 ChatGPT 对话
 

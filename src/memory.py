@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import uuid
@@ -19,6 +20,8 @@ DIRECTORIES = [
     "memory/decisions",
     "memory/procedures",
     "memory/sessions",
+    "imports/chatgpt/conversations",
+    "imports/manual/raw",
     "literature/inbox",
     "literature/pdf",
     "literature/notes",
@@ -105,7 +108,7 @@ FILES = {
     ),
 }
 DB_NAME = "memory.sqlite"
-DB_SCHEMA_VERSION = 1
+DB_SCHEMA_VERSION = 3
 STATE_DIR_ERROR = "SQLite state directory must be local and outside iCloud and the code repository."
 MEMORIES_COLUMNS = [
     "id",
@@ -129,11 +132,32 @@ MEMORIES_COLUMNS = [
     "sha256",
 ]
 INDEX_STATE_COLUMNS = ["relative_path", "sha256", "mtime_ns", "indexed_at"]
+DOCUMENTS_COLUMNS = [
+    "id",
+    "source_kind",
+    "source_id",
+    "title",
+    "content",
+    "workspace",
+    "confidentiality",
+    "project",
+    "context_id",
+    "updated",
+    "relative_path",
+    "sha256",
+    "metadata_json",
+]
+DOCUMENT_INDEX_STATE_COLUMNS = ["relative_path", "sha256", "mtime_ns", "indexed_at"]
 REQUIRED_INDEXES = {
     "idx_memories_type",
     "idx_memories_project",
     "idx_memories_context",
     "idx_memories_workspace_status",
+}
+REQUIRED_DOCUMENT_INDEXES = {
+    "idx_documents_source_kind",
+    "idx_documents_project",
+    "idx_documents_workspace_confidentiality",
 }
 CJK_RUN = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF]+")
 
@@ -1076,7 +1100,40 @@ def _create_schema(conn):
             mtime_ns INTEGER NOT NULL,
             indexed_at TEXT NOT NULL
         );
-        PRAGMA user_version = 1;
+        CREATE TABLE documents (
+            id TEXT PRIMARY KEY,
+            source_kind TEXT NOT NULL,
+            source_id TEXT,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            workspace TEXT NOT NULL,
+            confidentiality TEXT NOT NULL,
+            project TEXT,
+            context_id TEXT,
+            updated TEXT,
+            relative_path TEXT NOT NULL UNIQUE,
+            sha256 TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX idx_documents_source_kind ON documents(source_kind);
+        CREATE INDEX idx_documents_project ON documents(project);
+        CREATE INDEX idx_documents_workspace_confidentiality
+            ON documents(workspace, confidentiality);
+        CREATE VIRTUAL TABLE document_fts USING fts5(
+            id UNINDEXED,
+            title,
+            content,
+            source_kind,
+            project,
+            tokenize = 'unicode61'
+        );
+        CREATE TABLE document_index_state (
+            relative_path TEXT PRIMARY KEY,
+            sha256 TEXT NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            indexed_at TEXT NOT NULL
+        );
+        PRAGMA user_version = 3;
         """
     )
 
@@ -1092,7 +1149,10 @@ def _target_tables(conn):
             """
             SELECT name, type, sql
             FROM sqlite_master
-            WHERE name IN ('memories', 'memory_fts', 'index_state')
+            WHERE name IN (
+                'memories', 'memory_fts', 'index_state',
+                'documents', 'document_fts', 'document_index_state'
+            )
             """
         )
     }
@@ -1110,14 +1170,28 @@ def inspect_database(db):
                 raise ValueError("Incompatible SQLite schema version.")
             if str(mode).lower() != "wal":
                 raise ValueError("SQLite journal_mode WAL could not be verified.")
-            if set(tables) != {"memories", "memory_fts", "index_state"}:
+            required_tables = {
+                "memories",
+                "memory_fts",
+                "index_state",
+                "documents",
+                "document_fts",
+                "document_index_state",
+            }
+            if set(tables) != required_tables:
                 raise ValueError("SQLite schema is incomplete.")
             if "CREATE VIRTUAL TABLE" not in tables["memory_fts"][1].upper():
+                raise ValueError("SQLite FTS5 table is missing.")
+            if "CREATE VIRTUAL TABLE" not in tables["document_fts"][1].upper():
                 raise ValueError("SQLite FTS5 table is missing.")
             if _table_columns(conn, "memories") != MEMORIES_COLUMNS:
                 raise ValueError("SQLite memories table columns do not match.")
             if _table_columns(conn, "index_state") != INDEX_STATE_COLUMNS:
                 raise ValueError("SQLite index_state table columns do not match.")
+            if _table_columns(conn, "documents") != DOCUMENTS_COLUMNS:
+                raise ValueError("SQLite documents table columns do not match.")
+            if _table_columns(conn, "document_index_state") != DOCUMENT_INDEX_STATE_COLUMNS:
+                raise ValueError("SQLite document_index_state table columns do not match.")
             indexes = {
                 row[0]
                 for row in conn.execute(
@@ -1126,6 +1200,14 @@ def inspect_database(db):
             }
             if not REQUIRED_INDEXES.issubset(indexes):
                 raise ValueError("SQLite memories indexes are incomplete.")
+            document_indexes = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_documents_%'"
+                )
+            }
+            if not REQUIRED_DOCUMENT_INDEXES.issubset(document_indexes):
+                raise ValueError("SQLite documents indexes are incomplete.")
             return {"initialized": True, "version": version}
     except sqlite3.DatabaseError as exc:
         raise ValueError("Invalid SQLite database.") from exc
@@ -1215,8 +1297,38 @@ def db_init(args):
         "state_dir": state,
         "database": db,
         "version": DB_SCHEMA_VERSION,
-        "tables": ["memories", "memory_fts", "index_state"],
+        "tables": ["memories", "memory_fts", "index_state", "documents", "document_fts", "document_index_state"],
     }
+
+
+def db_rebuild(args):
+    root, _, errors, _ = collect_validated_records(args.root)
+    if errors:
+        messages = [f"ERROR {rel_path}: {message}" for rel_path, message in errors]
+        raise ValueError("\n".join(messages + ["Database rebuild aborted because validation failed."]))
+
+    check_fts5()
+    state_dir = args.state_dir if args.state_dir else default_state_dir()
+    state, db = check_state_dir(root, state_dir)
+    state.mkdir(parents=True, exist_ok=True)
+    tmp_state = state / f".rebuild-{uuid.uuid4().hex}"
+    tmp_db = tmp_state / DB_NAME
+    try:
+        tmp_state.mkdir()
+        create_database(tmp_db)
+        index_summary = index_store(argparse.Namespace(root=str(root), state_dir=str(tmp_state), dry_run=False))
+        _remove_sqlite_sidecars(db)
+        tmp_db.replace(db)
+        _remove_sqlite_sidecars(tmp_db)
+        checkpoint_database(db)
+        return {
+            "database": db,
+            "version": DB_SCHEMA_VERSION,
+            "memories": index_summary["memories"],
+            "documents": index_summary["documents"],
+        }
+    finally:
+        shutil.rmtree(tmp_state, ignore_errors=True)
 
 
 def normalize_fts_text(value):
@@ -1294,6 +1406,127 @@ def _current_index_items(root, records):
     return sorted(items, key=lambda value: value["relative_path"])
 
 
+def document_source_kind(relative_path):
+    if relative_path.startswith("imports/chatgpt/conversations/"):
+        return "chatgpt"
+    if relative_path.startswith("imports/manual/raw/"):
+        return "manual"
+    if relative_path.startswith("literature/notes/"):
+        return "literature"
+    if relative_path.startswith("literature/journals/"):
+        return "journal"
+    if (
+        relative_path.startswith("manuscripts/current/")
+        or relative_path.startswith("manuscripts/evidence/")
+        or relative_path.startswith("manuscripts/archive/")
+    ):
+        return "manuscript"
+    return None
+
+
+def parse_document_frontmatter(text):
+    metadata = {
+        "workspace": "personal",
+        "confidentiality": "personal",
+        "project": None,
+        "context_id": None,
+    }
+    body = text
+    if text.startswith("---\n"):
+        lines = text.splitlines()
+        try:
+            end = lines.index("---", 1)
+        except ValueError:
+            return metadata, text
+        for line in lines[1:end]:
+            if ":" not in line or line.startswith(" "):
+                continue
+            key, raw = line.split(":", 1)
+            key = key.strip()
+            raw = raw.strip()
+            if key not in {"title", "conversation_id", "archive_id", "workspace", "confidentiality", "project", "context_id", "updated"}:
+                continue
+            try:
+                value = json.loads(raw) if raw.startswith('"') else raw
+            except json.JSONDecodeError:
+                value = raw
+            if value == "null":
+                value = None
+            metadata[key] = value
+        body = "\n".join(lines[end + 1 :]).strip()
+    return metadata, body
+
+
+def _sha16(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def document_id_for_path(relative_path, source_kind, source_id, sha256):
+    if source_kind == "chatgpt" and source_id:
+        return f"doc:chatgpt:{source_id}"
+    if source_kind == "manual":
+        return f"doc:manual:{sha256[:16]}"
+    return f"doc:file:{_sha16(relative_path)}"
+
+
+def _document_title(path, metadata):
+    title = metadata.get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    return path.stem or path.name
+
+
+def collect_document_items(root):
+    root = _require_data_root(root)
+    items = []
+    for base in [
+        root / "imports" / "chatgpt" / "conversations",
+        root / "imports" / "manual" / "raw",
+        root / "literature" / "notes",
+        root / "literature" / "journals",
+        root / "manuscripts" / "current",
+        root / "manuscripts" / "evidence",
+        root / "manuscripts" / "archive",
+    ]:
+        if not base.exists():
+            continue
+        for path in sorted(base.rglob("*")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            rel_path = path.relative_to(root).as_posix()
+            source_kind = document_source_kind(rel_path)
+            if source_kind is None:
+                continue
+            try:
+                raw = path.read_bytes()
+                text = raw.decode("utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            metadata, body = parse_document_frontmatter(text)
+            if not body.strip():
+                continue
+            source_id = metadata.get("conversation_id") or metadata.get("archive_id")
+            sha256 = hashlib.sha256(raw).hexdigest()
+            item = {
+                "id": document_id_for_path(rel_path, source_kind, source_id, sha256),
+                "source_kind": source_kind,
+                "source_id": source_id,
+                "title": _document_title(path, metadata),
+                "content": body.strip(),
+                "workspace": metadata.get("workspace") or "personal",
+                "confidentiality": metadata.get("confidentiality") or "personal",
+                "project": metadata.get("project"),
+                "context_id": metadata.get("context_id"),
+                "updated": metadata.get("updated"),
+                "relative_path": rel_path,
+                "sha256": sha256,
+                "mtime_ns": path.stat().st_mtime_ns,
+                "metadata_json": json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            }
+            items.append(item)
+    return sorted(items, key=lambda value: value["relative_path"])
+
+
 def _database_index_state(conn):
     memories = [
         dict(zip(MEMORIES_COLUMNS, row))
@@ -1310,6 +1543,27 @@ def _database_index_state(conn):
     return {
         "memories_by_id": {row["id"]: row for row in memories},
         "memories_by_path": {row["relative_path"]: row for row in memories},
+        "index_state": index_state,
+        "fts_counts": fts_counts,
+    }
+
+
+def _database_document_state(conn):
+    documents = [
+        dict(zip(DOCUMENTS_COLUMNS, row))
+        for row in conn.execute("SELECT " + ", ".join(DOCUMENTS_COLUMNS) + " FROM documents")
+    ]
+    index_state = {
+        row[0]: {"sha256": row[1], "mtime_ns": row[2], "indexed_at": row[3]}
+        for row in conn.execute("SELECT relative_path, sha256, mtime_ns, indexed_at FROM document_index_state")
+    }
+    fts_counts = {
+        row[0]: row[1]
+        for row in conn.execute("SELECT id, COUNT(*) FROM document_fts GROUP BY id")
+    }
+    return {
+        "documents_by_id": {row["id"]: row for row in documents},
+        "documents_by_path": {row["relative_path"]: row for row in documents},
         "index_state": index_state,
         "fts_counts": fts_counts,
     }
@@ -1362,6 +1616,52 @@ def plan_index_changes(conn, items):
     }
 
 
+def plan_document_changes(conn, items):
+    state = _database_document_state(conn)
+    current_paths = {item["relative_path"] for item in items}
+    current_ids = {item["id"] for item in items}
+    added = []
+    updated = []
+    unchanged = []
+    deleted = []
+
+    for relative_path in sorted(set(state["index_state"]) - current_paths):
+        old = state["documents_by_path"].get(relative_path)
+        if old and old["id"] in current_ids:
+            continue
+        deleted.append({"relative_path": relative_path, "id": old["id"] if old else None})
+
+    for item in items:
+        document_id = item["id"]
+        relative_path = item["relative_path"]
+        state_row = state["index_state"].get(relative_path)
+        document_row = state["documents_by_id"].get(document_id)
+        path_row = state["documents_by_path"].get(relative_path)
+        fts_count = state["fts_counts"].get(document_id, 0)
+        if (
+            state_row
+            and state_row["sha256"] == item["sha256"]
+            and document_row
+            and document_row["relative_path"] == relative_path
+            and path_row
+            and path_row["id"] == document_id
+            and fts_count == 1
+        ):
+            unchanged.append(item)
+        elif not state_row and document_id not in state["documents_by_id"] and not path_row:
+            added.append(item)
+        else:
+            updated.append(item)
+
+    return {
+        "added": added,
+        "updated": updated,
+        "deleted": deleted,
+        "unchanged": unchanged,
+        "state": state,
+    }
+
+
 def _upsert_memory(conn, item, indexed_at):
     values = _record_to_db_values(item)
     columns = MEMORIES_COLUMNS
@@ -1382,6 +1682,45 @@ def _upsert_memory(conn, item, indexed_at):
     conn.execute(
         """
         INSERT INTO index_state(relative_path, sha256, mtime_ns, indexed_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(relative_path) DO UPDATE SET
+            sha256 = excluded.sha256,
+            mtime_ns = excluded.mtime_ns,
+            indexed_at = excluded.indexed_at
+        """,
+        (item["relative_path"], item["sha256"], item["mtime_ns"], indexed_at),
+    )
+
+
+def _document_fts_values(item):
+    return (
+        item["id"],
+        normalize_fts_text(item["title"]),
+        normalize_fts_text(item["content"]),
+        normalize_fts_text(item["source_kind"]),
+        normalize_fts_text(item.get("project") or ""),
+    )
+
+
+def _upsert_document(conn, item, indexed_at):
+    columns = DOCUMENTS_COLUMNS
+    placeholders = ", ".join("?" for _ in columns)
+    updates = ", ".join(f"{column} = excluded.{column}" for column in columns if column != "id")
+    conn.execute(
+        f"""
+        INSERT INTO documents ({", ".join(columns)})
+        VALUES ({placeholders})
+        ON CONFLICT(id) DO UPDATE SET {updates}
+        """,
+        tuple(item[column] for column in columns),
+    )
+    conn.execute(
+        "INSERT INTO document_fts(id, title, content, source_kind, project) VALUES (?, ?, ?, ?, ?)",
+        _document_fts_values(item),
+    )
+    conn.execute(
+        """
+        INSERT INTO document_index_state(relative_path, sha256, mtime_ns, indexed_at)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(relative_path) DO UPDATE SET
             sha256 = excluded.sha256,
@@ -1431,6 +1770,45 @@ def check_index_consistency(conn, expected_count):
         raise ValueError("SQLite index consistency check failed.")
 
 
+def check_document_index_consistency(conn, expected_count):
+    counts = {
+        "documents": conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0],
+        "document_index_state": conn.execute("SELECT COUNT(*) FROM document_index_state").fetchone()[0],
+        "fts_distinct": conn.execute("SELECT COUNT(DISTINCT id) FROM document_fts").fetchone()[0],
+    }
+    if any(value != expected_count for value in counts.values()):
+        raise ValueError("SQLite document index consistency check failed.")
+    if conn.execute("SELECT id FROM document_fts GROUP BY id HAVING COUNT(*) > 1").fetchone():
+        raise ValueError("SQLite document index consistency check failed.")
+    if conn.execute(
+        """
+        SELECT documents.relative_path
+        FROM documents
+        LEFT JOIN document_index_state USING(relative_path)
+        WHERE document_index_state.relative_path IS NULL
+        """
+    ).fetchone():
+        raise ValueError("SQLite document index consistency check failed.")
+    if conn.execute(
+        """
+        SELECT document_index_state.relative_path
+        FROM document_index_state
+        LEFT JOIN documents USING(relative_path)
+        WHERE documents.relative_path IS NULL
+        """
+    ).fetchone():
+        raise ValueError("SQLite document index consistency check failed.")
+    if conn.execute(
+        """
+        SELECT documents.id
+        FROM documents
+        LEFT JOIN document_fts ON document_fts.id = documents.id
+        WHERE document_fts.id IS NULL
+        """
+    ).fetchone():
+        raise ValueError("SQLite document index consistency check failed.")
+
+
 def apply_index_changes(conn, plan, expected_count):
     indexed_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     for item in plan["deleted"]:
@@ -1458,6 +1836,33 @@ def apply_index_changes(conn, plan, expected_count):
     check_index_consistency(conn, expected_count)
 
 
+def apply_document_changes(conn, plan, expected_count):
+    indexed_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    for item in plan["deleted"]:
+        if item["id"]:
+            conn.execute("DELETE FROM document_fts WHERE id = ?", (item["id"],))
+            conn.execute("DELETE FROM documents WHERE id = ?", (item["id"],))
+        conn.execute("DELETE FROM documents WHERE relative_path = ?", (item["relative_path"],))
+        conn.execute("DELETE FROM document_index_state WHERE relative_path = ?", (item["relative_path"],))
+
+    for item in plan["added"] + plan["updated"]:
+        document_id = item["id"]
+        old = plan["state"]["documents_by_id"].get(document_id)
+        if old and old["relative_path"] != item["relative_path"]:
+            conn.execute("DELETE FROM document_index_state WHERE relative_path = ?", (old["relative_path"],))
+        conflicts = conn.execute(
+            "SELECT id FROM documents WHERE relative_path = ? AND id != ?",
+            (item["relative_path"], document_id),
+        ).fetchall()
+        for (conflict_id,) in conflicts:
+            conn.execute("DELETE FROM document_fts WHERE id = ?", (conflict_id,))
+            conn.execute("DELETE FROM documents WHERE id = ?", (conflict_id,))
+        conn.execute("DELETE FROM document_fts WHERE id = ?", (document_id,))
+        _upsert_document(conn, item, indexed_at)
+
+    check_document_index_consistency(conn, expected_count)
+
+
 def index_store(args):
     root, records, errors, _ = collect_validated_records(args.root)
     if errors:
@@ -1473,14 +1878,28 @@ def index_store(args):
         raise ValueError("Database is not initialized. Run db-init first.")
 
     items = _current_index_items(root, records)
+    document_items = collect_document_items(root)
     with sqlite3.connect(db) as conn:
         conn.execute("PRAGMA busy_timeout = 5000")
         plan = plan_index_changes(conn, items)
+        document_plan = plan_document_changes(conn, document_items)
         result = {
             "added": len(plan["added"]),
             "updated": len(plan["updated"]),
             "deleted": len(plan["deleted"]),
             "unchanged": len(plan["unchanged"]),
+            "memories": {
+                "added": len(plan["added"]),
+                "updated": len(plan["updated"]),
+                "deleted": len(plan["deleted"]),
+                "unchanged": len(plan["unchanged"]),
+            },
+            "documents": {
+                "added": len(document_plan["added"]),
+                "updated": len(document_plan["updated"]),
+                "deleted": len(document_plan["deleted"]),
+                "unchanged": len(document_plan["unchanged"]),
+            },
             "database": db,
             "dry_run": args.dry_run,
         }
@@ -1489,6 +1908,7 @@ def index_store(args):
         try:
             conn.execute("BEGIN")
             apply_index_changes(conn, plan, len(items))
+            apply_document_changes(conn, document_plan, len(document_items))
             conn.commit()
         except Exception:
             conn.rollback()
@@ -1496,6 +1916,136 @@ def index_store(args):
 
     checkpoint_database(db)
     return result
+
+
+def _query_tokens(text):
+    parts = []
+    last = 0
+    for match in CJK_RUN.finditer(text):
+        parts.extend(text[last : match.start()].split())
+        run = match.group(0)
+        parts.extend(run[index : index + 2] for index in range(max(1, len(run) - 1)))
+        last = match.end()
+    parts.extend(text[last:].split())
+    return [part for part in parts if part]
+
+
+def _fts_query(text):
+    tokens = _query_tokens(text)
+    if not tokens:
+        raise ValueError("Search query must not be empty.")
+    return " AND ".join('"' + token.replace('"', '""') + '"' for token in tokens)
+
+
+def _index_fresh(conn, memory_items, document_items):
+    memory_state = _database_index_state(conn)
+    document_state = _database_document_state(conn)
+    current_memory = {item["relative_path"]: item["sha256"] for item in memory_items}
+    current_documents = {item["relative_path"]: item["sha256"] for item in document_items}
+    indexed_memory = {key: value["sha256"] for key, value in memory_state["index_state"].items()}
+    indexed_documents = {key: value["sha256"] for key, value in document_state["index_state"].items()}
+    return current_memory == indexed_memory and current_documents == indexed_documents
+
+
+def _search_memory(conn, args, query):
+    conditions = ["memory_fts MATCH ?", "m.confidentiality IN ('public', 'personal')", "m.status = 'active'"]
+    values = [query]
+    if args.project:
+        if args.include_unassigned:
+            conditions.append("(m.project = ? OR m.project IS NULL)")
+        else:
+            conditions.append("m.project = ?")
+        values.append(args.project)
+    if args.workspace:
+        conditions.append("m.workspace = ?")
+        values.append(args.workspace)
+    if args.status:
+        conditions.append("m.status = ?")
+        values.append(args.status)
+    values.append(args.limit)
+    sql = f"""
+        SELECT m.id, m.title, m.type, m.status, m.workspace, m.confidentiality,
+               m.project, m.context_id, m.updated, m.relative_path,
+               snippet(memory_fts, 2, '[', ']', '…', 20) AS excerpt,
+               bm25(memory_fts) AS rank
+        FROM memory_fts
+        JOIN memories AS m ON m.id = memory_fts.id
+        WHERE {' AND '.join(conditions)}
+        ORDER BY rank, m.updated DESC, m.id
+        LIMIT ?
+    """
+    rows = []
+    for index, row in enumerate(conn.execute(sql, values), start=1):
+        data = dict(row)
+        data.update({"kind": "memory", "source_kind": "memory", "score": 1.20 / (60 + index)})
+        rows.append(data)
+    return rows
+
+
+def _search_documents(conn, args, query):
+    conditions = ["document_fts MATCH ?", "d.confidentiality IN ('public', 'personal')"]
+    values = [query]
+    if args.source_kind:
+        conditions.append("d.source_kind = ?")
+        values.append(args.source_kind)
+    if args.project:
+        if args.include_unassigned:
+            conditions.append("(d.project = ? OR d.project IS NULL)")
+        else:
+            conditions.append("d.project = ?")
+        values.append(args.project)
+    if args.workspace:
+        conditions.append("d.workspace = ?")
+        values.append(args.workspace)
+    values.append(args.limit)
+    sql = f"""
+        SELECT d.id, d.source_kind, d.title, NULL AS type, NULL AS status,
+               d.workspace, d.confidentiality, d.project, d.context_id,
+               d.updated, d.relative_path,
+               snippet(document_fts, 2, '[', ']', '…', 20) AS excerpt,
+               bm25(document_fts) AS rank
+        FROM document_fts
+        JOIN documents AS d ON d.id = document_fts.id
+        WHERE {' AND '.join(conditions)}
+        ORDER BY rank, d.updated DESC, d.id
+        LIMIT ?
+    """
+    rows = []
+    for index, row in enumerate(conn.execute(sql, values), start=1):
+        data = dict(row)
+        data.update({"kind": "document", "score": 1.00 / (60 + index)})
+        rows.append(data)
+    return rows
+
+
+def search_store(args):
+    root = _require_data_root(args.root)
+    state_dir = args.state_dir if args.state_dir else default_state_dir()
+    _, db = check_state_dir(root, state_dir)
+    if not db.exists():
+        raise ValueError("Database is not initialized. Run db-init and index first.")
+    summary = inspect_database(db)
+    if not summary["initialized"]:
+        raise ValueError("Database is not initialized. Run db-init and index first.")
+
+    query = _fts_query(args.query)
+    root, records, errors, _ = collect_validated_records(root)
+    if errors:
+        messages = [f"ERROR {rel_path}: {message}" for rel_path, message in errors]
+        raise ValueError("\n".join(messages + ["Search aborted because validation failed."]))
+    memory_items = _current_index_items(root, records)
+    document_items = collect_document_items(root)
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        if not _index_fresh(conn, memory_items, document_items):
+            raise ValueError("Search aborted because the index is stale. Run index first.")
+        rows = []
+        if args.kind in {"all", "memory"} and not args.source_kind:
+            rows.extend(_search_memory(conn, args, query))
+        if args.kind in {"all", "document"}:
+            rows.extend(_search_documents(conn, args, query))
+    rows.sort(key=lambda row: (-row["score"], row["kind"], row["id"]))
+    return rows[: args.limit]
 
 
 def build_parser():
@@ -1536,6 +2086,14 @@ def build_parser():
         help="Local state directory for memory.sqlite.",
     )
 
+    db_rebuild_parser = subparsers.add_parser("db-rebuild", help="Rebuild the local SQLite index from files.")
+    db_rebuild_parser.add_argument("--root", required=True, help="Initialized data root.")
+    db_rebuild_parser.add_argument(
+        "--state-dir",
+        default=str(default_state_dir()),
+        help="Local state directory for memory.sqlite.",
+    )
+
     index_parser = subparsers.add_parser("index", help="Incrementally index memory files into SQLite.")
     index_parser.add_argument("--root", required=True, help="Initialized data root.")
     index_parser.add_argument(
@@ -1544,6 +2102,23 @@ def build_parser():
         help="Local state directory for memory.sqlite.",
     )
     index_parser.add_argument("--dry-run", action="store_true")
+
+    search_parser = subparsers.add_parser("search", help="Search memories and indexed documents.")
+    search_parser.add_argument("query")
+    search_parser.add_argument("--root", required=True, help="Initialized data root.")
+    search_parser.add_argument(
+        "--state-dir",
+        default=str(default_state_dir()),
+        help="Local state directory for memory.sqlite.",
+    )
+    search_parser.add_argument("--kind", choices=["all", "memory", "document"], default="all")
+    search_parser.add_argument("--source-kind", choices=["chatgpt", "manual", "literature", "manuscript", "journal"])
+    search_parser.add_argument("--project")
+    search_parser.add_argument("--workspace")
+    search_parser.add_argument("--status")
+    search_parser.add_argument("--include-unassigned", action="store_true")
+    search_parser.add_argument("--limit", type=int, default=20)
+    search_parser.add_argument("--json", action="store_true")
 
     export_parser = subparsers.add_parser("export", help="Export memory records.")
     export_parser.add_argument("--root", required=True, help="Initialized data root.")
@@ -1605,6 +2180,14 @@ def main(argv=None):
             print("FTS5: available")
             print("Tables: " + ", ".join(summary["tables"]))
             return 0
+        if args.command == "db-rebuild":
+            summary = db_rebuild(args)
+            print("Database rebuilt")
+            print(f"Database: {summary['database']}")
+            print(f"Schema version: {summary['version']}")
+            print(f"Memories added: {summary['memories']['added']}")
+            print(f"Documents added: {summary['documents']['added']}")
+            return 0
         if args.command == "index":
             summary = index_store(args)
             if summary["dry_run"]:
@@ -1612,13 +2195,34 @@ def main(argv=None):
                 print(f"Would add: {summary['added']}")
                 print(f"Would update: {summary['updated']}")
                 print(f"Would delete: {summary['deleted']}")
+                print(f"Would add documents: {summary['documents']['added']}")
+                print(f"Would update documents: {summary['documents']['updated']}")
+                print(f"Would delete documents: {summary['documents']['deleted']}")
             else:
                 print("Index complete")
                 print(f"Added: {summary['added']}")
                 print(f"Updated: {summary['updated']}")
                 print(f"Deleted: {summary['deleted']}")
+                print(f"Documents added: {summary['documents']['added']}")
+                print(f"Documents updated: {summary['documents']['updated']}")
+                print(f"Documents deleted: {summary['documents']['deleted']}")
             print(f"Unchanged: {summary['unchanged']}")
+            print(f"Documents unchanged: {summary['documents']['unchanged']}")
             print(f"Database: {summary['database']}")
+            return 0
+        if args.command == "search":
+            rows = search_store(args)
+            if args.json:
+                print(json.dumps(rows, ensure_ascii=False, indent=2))
+            else:
+                for row in rows:
+                    source = f" source={row['source_kind']}" if row.get("source_kind") else ""
+                    project = f" project={row['project']}" if row.get("project") else ""
+                    print(f"{row['id']}  {row['title']}  kind={row['kind']}{source}{project}")
+                    if row.get("excerpt"):
+                        print(f"  {row['excerpt']}")
+                    print(f"  {row['relative_path']}")
+                print(f"Results: {len(rows)}")
             return 0
         if args.command == "export":
             summary, errors = export_store(args.root, args.include_internal)
