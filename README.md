@@ -27,6 +27,7 @@ python3 src/memory.py search "QUERY" --root PATH
 python3 src/memory.py document-meta set ...
 python3 src/memory.py project-status --project PROJECT --root PATH
 python3 src/memory.py context "TASK QUERY" --root PATH
+python3 src/memory.py evaluate-search --cases CASES.json --root PATH
 python3 src/memory_distill.py review --root PATH
 ```
 
@@ -43,6 +44,7 @@ python3 src/memory_distill.py review --root PATH
 - 统一全文搜索，可按记忆/文档、来源、项目和 workspace 过滤
 - 项目注册校验、文档元数据覆盖、时间有效性过滤和项目状态汇总
 - Agent Context Pack (`context-pack/v1`) JSON/Markdown 输出
+- lexical 检索评测框架，`semantic`/`hybrid` 可选接口默认安全回退 lexical
 - 中文二元词索引预处理
 - 候选记忆审核生命周期：candidate → accept/reject → active/accepted/rejected/conflict
 
@@ -354,6 +356,21 @@ python3 src/memory.py context \
 ```
 
 生成前会检查 SQLite 索引是否过期；过期时拒绝生成，提示先重新运行 `index`。
+
+## 检索评测
+
+评测用例模板在 `templates/retrieval_eval.json`。真实评测数据应放在用户数据目录，不提交仓库。
+
+```bash
+python3 src/memory.py evaluate-search \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --cases "$DATA_ROOT/evaluation/retrieval_cases.json" \
+  --mode lexical \
+  --json
+```
+
+`search` 支持 `--mode lexical|semantic|hybrid`。当前默认和实际执行模式都是 `lexical`；`semantic`/`hybrid` 在没有本地语义模块时会回退 lexical 并输出 warning。
 
 ## 情景迁移
 

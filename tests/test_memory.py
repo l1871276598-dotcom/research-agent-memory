@@ -2417,6 +2417,111 @@ class ContextPackCommandTests(unittest.TestCase):
             self.assertIn("PDC markdown memory", text)
 
 
+class RetrievalEvaluationCommandTests(unittest.TestCase):
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(MEMORY_CLI), *args],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+
+    def run_init(self, root):
+        return self.run_cli("init", "--root", str(root))
+
+    def run_db_init(self, root, state_dir):
+        return self.run_cli("db-init", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_index(self, root, state_dir):
+        return self.run_cli("index", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_add(self, root, title, content, **kwargs):
+        args = [
+            "add",
+            "--root",
+            str(root),
+            "--type",
+            kwargs.pop("memory_type", "principle"),
+            "--title",
+            title,
+            "--scope",
+            kwargs.pop("scope", "global"),
+            "--workspace",
+            kwargs.pop("workspace", "personal"),
+            "--confidentiality",
+            kwargs.pop("confidentiality", "personal"),
+            "--source",
+            "user",
+            "--confidence",
+            "confirmed",
+            "--content",
+            content,
+        ]
+        for option, value in kwargs.items():
+            if value is not None:
+                args.extend(["--" + option.replace("_", "-"), value])
+        result = self.run_cli(*args)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return re.search(r"memory_id: (.+)", result.stdout).group(1)
+
+    def setup_store(self, tmp):
+        root = Path(tmp) / "data"
+        state_dir = Path(tmp) / "state"
+        self.assertEqual(self.run_init(root).returncode, 0)
+        self.assertEqual(self.run_db_init(root, state_dir).returncode, 0)
+        return root, state_dir
+
+    def test_evaluate_search_reports_metrics_and_zero_leakage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.run_add(root, "代码最少原则", "使用尽可能少的代码实现相同功能。")
+            self.run_add(root, "Work internal", "代码最少 internal", workspace="work", confidentiality="internal")
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            cases = Path(tmp) / "cases.json"
+            cases.write_text(
+                json.dumps(
+                    {
+                        "cases": [
+                            {"query": "代码最少", "expected_ids": ["代码最少原则"], "workspace": "personal", "synonym": True},
+                            {"query": "missing phrase", "expected_ids": [], "workspace": "personal"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            result = self.run_cli("evaluate-search", "--root", str(root), "--state-dir", str(state_dir), "--cases", cases, "--mode", "lexical", "--json")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            metrics = json.loads(result.stdout)
+            self.assertEqual(metrics["mode"], "lexical")
+            self.assertEqual(metrics["case_count"], 2)
+            self.assertEqual(metrics["restricted_leak_rate"], 0)
+            self.assertEqual(metrics["project_leak_rate"], 0)
+            self.assertGreaterEqual(metrics["top5"], metrics["top1"])
+            self.assertIn("p95_latency_ms", metrics)
+
+    def test_search_hybrid_falls_back_to_lexical_without_embeddings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.run_add(root, "Hybrid", "PDC hybrid fallback")
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            result = self.run_cli("search", "PDC", "--root", str(root), "--state-dir", str(state_dir), "--mode", "hybrid", "--json")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            rows = json.loads(result.stdout)
+            self.assertTrue(rows)
+            self.assertIn("falling back to lexical", result.stderr)
+
+    def test_retrieval_eval_template_exists(self):
+        template = REPO_ROOT / "templates" / "retrieval_eval.json"
+        self.assertTrue(template.is_file())
+        data = json.loads(template.read_text(encoding="utf-8"))
+        self.assertIn("cases", data)
+
+
 class ExportCommandTests(unittest.TestCase):
     def run_cli(self, *args):
         return subprocess.run(

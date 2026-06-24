@@ -6,6 +6,7 @@ import re
 import shutil
 import sqlite3
 import sys
+import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -2523,6 +2524,95 @@ def render_context_markdown(pack):
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _load_eval_cases(path):
+    try:
+        data = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("Invalid retrieval evaluation cases file.") from exc
+    cases = data.get("cases")
+    if not isinstance(cases, list):
+        raise ValueError("Retrieval evaluation cases must contain a cases list.")
+    return cases
+
+
+def _expected_hit(row, expected):
+    return row.get("id") in expected or row.get("title") in expected
+
+
+def _p95(values):
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, int(0.95 * (len(ordered) - 1)))
+    return ordered[index]
+
+
+def evaluate_search(args):
+    cases = _load_eval_cases(args.cases)
+    warnings = []
+    mode = args.mode
+    if mode in {"semantic", "hybrid"}:
+        warnings.append(f"{mode} search unavailable; falling back to lexical")
+        mode = "lexical"
+    top1 = top5 = no_result = project_leaks = restricted_leaks = synonym_hits = synonym_total = 0
+    latencies = []
+    for case in cases:
+        query = case.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("Each retrieval evaluation case requires a non-empty query.")
+        search_args = argparse.Namespace(
+            root=args.root,
+            state_dir=args.state_dir,
+            query=query,
+            kind="all",
+            source_kind=None,
+            project=case.get("project"),
+            context_id=case.get("context_id"),
+            workspace=case.get("workspace"),
+            status=None,
+            as_of=case.get("as_of"),
+            include_unassigned=False,
+            limit=20,
+            json=True,
+            mode=mode,
+        )
+        started = time.perf_counter()
+        rows = search_store(search_args)
+        latencies.append((time.perf_counter() - started) * 1000)
+        if not rows:
+            no_result += 1
+        expected = set(case.get("expected_ids") or [])
+        if expected:
+            if rows and _expected_hit(rows[0], expected):
+                top1 += 1
+            if any(_expected_hit(row, expected) for row in rows[:5]):
+                top5 += 1
+            if case.get("synonym"):
+                synonym_total += 1
+                if any(_expected_hit(row, expected) for row in rows[:5]):
+                    synonym_hits += 1
+        project = case.get("project")
+        if project and any(row.get("project") not in {None, project} and row.get("scope") != "global" for row in rows):
+            project_leaks += 1
+        if any(row.get("confidentiality") == "restricted" for row in rows):
+            restricted_leaks += 1
+    denominator = len(cases) or 1
+    return {
+        "mode": args.mode,
+        "effective_mode": mode,
+        "case_count": len(cases),
+        "top1": top1 / denominator,
+        "top5": top5 / denominator,
+        "no_result_rate": no_result / denominator,
+        "project_leak_rate": project_leaks / denominator,
+        "restricted_leak_rate": restricted_leaks / denominator,
+        "average_latency_ms": sum(latencies) / len(latencies) if latencies else 0.0,
+        "p95_latency_ms": _p95(latencies),
+        "synonym_hit_rate": (synonym_hits / synonym_total) if synonym_total else 0.0,
+        "warnings": warnings,
+    }
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Manage file-based research memory.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2593,6 +2683,7 @@ def build_parser():
     search_parser.add_argument("--workspace")
     search_parser.add_argument("--status")
     search_parser.add_argument("--as-of")
+    search_parser.add_argument("--mode", choices=["lexical", "semantic", "hybrid"], default="lexical")
     search_parser.add_argument("--include-unassigned", action="store_true")
     search_parser.add_argument("--limit", type=int, default=20)
     search_parser.add_argument("--json", action="store_true")
@@ -2627,6 +2718,13 @@ def build_parser():
     context_parser.add_argument("--output")
     context_parser.add_argument("--as-of")
     context_parser.add_argument("--max-chars", type=int, default=16000)
+
+    eval_parser = subparsers.add_parser("evaluate-search", help="Evaluate lexical retrieval cases.")
+    eval_parser.add_argument("--root", required=True)
+    eval_parser.add_argument("--state-dir", default=str(default_state_dir()))
+    eval_parser.add_argument("--cases", required=True)
+    eval_parser.add_argument("--mode", choices=["lexical", "semantic", "hybrid"], default="lexical")
+    eval_parser.add_argument("--json", action="store_true")
 
     doctor_parser = subparsers.add_parser("doctor", help="Inspect data root and derived SQLite index health.")
     doctor_parser.add_argument("--root", required=True, help="Initialized data root.")
@@ -2728,6 +2826,8 @@ def main(argv=None):
             print(f"Database: {summary['database']}")
             return 0
         if args.command == "search":
+            if args.mode in {"semantic", "hybrid"}:
+                print(f"{args.mode} search unavailable; falling back to lexical", file=sys.stderr)
             rows = search_store(args)
             if args.json:
                 print(json.dumps(rows, ensure_ascii=False, indent=2))
@@ -2772,6 +2872,23 @@ def main(argv=None):
                 atomic_write_text(Path(args.output).expanduser(), content)
             else:
                 print(content, end="")
+            return 0
+        if args.command == "evaluate-search":
+            summary = evaluate_search(args)
+            if args.json:
+                print(json.dumps(summary, ensure_ascii=False, indent=2))
+            else:
+                print(f"Mode: {summary['mode']}")
+                print(f"Effective mode: {summary['effective_mode']}")
+                print(f"Cases: {summary['case_count']}")
+                print(f"Top-1: {summary['top1']:.3f}")
+                print(f"Top-5: {summary['top5']:.3f}")
+                print(f"No result rate: {summary['no_result_rate']:.3f}")
+                print(f"Project leak rate: {summary['project_leak_rate']:.3f}")
+                print(f"Restricted leak rate: {summary['restricted_leak_rate']:.3f}")
+                print(f"Average latency ms: {summary['average_latency_ms']:.3f}")
+                print(f"P95 latency ms: {summary['p95_latency_ms']:.3f}")
+                print(f"Synonym hit rate: {summary['synonym_hit_rate']:.3f}")
             return 0
         if args.command == "doctor":
             summary = doctor_store(args)
