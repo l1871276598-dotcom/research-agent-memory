@@ -58,7 +58,15 @@
         "deprecated",
         "candidate",
         "conflict",
-        "archived"
+        "archived",
+        "prepared",
+        "awaiting_review",
+        "accepted",
+        "rejected",
+        "pending_delete",
+        "deleted",
+        "stale",
+        "failed"
       ]
     },
     "scope": {
@@ -154,6 +162,65 @@
     "reason": {
       "type": "string",
       "minLength": 1
+    },
+    "candidate_action": {
+      "enum": [
+        "create",
+        "merge",
+        "support",
+        "supersede",
+        "conflict",
+        "discard"
+      ]
+    },
+    "target_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_sha256": {
+      "type": "string",
+      "pattern": "^[a-fA-F0-9]{64}$"
+    },
+    "reviewed_at": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "review_reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "source_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "relations": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
     }
   },
   "allOf": [

@@ -24,6 +24,7 @@ python3 src/memory.py db-init --root PATH
 python3 src/memory.py index --root PATH
 python3 src/memory.py db-rebuild --root PATH
 python3 src/memory.py search "QUERY" --root PATH
+python3 src/memory_distill.py review --root PATH
 ```
 
 已实现：
@@ -38,6 +39,7 @@ python3 src/memory.py search "QUERY" --root PATH
 - Markdown 记忆、ChatGPT 原始归档、手工原文、文献笔记和稿件文件增量索引
 - 统一全文搜索，可按记忆/文档、来源、项目和 workspace 过滤
 - 中文二元词索引预处理
+- 候选记忆审核生命周期：candidate → accept/reject → active/accepted/rejected/conflict
 
 ### 轻量扩展命令
 
@@ -258,6 +260,29 @@ python3 src/memory.py doctor \
 ```
 
 `doctor` 只读检查数据根、SQLite schema、WAL、memory/document 索引新鲜度、哈希不一致和手工 raw/text 孤立文件。
+
+## 候选记忆审核
+
+Codex 或其他自动蒸馏流程应先生成候选，不直接写入正式 active 记忆：
+
+```bash
+python3 src/memory_distill.py apply \
+  --root "$DATA_ROOT" \
+  --action create \
+  --type principle \
+  --title "候选原则" \
+  --scope global \
+  --workspace personal \
+  --confidentiality personal \
+  --source codex \
+  --content "候选内容"
+
+python3 src/memory_distill.py review --root "$DATA_ROOT"
+python3 src/memory_distill.py accept --root "$DATA_ROOT" --id CANDIDATE_ID
+python3 src/memory_distill.py reject --root "$DATA_ROOT" --id CANDIDATE_ID --reason "证据不足"
+```
+
+`merge` 和 `support` 只合并 `source_refs`、`tags`、`relations` 等安全列表，不静默覆盖目标记忆的核心 `content`。
 
 ## 情景迁移
 

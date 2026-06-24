@@ -44,7 +44,22 @@ TYPE_CHOICES = [
     "procedure",
     "session",
 ]
-STATUS_CHOICES = ["active", "historical", "deprecated", "candidate", "conflict", "archived"]
+STATUS_CHOICES = [
+    "active",
+    "historical",
+    "deprecated",
+    "candidate",
+    "conflict",
+    "archived",
+    "prepared",
+    "awaiting_review",
+    "accepted",
+    "rejected",
+    "pending_delete",
+    "deleted",
+    "stale",
+    "failed",
+]
 SCOPE_CHOICES = ["global", "context", "project"]
 WORKSPACE_CHOICES = ["personal", "work"]
 CONFIDENTIALITY_CHOICES = ["public", "personal", "internal", "restricted"]
@@ -87,8 +102,18 @@ ALLOWED_FIELDS = set(REQUIRED_FIELDS) | {
     "to_context",
     "effective_date",
     "reason",
+    "candidate_action",
+    "target_id",
+    "source_id",
+    "source_path",
+    "source_sha256",
+    "reviewed_at",
+    "review_reason",
+    "evidence",
+    "source_refs",
+    "relations",
 }
-LIST_FIELDS = {"tags", "supersedes", "superseded_by"}
+LIST_FIELDS = {"tags", "supersedes", "superseded_by", "evidence", "source_refs", "relations"}
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-]*$")
 
 FILES = {
@@ -325,11 +350,18 @@ def render_front_matter(record):
         "to_context",
         "effective_date",
         "reason",
+        "candidate_action",
+        "target_id",
+        "source_id",
+        "source_path",
+        "source_sha256",
+        "reviewed_at",
+        "review_reason",
     ]:
         if field in record:
             lines.append(f"{field}: {_quoted(record[field])}")
 
-    for field in ["supersedes", "superseded_by", "tags"]:
+    for field in ["supersedes", "superseded_by", "tags", "evidence", "source_refs", "relations"]:
         if field not in record:
             continue
         values = record.get(field, [])
