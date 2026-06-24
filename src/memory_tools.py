@@ -1,13 +1,12 @@
 import argparse
 import hashlib
-import hmac
+import html
 import json
 import re
 import sqlite3
 import sys
 import zipfile
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from memory import (
@@ -20,7 +19,8 @@ from memory import (
 )
 
 CJK_RUN = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF]+")
-LIVE_ROLES = {"user": "User", "assistant": "Assistant"}
+IMPORTER_VERSION = 2
+TEXT_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".json", ".html", ".htm", ".rtf", ".pdf", ".docx"}
 
 
 def _query_tokens(text):
@@ -157,23 +157,181 @@ def _render_conversation(conversation):
     return "\n".join(lines).rstrip() + "\n", count
 
 
-def _load_conversations(zip_path):
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _zip_conversation_name(archive):
+    names = [name for name in archive.namelist() if Path(name).name.lower() == "conversations.json"]
+    if not names:
+        raise ValueError("conversations.json was not found in the export ZIP.")
+    if len(names) > 1:
+        raise ValueError("Multiple conversations.json files were found in the export ZIP.")
+    return names[0]
+
+
+def _valid_conversation(conversation):
+    if not isinstance(conversation, dict):
+        return False
+    if not (conversation.get("id") or conversation.get("conversation_id")):
+        return False
+    mapping = conversation.get("mapping")
+    return isinstance(mapping, dict) and bool(mapping)
+
+
+def preflight_chatgpt_export(zip_path):
+    zip_path = Path(zip_path).expanduser()
+    if not zip_path.exists():
+        raise ValueError("ChatGPT export ZIP does not exist.")
+    if zip_path.is_symlink():
+        raise ValueError("ChatGPT export ZIP must not be a symbolic link.")
+    report = {
+        "zip_path": str(zip_path),
+        "zip_sha256": _file_sha256(zip_path),
+        "zip_valid": False,
+        "conversation_count": 0,
+        "message_count": 0,
+        "invalid_conversations": 0,
+        "warnings": [],
+        "conversations": [],
+    }
     try:
         with zipfile.ZipFile(zip_path) as archive:
-            names = [name for name in archive.namelist() if Path(name).name.lower() == "conversations.json"]
-            if not names:
-                raise ValueError("conversations.json was not found in the export ZIP.")
-            data = json.loads(archive.read(sorted(names, key=len)[0]).decode("utf-8"))
+            bad = archive.testzip()
+            if bad:
+                raise ValueError(f"ZIP CRC check failed for {bad}.")
+            data = json.loads(archive.read(_zip_conversation_name(archive)).decode("utf-8"))
     except (OSError, zipfile.BadZipFile, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("Invalid ChatGPT export ZIP.") from exc
     if not isinstance(data, list):
         raise ValueError("conversations.json must contain a list.")
-    return data
+    report["zip_valid"] = True
+    report["conversation_count"] = len(data)
+    valid = []
+    for index, conversation in enumerate(data):
+        if not _valid_conversation(conversation):
+            report["invalid_conversations"] += 1
+            report["warnings"].append(f"invalid conversation at index {index}")
+            continue
+        _, message_count = _render_conversation(conversation)
+        report["message_count"] += message_count
+        valid.append(conversation)
+    report["conversations"] = valid
+    return report
+
+
+def _load_conversations(zip_path):
+    return preflight_chatgpt_export(zip_path)["conversations"]
+
+
+def _write_import_report(root, kind, input_sha256, report):
+    stamp = datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y%m%dT%H%M%SZ")
+    relative = Path("exports/import_reports") / f"{stamp}-{kind}-{input_sha256[:16]}.json"
+    target = root / relative
+    safe_report = dict(report)
+    safe_report.pop("conversations", None)
+    safe_report["report_path"] = relative.as_posix()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(target, json.dumps(safe_report, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    return relative.as_posix()
+
+
+def _atomic_write_bytes(path, data):
+    tmp = path.with_name(f".tmp-{path.name}-{hashlib.sha256(data).hexdigest()[:16]}")
+    try:
+        tmp.write_bytes(data)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _manual_text(path):
+    suffix = path.suffix.lower()
+    if suffix not in TEXT_SUFFIXES:
+        raise ValueError("Manual import supports PDF/DOCX/RTF/HTML/TXT/Markdown/CSV/JSON only when text is directly readable.")
+    text = path.read_text(encoding="utf-8")
+    if suffix in {".html", ".htm"}:
+        text = html.unescape(re.sub(r"<[^>]+>", " ", text))
+    elif suffix == ".json":
+        try:
+            text = json.dumps(json.loads(text), ensure_ascii=False, indent=2)
+        except json.JSONDecodeError:
+            pass
+    return re.sub(r"\s+\n", "\n", text).strip()
+
+
+def import_manual(args):
+    root = _require_data_root(args.root)
+    source = Path(args.path).expanduser()
+    if not source.exists():
+        raise ValueError("Manual import source does not exist.")
+    if source.is_symlink():
+        raise ValueError("Manual import source must not be a symbolic link.")
+    if not source.is_file():
+        raise ValueError("Manual import source must be a file.")
+    raw = source.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    text = _manual_text(source)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    relative_base = Path(f"{now.year:04d}/{now.month:02d}/{digest[:16]}-{safe_slug(source.stem)}")
+    raw_relative = Path("imports/manual/raw") / relative_base.with_suffix(source.suffix.lower())
+    text_relative = Path("imports/manual/text") / relative_base.with_suffix(".md")
+    title = source.stem or source.name
+    markdown = "\n".join(
+        [
+            "---",
+            f"title: {json.dumps(title, ensure_ascii=False)}",
+            f"source_name: {json.dumps(source.name, ensure_ascii=False)}",
+            f"source_sha256: {json.dumps(digest)}",
+            f"imported_at: {json.dumps(now.isoformat())}",
+            'source: "manual_import"',
+            "---",
+            "",
+            f"# {title}",
+            "",
+            text,
+            "",
+        ]
+    )
+    report = {
+        "format_version": 1,
+        "importer_version": IMPORTER_VERSION,
+        "kind": "manual",
+        "input_path": str(source),
+        "input_sha256": digest,
+        "imported_at": now.isoformat(),
+        "new": 0 if (root / raw_relative).exists() and (root / text_relative).exists() else 1,
+        "updated": 0,
+        "duplicate": 1 if (root / raw_relative).exists() and (root / text_relative).exists() else 0,
+        "failed": 0,
+        "written_paths": [raw_relative.as_posix(), text_relative.as_posix()],
+        "index_result": "not_run",
+        "restore_suggestion": "",
+    }
+    if not args.dry_run:
+        (root / raw_relative).parent.mkdir(parents=True, exist_ok=True)
+        (root / text_relative).parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_bytes(root / raw_relative, raw)
+        atomic_write_text(root / text_relative, markdown)
+        report["report_path"] = _write_import_report(root, "manual", digest, report)
+    print(f"Raw: {raw_relative.as_posix()}")
+    print(f"Text: {text_relative.as_posix()}")
+    if args.dry_run:
+        print("Dry run: no files changed")
+    else:
+        print(f"Report: {report['report_path']}")
+    return report
 
 
 def import_chatgpt(args):
     root = _require_data_root(args.root)
-    conversations = _load_conversations(Path(args.zip).expanduser())
+    zip_path = Path(args.zip).expanduser()
+    preflight = preflight_chatgpt_export(zip_path)
+    conversations = preflight["conversations"]
     output_root = root / "imports" / "chatgpt" / "conversations"
     manifest_path = root / "imports" / "chatgpt" / "import_manifest.json"
     records = []
@@ -207,6 +365,30 @@ def import_chatgpt(args):
             }
         )
 
+    raw_only = unchanged if not getattr(args, "restore_recent", False) else 0
+    report = {
+        "format_version": 1,
+        "importer_version": IMPORTER_VERSION,
+        "kind": "chatgpt",
+        "input_path": str(zip_path),
+        "input_sha256": preflight["zip_sha256"],
+        "imported_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "zip_path": preflight["zip_path"],
+        "zip_sha256": preflight["zip_sha256"],
+        "zip_valid": preflight["zip_valid"],
+        "conversation_count": preflight["conversation_count"],
+        "message_count": preflight["message_count"],
+        "invalid_conversations": preflight["invalid_conversations"],
+        "new": created,
+        "updated": updated,
+        "unchanged": unchanged,
+        "raw_only": raw_only,
+        "warnings": preflight["warnings"],
+        "failed": preflight["invalid_conversations"],
+        "written_paths": [record["path"] for record in records],
+        "index_result": "not_run",
+        "restore_suggestion": "Run import-chatgpt --restore-recent only if a future recent pipeline explicitly supports it.",
+    }
     manifest = {
         "format_version": 1,
         "source": Path(args.zip).name,
@@ -215,229 +397,24 @@ def import_chatgpt(args):
     if not args.dry_run:
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+        report["report_path"] = _write_import_report(root, "chatgpt", preflight["zip_sha256"], report)
 
     print(f"Conversations: {len(records)}")
     print(f"Created: {created}")
     print(f"Updated: {updated}")
     print(f"Unchanged: {unchanged}")
+    print(f"Invalid conversations: {preflight['invalid_conversations']}")
+    print(f"Raw only: {raw_only}")
     if args.dry_run:
         print("Dry run: no files changed")
     else:
         print("Manifest: imports/chatgpt/import_manifest.json")
-    return manifest
-
-
-def _utc_now():
-    return datetime.now(timezone.utc).replace(microsecond=0)
-
-
-def _live_time(value, default):
-    if not value:
-        return default.isoformat()
-    if not isinstance(value, str):
-        raise ValueError("Live archive timestamps must be strings.")
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ValueError("Live archive timestamps must use ISO 8601.") from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def _live_messages(value):
-    if not isinstance(value, list) or not value:
-        raise ValueError("messages must be a non-empty list.")
-    messages = []
-    for item in value:
-        if not isinstance(item, dict):
-            raise ValueError("Each message must be an object.")
-        role = str(item.get("role") or "").lower()
-        if role not in LIVE_ROLES:
-            raise ValueError("Only visible user and assistant messages may be archived.")
-        content = item.get("content")
-        if not isinstance(content, str) or not content.strip():
-            raise ValueError("Each message content must be a non-empty string.")
-        message = {"role": role, "content": content.strip()}
-        if item.get("created_at"):
-            message["created_at"] = _live_time(item["created_at"], _utc_now())
-        messages.append(message)
-    return messages
-
-
-def _live_key(payload, messages):
-    supplied = payload.get("conversation_key")
-    if supplied:
-        if not isinstance(supplied, str) or len(supplied) > 128:
-            raise ValueError("conversation_key must be a string up to 128 characters.")
-        return safe_slug(supplied)[:128]
-    seed = "\n".join(f"{item['role']}:{item['content']}" for item in messages[:2])
-    return "live-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
-
-
-def _existing_live_hash(path):
-    if not path.is_file():
-        return None
-    for line in path.read_text(encoding="utf-8").splitlines()[:20]:
-        if line.startswith("content_sha256: "):
-            try:
-                value = json.loads(line.split(":", 1)[1].strip())
-            except json.JSONDecodeError:
-                return None
-            return value if isinstance(value, str) else None
-    return None
-
-
-def archive_live(root, payload):
-    root = _require_data_root(root)
-    if not isinstance(payload, dict):
-        raise ValueError("Archive payload must be a JSON object.")
-    title = payload.get("title") or "Untitled conversation"
-    if not isinstance(title, str) or not title.strip() or len(title) > 500:
-        raise ValueError("title must be a non-empty string up to 500 characters.")
-    title = title.strip()
-    messages = _live_messages(payload.get("messages"))
-    now = _utc_now()
-    created = _live_time(payload.get("created_at"), now)
-    updated = _live_time(payload.get("updated_at"), now)
-    summary = payload.get("summary")
-    if summary is not None and (not isinstance(summary, str) or len(summary) > 20000):
-        raise ValueError("summary must be a string up to 20000 characters.")
-    complete = bool(payload.get("is_complete", False))
-    archive_id = _live_key(payload, messages)
-    semantic = {
-        "archive_id": archive_id,
-        "title": title,
-        "created": _live_time(payload.get("created_at"), now) if payload.get("created_at") else "",
-        "updated": _live_time(payload.get("updated_at"), now) if payload.get("updated_at") else "",
-        "summary": (summary or "").strip(),
-        "is_complete": complete,
-        "messages": messages,
-    }
-    content_hash = hashlib.sha256(
-        json.dumps(semantic, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-    output_root = root / "imports" / "chatgpt" / "live"
-    existing = sorted(output_root.rglob(f"{archive_id}.md")) if output_root.exists() else []
-    target = existing[0] if existing else output_root / f"{now.year:04d}" / f"{now.month:02d}" / f"{archive_id}.md"
-    if _existing_live_hash(target) == content_hash:
-        status = "unchanged"
-    else:
-        status = "updated" if target.exists() else "created"
-        lines = [
-            "---",
-            f"archive_id: {json.dumps(archive_id, ensure_ascii=False)}",
-            f"title: {json.dumps(title, ensure_ascii=False)}",
-            f"created: {json.dumps(created, ensure_ascii=False)}",
-            f"updated: {json.dumps(updated, ensure_ascii=False)}",
-            f"archived_at: {json.dumps(now.isoformat(), ensure_ascii=False)}",
-            'source: "chatgpt_action"',
-            'coverage: "current_model_context"',
-            f"is_complete: {'true' if complete else 'false'}",
-            f"message_count: {len(messages)}",
-            f"content_sha256: {json.dumps(content_hash)}",
-            "---",
-            "",
-            f"# {title}",
-            "",
-        ]
-        if semantic["summary"]:
-            lines.extend(["## Summary", "", semantic["summary"], ""])
-        for message in messages:
-            lines.extend([f"## {LIVE_ROLES[message['role']]}", ""])
-            if message.get("created_at"):
-                lines.extend([f"_Time: {message['created_at']}_", ""])
-            lines.extend([message["content"], ""])
-        target.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(target, "\n".join(lines).rstrip() + "\n")
-
-    return {
-        "status": status,
-        "archive_id": archive_id,
-        "relative_path": target.relative_to(root).as_posix(),
-        "message_count": len(messages),
-        "content_sha256": content_hash,
-        "is_complete": complete,
-    }
-
-
-def _read_token(path):
-    token = Path(path).expanduser().read_text(encoding="utf-8").strip()
-    if len(token) < 32 or any(char.isspace() for char in token):
-        raise ValueError("Archive token must contain at least 32 non-whitespace characters.")
-    return token
-
-
-def _archive_server(root, token, host, port, max_bytes):
-    expected = f"Bearer {token}"
-
-    class Handler(BaseHTTPRequestHandler):
-        server_version = "ResearchAgentArchive/1"
-
-        def _send(self, status, payload):
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_GET(self):
-            if self.path == "/health":
-                self._send(200, {"status": "ok"})
-            else:
-                self._send(404, {"error": "not_found"})
-
-        def do_POST(self):
-            if self.path != "/archive":
-                self._send(404, {"error": "not_found"})
-                return
-            if not hmac.compare_digest(self.headers.get("Authorization", ""), expected):
-                self._send(401, {"error": "unauthorized"})
-                return
-            try:
-                length = int(self.headers.get("Content-Length", ""))
-            except ValueError:
-                length = -1
-            if length < 1 or length > max_bytes:
-                self._send(413, {"error": "invalid_content_length"})
-                return
-            try:
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                result = archive_live(root, payload)
-            except (UnicodeDecodeError, json.JSONDecodeError, OSError, ValueError) as exc:
-                self._send(400, {"error": str(exc)})
-                return
-            self._send(201 if result["status"] == "created" else 200, result)
-
-        def log_message(self, format, *args):
-            print(f"{self.client_address[0]} - {format % args}", file=sys.stderr)
-
-    return ThreadingHTTPServer((host, port), Handler)
-
-
-def serve_chatgpt(args):
-    if args.host not in {"127.0.0.1", "::1", "localhost"}:
-        raise ValueError("The archive service must bind to loopback; expose it through a secure HTTPS tunnel.")
-    root = _require_data_root(args.root)
-    token = _read_token(args.token_file)
-    if not (1 <= args.port <= 65535) or args.max_bytes < 1024:
-        raise ValueError("Invalid server port or max-bytes value.")
-    server = _archive_server(root, token, args.host, args.port, args.max_bytes)
-    print(f"Archive service: http://{args.host}:{server.server_port}")
-    print("Endpoints: GET /health, POST /archive")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
+        print(f"Report: {report['report_path']}")
+    return report
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Search memory and archive ChatGPT conversations.")
+    parser = argparse.ArgumentParser(description="Search memory and import local evidence files.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     search_parser = subparsers.add_parser("search", help="Search the local SQLite FTS5 index.")
@@ -455,13 +432,12 @@ def build_parser():
     import_parser.add_argument("--zip", required=True)
     import_parser.add_argument("--root", required=True)
     import_parser.add_argument("--dry-run", action="store_true")
+    import_parser.add_argument("--restore-recent", action="store_true")
 
-    serve_parser = subparsers.add_parser("serve-chatgpt", help="Receive live ChatGPT archive actions.")
-    serve_parser.add_argument("--root", required=True)
-    serve_parser.add_argument("--token-file", required=True)
-    serve_parser.add_argument("--host", default="127.0.0.1")
-    serve_parser.add_argument("--port", type=int, default=8765)
-    serve_parser.add_argument("--max-bytes", type=int, default=1_000_000)
+    manual_parser = subparsers.add_parser("import-manual", help="Import a local readable file as raw evidence plus text sidecar.")
+    manual_parser.add_argument("--path", required=True)
+    manual_parser.add_argument("--root", required=True)
+    manual_parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -473,7 +449,7 @@ def main(argv=None):
         elif args.command == "import-chatgpt":
             import_chatgpt(args)
         else:
-            serve_chatgpt(args)
+            import_manual(args)
         return 0
     except (OSError, ValueError, sqlite3.DatabaseError) as exc:
         print(str(exc), file=sys.stderr)

@@ -22,6 +22,7 @@ DIRECTORIES = [
     "memory/sessions",
     "imports/chatgpt/conversations",
     "imports/manual/raw",
+    "imports/manual/text",
     "literature/inbox",
     "literature/pdf",
     "literature/notes",
@@ -1411,6 +1412,8 @@ def document_source_kind(relative_path):
         return "chatgpt"
     if relative_path.startswith("imports/manual/raw/"):
         return "manual"
+    if relative_path.startswith("imports/manual/text/"):
+        return "manual"
     if relative_path.startswith("literature/notes/"):
         return "literature"
     if relative_path.startswith("literature/journals/"):
@@ -1482,6 +1485,7 @@ def collect_document_items(root):
     for base in [
         root / "imports" / "chatgpt" / "conversations",
         root / "imports" / "manual" / "raw",
+        root / "imports" / "manual" / "text",
         root / "literature" / "notes",
         root / "literature" / "journals",
         root / "manuscripts" / "current",
@@ -2048,6 +2052,122 @@ def search_store(args):
     return rows[: args.limit]
 
 
+def _state_sha_map(state):
+    return {key: value["sha256"] for key, value in state["index_state"].items()}
+
+
+def _freshness_details(conn, memory_items, document_items):
+    memory_state = _database_index_state(conn)
+    document_state = _database_document_state(conn)
+    current_memory = {item["relative_path"]: item["sha256"] for item in memory_items}
+    current_documents = {item["relative_path"]: item["sha256"] for item in document_items}
+    indexed_memory = _state_sha_map(memory_state)
+    indexed_documents = _state_sha_map(document_state)
+    return {
+        "memory_index_fresh": current_memory == indexed_memory,
+        "document_index_fresh": current_documents == indexed_documents,
+        "hash_mismatches": [
+            {"kind": kind, "relative_path": path}
+            for kind, current, indexed in [
+                ("memory", current_memory, indexed_memory),
+                ("document", current_documents, indexed_documents),
+            ]
+            for path in sorted(set(current) & set(indexed))
+            if current[path] != indexed[path]
+        ],
+    }
+
+
+def _relative_stems(root, relative_dir):
+    base = root / relative_dir
+    if not base.exists():
+        return set()
+    return {
+        path.relative_to(base).with_suffix("").as_posix()
+        for path in base.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+
+
+def _old_network_residuals():
+    repo = Path(__file__).resolve().parents[1]
+    files = [
+        repo / "src" / "memory_tools.py",
+        repo / "README.md",
+    ]
+    docs = repo / "docs"
+    if docs.exists():
+        files.extend(path for path in docs.rglob("*") if path.is_file())
+    patterns = [
+        "serve-" + "chatgpt",
+        "Bear" + "er",
+        "Threading" + "HTTPServer",
+        "BaseHTTP" + "RequestHandler",
+        "G" + "mail",
+        "approve-" + "host",
+        "Launch" + "Agent",
+        "Tail" + "scale " + "Fun" + "nel",
+    ]
+    residuals = []
+    for path in sorted(files):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        for pattern in patterns:
+            if pattern in text:
+                residuals.append({"path": path.relative_to(repo).as_posix(), "pattern": pattern})
+    return residuals
+
+
+def doctor_store(args):
+    root = _require_data_root(args.root)
+    state_dir = args.state_dir if args.state_dir else default_state_dir()
+    result = {
+        "data_root": str(root),
+        "data_root_ok": True,
+        "schema_version": None,
+        "sqlite_initialized": False,
+        "wal": False,
+        "memory_index_fresh": None,
+        "document_index_fresh": None,
+        "hash_mismatches": [],
+        "manual_orphan_raw": [],
+        "manual_orphan_text": [],
+        "old_network_residuals": [],
+        "errors": [],
+    }
+    result["old_network_residuals"] = _old_network_residuals()
+    raw_stems = _relative_stems(root, "imports/manual/raw")
+    text_stems = _relative_stems(root, "imports/manual/text")
+    result["manual_orphan_raw"] = sorted(raw_stems - text_stems)
+    result["manual_orphan_text"] = sorted(text_stems - raw_stems)
+
+    try:
+        _, db = check_state_dir(root, state_dir)
+        if not db.exists():
+            result["errors"].append("database missing")
+            return result
+        summary = inspect_database(db)
+        result["schema_version"] = summary["version"]
+        result["sqlite_initialized"] = summary["initialized"]
+        if not summary["initialized"]:
+            result["errors"].append("database not initialized")
+            return result
+        records_root, records, errors, _ = collect_validated_records(root)
+        if errors:
+            result["errors"].extend(f"{rel_path}: {message}" for rel_path, message in errors)
+            return result
+        memory_items = _current_index_items(records_root, records)
+        document_items = collect_document_items(root)
+        with sqlite3.connect(db) as conn:
+            result["wal"] = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal"
+            result.update(_freshness_details(conn, memory_items, document_items))
+    except (OSError, ValueError, sqlite3.DatabaseError) as exc:
+        result["errors"].append(str(exc))
+    return result
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Manage file-based research memory.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2119,6 +2239,15 @@ def build_parser():
     search_parser.add_argument("--include-unassigned", action="store_true")
     search_parser.add_argument("--limit", type=int, default=20)
     search_parser.add_argument("--json", action="store_true")
+
+    doctor_parser = subparsers.add_parser("doctor", help="Inspect data root and derived SQLite index health.")
+    doctor_parser.add_argument("--root", required=True, help="Initialized data root.")
+    doctor_parser.add_argument(
+        "--state-dir",
+        default=str(default_state_dir()),
+        help="Local state directory for memory.sqlite.",
+    )
+    doctor_parser.add_argument("--json", action="store_true")
 
     export_parser = subparsers.add_parser("export", help="Export memory records.")
     export_parser.add_argument("--root", required=True, help="Initialized data root.")
@@ -2224,6 +2353,22 @@ def main(argv=None):
                     print(f"  {row['relative_path']}")
                 print(f"Results: {len(rows)}")
             return 0
+        if args.command == "doctor":
+            summary = doctor_store(args)
+            if args.json:
+                print(json.dumps(summary, ensure_ascii=False, indent=2))
+            else:
+                print(f"Data root: {summary['data_root']}")
+                print(f"SQLite initialized: {summary['sqlite_initialized']}")
+                print(f"Schema version: {summary['schema_version']}")
+                print(f"WAL: {summary['wal']}")
+                print(f"Memory index fresh: {summary['memory_index_fresh']}")
+                print(f"Document index fresh: {summary['document_index_fresh']}")
+                print(f"Hash mismatches: {len(summary['hash_mismatches'])}")
+                print(f"Manual orphan raw: {len(summary['manual_orphan_raw'])}")
+                print(f"Manual orphan text: {len(summary['manual_orphan_text'])}")
+                print(f"Errors: {len(summary['errors'])}")
+            return 1 if summary["errors"] else 0
         if args.command == "export":
             summary, errors = export_store(args.root, args.include_internal)
             if errors:

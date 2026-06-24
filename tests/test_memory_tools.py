@@ -4,12 +4,9 @@ import json
 import sqlite3
 import sys
 import tempfile
-import threading
 import unittest
-import urllib.error
-import urllib.request
 import zipfile
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 
@@ -178,6 +175,12 @@ class MemoryToolsTests(unittest.TestCase):
             self.assertIn("# 重命名对话", text)
             self.assertIn("## User", text)
             self.assertIn("## Assistant", text)
+            reports = list((root / "exports/import_reports").glob("*.json"))
+            self.assertTrue(reports)
+            report = json.loads(reports[-1].read_text(encoding="utf-8"))
+            self.assertEqual(report["kind"], "chatgpt")
+            self.assertEqual(report["zip_valid"], True)
+            self.assertEqual(report["failed"], 0)
 
     def test_import_chatgpt_dry_run_writes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -189,6 +192,7 @@ class MemoryToolsTests(unittest.TestCase):
             with redirect_stdout(StringIO()):
                 TOOLS.import_chatgpt(args)
             self.assertFalse((root / "imports").exists())
+            self.assertFalse((root / "exports").exists())
 
     def test_import_rejects_zip_without_conversations(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -198,83 +202,80 @@ class MemoryToolsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "conversations.json"):
                 TOOLS._load_conversations(path)
 
-    def test_live_archive_is_idempotent_and_title_safe(self):
+    def test_import_rejects_corrupt_zip(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = self.make_root(Path(tmp))
-            payload = {
-                "title": "原始标题",
-                "created_at": "2026-06-22T08:00:00Z",
-                "updated_at": "2026-06-22T08:05:00Z",
-                "messages": [
-                    {"role": "user", "content": "请归档这次讨论。"},
-                    {"role": "assistant", "content": "可以。"},
-                ],
-            }
-            first = TOOLS.archive_live(root, payload)
-            self.assertEqual(first["status"], "created")
-            self.assertEqual(TOOLS.archive_live(root, payload)["status"], "unchanged")
-            payload["title"] = "重命名标题"
-            changed = TOOLS.archive_live(root, payload)
-            self.assertEqual(changed["status"], "updated")
-            files = list((root / "imports/chatgpt/live").rglob("*.md"))
-            self.assertEqual(len(files), 1)
-            text = files[0].read_text(encoding="utf-8")
-            self.assertIn('source: "chatgpt_action"', text)
-            self.assertIn("# 重命名标题", text)
-            self.assertIn("## User", text)
-            self.assertIn("## Assistant", text)
+            path = Path(tmp) / "bad.zip"
+            path.write_text("not a zip", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Invalid ChatGPT export ZIP"):
+                TOOLS._load_conversations(path)
 
-    def test_live_archive_rejects_hidden_roles(self):
+    def test_import_rejects_non_list_conversations_json(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = self.make_root(Path(tmp))
-            with self.assertRaisesRegex(ValueError, "visible user and assistant"):
-                TOOLS.archive_live(
-                    root,
-                    {"title": "bad", "messages": [{"role": "system", "content": "secret"}]},
-                )
+            path = Path(tmp) / "bad.zip"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("conversations.json", "{}")
+            with self.assertRaisesRegex(ValueError, "must contain a list"):
+                TOOLS._load_conversations(path)
 
-    def test_archive_http_requires_bearer_token(self):
+    def test_import_rejects_multiple_conversations_json(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = self.make_root(Path(tmp))
-            token = "x" * 32
-            server = TOOLS._archive_server(root, token, "127.0.0.1", 0, 100000)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            url = f"http://127.0.0.1:{server.server_port}/archive"
-            body = json.dumps(
-                {
-                    "title": "HTTP test",
-                    "messages": [
-                        {"role": "user", "content": "archive"},
-                        {"role": "assistant", "content": "done"},
-                    ],
-                }
-            ).encode()
-            try:
-                with self.assertRaises(urllib.error.HTTPError) as caught:
-                    urllib.request.urlopen(
-                        urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}),
-                        timeout=5,
-                    )
-                self.assertEqual(caught.exception.code, 401)
-                request = urllib.request.Request(
-                    url,
-                    data=body,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {token}",
-                    },
-                )
-                response = urllib.request.urlopen(request, timeout=5)
-                self.assertEqual(response.status, 201)
-                self.assertEqual(json.loads(response.read())["status"], "created")
-                response = urllib.request.urlopen(request, timeout=5)
-                self.assertEqual(response.status, 200)
-                self.assertEqual(json.loads(response.read())["status"], "unchanged")
-            finally:
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=5)
+            path = Path(tmp) / "bad.zip"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("a/conversations.json", "[]")
+                archive.writestr("b/conversations.json", "[]")
+            with self.assertRaisesRegex(ValueError, "Multiple conversations.json"):
+                TOOLS._load_conversations(path)
+
+    def test_import_preflight_counts_invalid_conversation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mixed.zip"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("conversations.json", json.dumps([{"id": "ok", "mapping": {}}, {"bad": True}]))
+            report = TOOLS.preflight_chatgpt_export(path)
+            self.assertEqual(report["conversation_count"], 2)
+            self.assertEqual(report["invalid_conversations"], 2)
+            self.assertEqual(report["conversations"], [])
+
+    def test_import_chatgpt_reports_raw_only_without_restore_recent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = self.make_root(base)
+            export = base / "export.zip"
+            self.sample_export(export)
+            args = argparse.Namespace(root=str(root), zip=str(export), dry_run=False, restore_recent=False)
+            with redirect_stdout(StringIO()):
+                TOOLS.import_chatgpt(args)
+            with redirect_stdout(StringIO()):
+                report = TOOLS.import_chatgpt(args)
+            self.assertEqual(report["raw_only"], 1)
+            args.restore_recent = True
+            with redirect_stdout(StringIO()):
+                restored = TOOLS.import_chatgpt(args)
+            self.assertEqual(restored["raw_only"], 0)
+
+    def test_import_manual_writes_raw_text_sidecar_and_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = self.make_root(base)
+            source = base / "note.txt"
+            source.write_text("Manual PDC sidecar text", encoding="utf-8")
+            args = argparse.Namespace(root=str(root), path=str(source), dry_run=False)
+
+            with redirect_stdout(StringIO()):
+                report = TOOLS.import_manual(args)
+
+            raw = root / report["written_paths"][0]
+            text = root / report["written_paths"][1]
+            self.assertTrue(raw.is_file())
+            self.assertTrue(text.is_file())
+            self.assertIn("Manual PDC sidecar text", text.read_text(encoding="utf-8"))
+            self.assertTrue(list((root / "exports/import_reports").glob("*.json")))
+
+    def test_serve_chatgpt_command_is_removed(self):
+        parser = TOOLS.build_parser()
+        with redirect_stderr(StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["serve-" + "chatgpt", "--root", "x"])
 
 
 if __name__ == "__main__":

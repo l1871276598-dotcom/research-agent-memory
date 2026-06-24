@@ -1869,6 +1869,9 @@ class UnifiedSearchCommandTests(unittest.TestCase):
             *extra,
         )
 
+    def run_doctor(self, root, state_dir):
+        return self.run_cli("doctor", "--root", str(root), "--state-dir", str(state_dir), "--json")
+
     def run_add(self, root, **kwargs):
         args = [
             "add",
@@ -2091,6 +2094,24 @@ class UnifiedSearchCommandTests(unittest.TestCase):
 
             self.assertNotEqual(stale.returncode, 0)
             self.assertIn("Search aborted because the index is stale. Run index first.", stale.stderr)
+
+    def test_doctor_reports_stale_index_hash_mismatch_and_manual_orphans(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            doc = self.write_document(root, "imports/manual/raw/note.txt", "PDC raw note")
+            self.write_document(root, "imports/manual/text/orphan.md", "PDC orphan text")
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            doc.write_text("PDC changed raw note", encoding="utf-8")
+
+            result = self.run_doctor(root, state_dir)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            summary = json.loads(result.stdout)
+            self.assertTrue(summary["memory_index_fresh"])
+            self.assertFalse(summary["document_index_fresh"])
+            self.assertEqual(summary["manual_orphan_raw"], ["note"])
+            self.assertEqual(summary["manual_orphan_text"], ["orphan"])
+            self.assertEqual(summary["hash_mismatches"], [{"kind": "document", "relative_path": "imports/manual/raw/note.txt"}])
 
 
 class ExportCommandTests(unittest.TestCase):
