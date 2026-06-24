@@ -26,6 +26,7 @@ python3 src/memory.py db-rebuild --root PATH
 python3 src/memory.py search "QUERY" --root PATH
 python3 src/memory.py document-meta set ...
 python3 src/memory.py project-status --project PROJECT --root PATH
+python3 src/memory.py context "TASK QUERY" --root PATH
 python3 src/memory_distill.py review --root PATH
 ```
 
@@ -41,6 +42,7 @@ python3 src/memory_distill.py review --root PATH
 - Markdown 记忆、ChatGPT 原始归档、手工原文、文献笔记和稿件文件增量索引
 - 统一全文搜索，可按记忆/文档、来源、项目和 workspace 过滤
 - 项目注册校验、文档元数据覆盖、时间有效性过滤和项目状态汇总
+- Agent Context Pack (`context-pack/v1`) JSON/Markdown 输出
 - 中文二元词索引预处理
 - 候选记忆审核生命周期：candidate → accept/reject → active/accepted/rejected/conflict
 
@@ -324,6 +326,34 @@ python3 src/memory.py project-status \
   --state-dir "$STATE_DIR" \
   --project pdc-rock-manuscript
 ```
+
+## Agent Context Pack
+
+为 Codex、LJQ 或其他本地 Agent 生成受控上下文包：
+
+```bash
+python3 src/memory.py context \
+  "本次任务查询" \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --project pdc-rock-manuscript \
+  --workspace personal \
+  --format json \
+  --max-chars 16000
+```
+
+可输出 Markdown 或写入文件：
+
+```bash
+python3 src/memory.py context \
+  "本次任务查询" \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --format markdown \
+  --output context-pack.md
+```
+
+生成前会检查 SQLite 索引是否过期；过期时拒绝生成，提示先重新运行 `index`。
 
 ## 情景迁移
 

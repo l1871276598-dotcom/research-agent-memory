@@ -2338,6 +2338,191 @@ def project_status(args):
     }
 
 
+def _memory_context_entry(item, as_of):
+    record = item["record"]
+    return {
+        "id": record["id"],
+        "title": record["title"],
+        "kind": "memory",
+        "type": record["type"],
+        "status": record["status"],
+        "confidence": record["confidence"],
+        "source": record["source"],
+        "source_path": item["relative_path"],
+        "source_sha256": hashlib.sha256(item["path"].read_bytes()).hexdigest(),
+        "updated": record["updated"],
+        "project": record.get("project"),
+        "context_id": record.get("context_id"),
+        "temporal_status": temporal_status(record, as_of),
+        "content": record["content"],
+    }
+
+
+def _search_context_entry(row):
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "kind": row["kind"],
+        "type": row.get("type"),
+        "status": row.get("status"),
+        "confidence": None,
+        "source": row.get("source_kind"),
+        "source_path": row["relative_path"],
+        "source_sha256": None,
+        "updated": row.get("updated"),
+        "project": row.get("project"),
+        "context_id": row.get("context_id"),
+        "temporal_status": row.get("temporal_status"),
+        "excerpt": row.get("excerpt") or "",
+    }
+
+
+def _visible_memory(record, project, workspace, as_of, include_conflict=False):
+    if record.get("workspace") != workspace:
+        return False
+    if record.get("confidentiality") not in {"public", "personal"}:
+        return False
+    if include_conflict:
+        if record.get("status") != "conflict":
+            return False
+    elif record.get("status") != "active":
+        return False
+    if temporal_status(record, as_of) != "current" and not include_conflict:
+        return False
+    if project and record.get("scope") != "global" and record.get("project") != project:
+        return False
+    return True
+
+
+def _context_sources(pack):
+    seen = set()
+    sources = []
+    for section in ["constraints", "project_memories", "query_memories", "evidence_documents", "recent_evidence", "related_memories", "conflicts"]:
+        for item in pack[section]:
+            key = (item.get("id"), item.get("source_path"))
+            if key in seen:
+                continue
+            seen.add(key)
+            sources.append(
+                {
+                    "id": item.get("id"),
+                    "title": item.get("title"),
+                    "kind": item.get("kind"),
+                    "source_path": item.get("source_path"),
+                    "source_sha256": item.get("source_sha256"),
+                    "updated": item.get("updated"),
+                }
+            )
+    return sources
+
+
+def _pack_json(pack):
+    return json.dumps(pack, ensure_ascii=False, indent=2) + "\n"
+
+
+def _fit_context_pack(pack, max_chars):
+    if len(_pack_json(pack)) <= max_chars:
+        return pack
+    pack["truncated"] = True
+    for section in ["evidence_documents", "query_memories", "related_memories", "project_memories"]:
+        while pack[section] and len(_pack_json(pack)) > max_chars:
+            pack[section].pop()
+    for section in ["constraints", "project_memories", "query_memories", "evidence_documents"]:
+        for item in pack[section]:
+            for field in ["content", "excerpt"]:
+                if field in item and isinstance(item[field], str) and len(_pack_json(pack)) > max_chars:
+                    item[field] = item[field][:40] + "..."
+    for section in ["constraints", "project_memories", "query_memories", "evidence_documents", "related_memories", "recent_evidence"]:
+        while pack[section] and len(_pack_json(pack)) > max_chars:
+            pack[section].pop()
+    pack["sources"] = _context_sources(pack)
+    return pack
+
+
+def context_pack(args):
+    root, records, errors, _ = collect_validated_records(args.root)
+    if errors:
+        messages = [f"ERROR {rel_path}: {message}" for rel_path, message in errors]
+        raise ValueError("\n".join(messages + ["Context pack aborted because validation failed."]))
+    as_of = args.as_of or date.today().isoformat()
+    search_args = argparse.Namespace(
+        root=str(root),
+        state_dir=args.state_dir,
+        query=args.query,
+        kind="all",
+        source_kind=None,
+        project=args.project,
+        context_id=None,
+        workspace=args.workspace,
+        status=None,
+        as_of=as_of,
+        include_unassigned=False,
+        limit=20,
+        json=True,
+    )
+    rows = search_store(search_args)
+    constraints = []
+    project_memories = []
+    conflicts = []
+    for item in records:
+        record = item["record"]
+        if _visible_memory(record, args.project, args.workspace, as_of):
+            entry = _memory_context_entry(item, as_of)
+            if record["type"] in {"profile", "principle", "context"}:
+                constraints.append(entry)
+            elif record["type"] in {"project", "decision", "procedure"}:
+                project_memories.append(entry)
+        elif _visible_memory(record, args.project, args.workspace, as_of, include_conflict=True):
+            conflicts.append(_memory_context_entry(item, as_of))
+    query_memories = [_search_context_entry(row) for row in rows if row["kind"] == "memory"]
+    evidence_documents = [_search_context_entry(row) for row in rows if row["kind"] == "document"]
+    pack = {
+        "schema": "context-pack/v1",
+        "query": args.query,
+        "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "workspace": args.workspace,
+        "project": args.project,
+        "context_id": None,
+        "as_of": as_of,
+        "constraints": constraints,
+        "project_memories": project_memories,
+        "query_memories": query_memories,
+        "evidence_documents": evidence_documents,
+        "recent_evidence": [],
+        "related_memories": [],
+        "conflicts": conflicts,
+        "warnings": [],
+        "sources": [],
+        "truncated": False,
+    }
+    pack["sources"] = _context_sources(pack)
+    return _fit_context_pack(pack, args.max_chars)
+
+
+def render_context_markdown(pack):
+    lines = [
+        "# Context Pack",
+        "",
+        f"Query: {pack['query']}",
+        f"Workspace: {pack['workspace']}",
+        f"Project: {pack['project'] or ''}",
+        f"As of: {pack['as_of']}",
+        "",
+    ]
+    for title, key in [
+        ("Constraints", "constraints"),
+        ("Project Memories", "project_memories"),
+        ("Query Memories", "query_memories"),
+        ("Evidence Documents", "evidence_documents"),
+        ("Conflicts", "conflicts"),
+    ]:
+        lines.extend([f"## {title}", ""])
+        for item in pack[key]:
+            text = item.get("content") or item.get("excerpt") or ""
+            lines.extend([f"- {item['title']} ({item['source_path']})", f"  {text}", ""])
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Manage file-based research memory.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2431,6 +2616,17 @@ def build_parser():
     project_status_parser.add_argument("--project", required=True)
     project_status_parser.add_argument("--as-of")
     project_status_parser.add_argument("--json", action="store_true")
+
+    context_parser = subparsers.add_parser("context", help="Generate an Agent Context Pack.")
+    context_parser.add_argument("query")
+    context_parser.add_argument("--root", required=True)
+    context_parser.add_argument("--state-dir", default=str(default_state_dir()))
+    context_parser.add_argument("--project")
+    context_parser.add_argument("--workspace", default="personal", choices=WORKSPACE_CHOICES)
+    context_parser.add_argument("--format", choices=["json", "markdown"], default="json")
+    context_parser.add_argument("--output")
+    context_parser.add_argument("--as-of")
+    context_parser.add_argument("--max-chars", type=int, default=16000)
 
     doctor_parser = subparsers.add_parser("doctor", help="Inspect data root and derived SQLite index health.")
     doctor_parser.add_argument("--root", required=True, help="Initialized data root.")
@@ -2568,6 +2764,14 @@ def main(argv=None):
                 print(f"Conflicts: {summary['conflicts']}")
                 print(f"Expired: {summary['expired']}")
                 print(f"Unresolved relations: {summary['unresolved_relations']}")
+            return 0
+        if args.command == "context":
+            pack = context_pack(args)
+            content = _pack_json(pack) if args.format == "json" else render_context_markdown(pack)
+            if args.output:
+                atomic_write_text(Path(args.output).expanduser(), content)
+            else:
+                print(content, end="")
             return 0
         if args.command == "doctor":
             summary = doctor_store(args)

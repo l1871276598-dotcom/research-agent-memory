@@ -2276,6 +2276,147 @@ class ProjectGovernanceCommandTests(unittest.TestCase):
             self.assertEqual(summary["expired"], 1)
 
 
+class ContextPackCommandTests(unittest.TestCase):
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(MEMORY_CLI), *args],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+
+    def run_init(self, root):
+        return self.run_cli("init", "--root", str(root))
+
+    def run_db_init(self, root, state_dir):
+        return self.run_cli("db-init", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_index(self, root, state_dir):
+        return self.run_cli("index", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_add(self, root, memory_type="principle", title="记忆", scope="global", content="内容", **kwargs):
+        args = [
+            "add",
+            "--root",
+            str(root),
+            "--type",
+            memory_type,
+            "--title",
+            title,
+            "--scope",
+            scope,
+            "--workspace",
+            kwargs.pop("workspace", "personal"),
+            "--confidentiality",
+            kwargs.pop("confidentiality", "personal"),
+            "--source",
+            "user",
+            "--confidence",
+            kwargs.pop("confidence", "confirmed"),
+            "--content",
+            content,
+        ]
+        for option, value in kwargs.items():
+            if value is not None:
+                args.extend(["--" + option.replace("_", "-"), value])
+        result = self.run_cli(*args)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return re.search(r"memory_id: (.+)", result.stdout).group(1)
+
+    def setup_store(self, tmp):
+        root = Path(tmp) / "data"
+        state_dir = Path(tmp) / "state"
+        self.assertEqual(self.run_init(root).returncode, 0)
+        self.assertEqual(self.run_db_init(root, state_dir).returncode, 0)
+        return root, state_dir
+
+    def write_document(self, root, relative, text, front_matter=None):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if front_matter:
+            lines = ["---"]
+            for key, value in front_matter.items():
+                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+            lines.extend(["---", "", text])
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        else:
+            path.write_text(text, encoding="utf-8")
+        return path
+
+    def context_pack(self, root, state_dir, query, *extra):
+        result = self.run_cli("context", query, "--root", str(root), "--state-dir", str(state_dir), "--format", "json", *extra)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return json.loads(result.stdout)
+
+    def test_context_pack_schema_order_and_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.run_add(root, memory_type="project", title="PDC 项目", scope="project", project="pdc", content="PDC project skeleton")
+            self.run_add(root, title="Global principle", content="PDC global principle")
+            self.run_add(root, memory_type="decision", title="Project decision", scope="project", project="pdc", content="PDC project decision")
+            self.write_document(root, "manuscripts/current/pdc.md", "PDC manuscript evidence", {"project": "pdc"})
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            pack = self.context_pack(root, state_dir, "PDC", "--project", "pdc", "--workspace", "personal")
+
+            self.assertEqual(list(pack)[:4], ["schema", "query", "generated_at", "workspace"])
+            self.assertEqual(pack["schema"], "context-pack/v1")
+            self.assertEqual(pack["project"], "pdc")
+            self.assertTrue(pack["project_memories"])
+            self.assertTrue(pack["query_memories"])
+            self.assertTrue(pack["evidence_documents"])
+            self.assertTrue(all("id" in source and "source_path" in source for source in pack["sources"]))
+
+    def test_context_pack_has_zero_project_and_restricted_leakage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.run_add(root, memory_type="project", title="PDC 项目", scope="project", project="pdc", content="PDC")
+            self.run_add(root, memory_type="project", title="Other 项目", scope="project", project="other", content="PDC")
+            self.run_add(root, title="PDC keep", scope="project", project="pdc", content="PDC keep")
+            self.run_add(root, title="PDC other", scope="project", project="other", content="PDC leak")
+            self.write_document(root, "manuscripts/current/pdc.md", "PDC visible evidence", {"project": "pdc"})
+            self.write_document(root, "manuscripts/evidence/restricted.md", "PDC restricted evidence", {"project": "pdc", "workspace": "work", "confidentiality": "restricted"})
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            pack = self.context_pack(root, state_dir, "PDC", "--project", "pdc", "--workspace", "personal")
+            text = json.dumps(pack, ensure_ascii=False)
+
+            self.assertNotIn("PDC leak", text)
+            self.assertNotIn("restricted evidence", text)
+
+    def test_context_pack_rejects_stale_index_and_respects_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.run_add(root, title="Budget", content="PDC " + "x" * 1000)
+            doc = self.write_document(root, "imports/manual/raw/note.txt", "PDC " + "y" * 1000)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            small = self.run_cli("context", "PDC", "--root", str(root), "--state-dir", str(state_dir), "--format", "json", "--max-chars", "900")
+            self.assertEqual(small.returncode, 0, small.stdout + small.stderr)
+            self.assertLessEqual(len(small.stdout), 900)
+            self.assertTrue(json.loads(small.stdout)["truncated"])
+
+            doc.write_text("PDC changed", encoding="utf-8")
+            stale = self.run_cli("context", "PDC", "--root", str(root), "--state-dir", str(state_dir), "--format", "json")
+            self.assertNotEqual(stale.returncode, 0)
+            self.assertIn("index is stale", stale.stderr)
+
+    def test_context_pack_markdown_and_output_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.run_add(root, title="Markdown", content="PDC markdown memory")
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            output = Path(tmp) / "context.md"
+
+            result = self.run_cli("context", "PDC", "--root", str(root), "--state-dir", str(state_dir), "--format", "markdown", "--output", output)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, "")
+            text = output.read_text(encoding="utf-8")
+            self.assertIn("# Context Pack", text)
+            self.assertIn("PDC markdown memory", text)
+
+
 class ExportCommandTests(unittest.TestCase):
     def run_cli(self, *args):
         return subprocess.run(
