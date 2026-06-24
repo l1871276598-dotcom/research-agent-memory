@@ -1960,7 +1960,7 @@ class UnifiedSearchCommandTests(unittest.TestCase):
     def test_index_adds_memory_and_documents(self):
         with tempfile.TemporaryDirectory() as tmp:
             root, state_dir, db = self.setup_store(tmp)
-            self.assertEqual(self.run_add(root, project="ljq", scope="project").returncode, 0)
+            self.assertEqual(self.run_add(root).returncode, 0)
             self.write_document(root, "imports/chatgpt/conversations/2026/06/thread.md", "PDC raw conversation evidence")
             self.write_document(root, "imports/manual/raw/note.txt", "Manual raw note about PDC review cadence")
             self.write_document(root, "literature/notes/pdc-note.md", "PDC literature note for target journal", {"project": "ljq"})
@@ -2114,6 +2114,168 @@ class UnifiedSearchCommandTests(unittest.TestCase):
             self.assertEqual(summary["hash_mismatches"], [{"kind": "document", "relative_path": "imports/manual/raw/note.txt"}])
 
 
+class ProjectGovernanceCommandTests(unittest.TestCase):
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(MEMORY_CLI), *args],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+
+    def run_init(self, root):
+        return self.run_cli("init", "--root", str(root))
+
+    def run_db_init(self, root, state_dir):
+        return self.run_cli("db-init", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_index(self, root, state_dir):
+        return self.run_cli("index", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_add(self, root, memory_type="principle", title="记忆", scope="global", content="内容", **kwargs):
+        args = [
+            "add",
+            "--root",
+            str(root),
+            "--type",
+            memory_type,
+            "--title",
+            title,
+            "--scope",
+            scope,
+            "--workspace",
+            kwargs.pop("workspace", "personal"),
+            "--confidentiality",
+            kwargs.pop("confidentiality", "personal"),
+            "--source",
+            "user",
+            "--confidence",
+            kwargs.pop("confidence", "confirmed"),
+            "--content",
+            content,
+        ]
+        for option, value in kwargs.items():
+            if value is not None:
+                args.extend(["--" + option.replace("_", "-"), value])
+        return self.run_cli(*args)
+
+    def setup_store(self, tmp):
+        root = Path(tmp) / "data"
+        state_dir = Path(tmp) / "state"
+        self.assertEqual(self.run_init(root).returncode, 0)
+        self.assertEqual(self.run_db_init(root, state_dir).returncode, 0)
+        return root, state_dir
+
+    def search(self, root, state_dir, query, *extra):
+        result = self.run_cli("search", query, "--root", str(root), "--state-dir", str(state_dir), "--json", *extra)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return json.loads(result.stdout)
+
+    def write_document(self, root, relative, text):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_project_scoped_memory_requires_registered_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self.setup_store(tmp)
+
+            missing = self.run_add(root, title="项目事实", scope="project", project="pdc")
+
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("project does not reference an active project", missing.stderr)
+
+            project = self.run_add(root, memory_type="project", title="PDC 项目", scope="project", project="pdc")
+            self.assertEqual(project.returncode, 0, project.stdout + project.stderr)
+            fact = self.run_add(root, title="项目事实", scope="project", project="pdc")
+            self.assertEqual(fact.returncode, 0, fact.stdout + fact.stderr)
+
+    def test_rejects_multiple_active_project_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root, memory_type="project", title="PDC 项目", scope="project", project="pdc").returncode, 0)
+
+            duplicate = self.run_add(root, memory_type="project", title="PDC 项目 2", scope="project", project="pdc")
+
+            self.assertNotEqual(duplicate.returncode, 0)
+            self.assertIn("multiple active project records", duplicate.stderr)
+
+    def test_document_metadata_controls_project_and_workspace_filters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.write_document(root, "imports/manual/raw/note.txt", "PDC metadata controlled document")
+            result = self.run_cli(
+                "document-meta",
+                "set",
+                "--root",
+                str(root),
+                "--path",
+                "imports/manual/raw/note.txt",
+                "--project",
+                "pdc",
+                "--workspace",
+                "work",
+                "--confidentiality",
+                "internal",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            personal = self.search(root, state_dir, "PDC", "--kind", "document", "--workspace", "personal")
+            work = self.search(root, state_dir, "PDC", "--kind", "document", "--workspace", "work", "--project", "pdc")
+
+            self.assertEqual(personal, [])
+            self.assertEqual(work, [])
+
+    def test_search_as_of_context_and_project_isolation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root, memory_type="context", title="Context A", scope="context", context_id="ctx-a", content="ctx").returncode, 0)
+            self.assertEqual(self.run_add(root, memory_type="context", title="Context B", scope="context", context_id="ctx-b", content="ctx", status="historical").returncode, 0)
+            self.assertEqual(self.run_add(root, memory_type="project", title="PDC 项目", scope="project", project="pdc").returncode, 0)
+            self.assertEqual(self.run_add(root, memory_type="project", title="Other 项目", scope="project", project="other").returncode, 0)
+            self.assertEqual(self.run_add(root, title="Global principle", content="PDC shared principle").returncode, 0)
+            self.assertEqual(self.run_add(root, title="PDC current", scope="project", project="pdc", content="PDC scoped current", valid_from="2026-01-01", valid_until="2026-12-31").returncode, 0)
+            self.assertEqual(self.run_add(root, title="Other current", scope="project", project="other", content="PDC other project").returncode, 0)
+            self.assertEqual(self.run_add(root, title="Context A fact", scope="context", context_id="ctx-a", content="PDC context A").returncode, 0)
+            self.assertEqual(self.run_add(root, title="Context B fact", scope="context", context_id="ctx-b", content="PDC context B").returncode, 0)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            rows = self.search(root, state_dir, "PDC", "--project", "pdc", "--context-id", "ctx-a", "--as-of", "2026-06-01")
+            paths = {row["relative_path"] for row in rows}
+
+            self.assertTrue(any(row["temporal_status"] == "current" for row in rows))
+            self.assertTrue(any(row["scope"] == "global" for row in rows if row["kind"] == "memory"))
+            self.assertFalse(any("other" in (row["project"] or "") for row in rows))
+            self.assertFalse(any(row.get("context_id") == "ctx-b" for row in rows))
+            self.assertFalse(any("Other current" in row["title"] for row in rows))
+            self.assertFalse(any("Context B fact" in row["title"] for row in rows))
+
+            expired = self.search(root, state_dir, "PDC scoped current", "--project", "pdc", "--as-of", "2027-01-01")
+            self.assertEqual(expired, [])
+
+    def test_project_status_counts_project_health(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root, memory_type="project", title="PDC 项目", scope="project", project="pdc").returncode, 0)
+            self.assertEqual(self.run_add(root, title="PDC fact", scope="project", project="pdc", content="PDC fact", valid_until="2025-01-01").returncode, 0)
+            self.write_document(root, "imports/manual/raw/pdc.txt", "PDC doc")
+            self.write_document(root, "imports/manual/raw/unassigned.txt", "Unassigned doc")
+            self.assertEqual(self.run_cli("document-meta", "set", "--root", str(root), "--path", "imports/manual/raw/pdc.txt", "--project", "pdc").returncode, 0)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            result = self.run_cli("project-status", "--root", str(root), "--state-dir", str(state_dir), "--project", "pdc", "--json")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            summary = json.loads(result.stdout)
+            self.assertEqual(summary["project"], "pdc")
+            self.assertEqual(summary["project_memories"], 2)
+            self.assertEqual(summary["documents"], 1)
+            self.assertEqual(summary["unassigned_documents"], 1)
+            self.assertEqual(summary["expired"], 1)
+
+
 class ExportCommandTests(unittest.TestCase):
     def run_cli(self, *args):
         return subprocess.run(
@@ -2214,7 +2376,7 @@ class ExportCommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "data-root"
             self.assertEqual(self.run_init(root).returncode, 0)
-            self.assertEqual(self.run_add(root, "session", "会话", "project", project="p").returncode, 0)
+            self.assertEqual(self.run_add(root, "session", "会话", "global").returncode, 0)
             self.assertEqual(self.run_add(root, "principle", "原则", "global").returncode, 0)
             self.assertEqual(self.run_add(root, "profile", "档案", "global").returncode, 0)
 

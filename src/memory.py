@@ -31,6 +31,7 @@ DIRECTORIES = [
     "manuscripts/evidence",
     "manuscripts/archive",
     "exports/database_snapshots",
+    "exports/import_reports",
     "backups",
 ]
 
@@ -125,6 +126,12 @@ FILES = {
     + "\n",
     "exports/index_manifest.json": json.dumps(
         {"format_version": 1, "records": []},
+        ensure_ascii=False,
+        indent=2,
+    )
+    + "\n",
+    "imports/document_metadata.json": json.dumps(
+        {"format_version": 1, "documents": {}},
         ensure_ascii=False,
         indent=2,
     )
@@ -405,6 +412,19 @@ def render_existing_memory(path, record):
 def add_memory(args):
     validate_add_args(args)
     root = _require_data_root(args.root)
+    _, existing_records, existing_errors, _ = collect_validated_records(root)
+    if existing_errors:
+        messages = [f"ERROR {rel_path}: {message}" for rel_path, message in existing_errors]
+        raise ValueError("\n".join(messages + ["Add aborted because validation failed."]))
+    active_projects = [
+        item["record"].get("project")
+        for item in existing_records
+        if item["record"].get("type") == "project" and item["record"].get("status") == "active"
+    ]
+    if args.type == "project" and args.status == "active" and args.project in active_projects:
+        raise ValueError(f"multiple active project records: {args.project}")
+    if args.scope == "project" and args.type != "project" and args.project not in active_projects:
+        raise ValueError("project does not reference an active project")
     target_dir = root / TYPE_DIRS[args.type]
     target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -722,6 +742,7 @@ def _validate_cross_file(records):
     ids = {}
     context_ids = set()
     active_contexts = {}
+    active_projects = {}
     for rel_path, record in records:
         memory_id = record.get("id")
         if isinstance(memory_id, str):
@@ -730,6 +751,8 @@ def _validate_cross_file(records):
             context_ids.add(record["context_id"])
             if record.get("status") == "active" and isinstance(record.get("workspace"), str):
                 active_contexts.setdefault(record["workspace"], []).append(rel_path)
+        if record.get("type") == "project" and record.get("status") == "active" and isinstance(record.get("project"), str):
+            active_projects.setdefault(record["project"], []).append(rel_path)
 
     for memory_id in sorted(ids):
         paths = ids[memory_id]
@@ -738,6 +761,13 @@ def _validate_cross_file(records):
                 errors.append((rel_path, f"duplicate id: {memory_id}"))
 
     for rel_path, record in records:
+        project = record.get("project")
+        if record.get("type") == "project" and record.get("status") == "active" and isinstance(project, str):
+            if len(active_projects.get(project, [])) > 1:
+                errors.append((rel_path, f"multiple active project records: {project}"))
+        elif record.get("scope") == "project" or (record.get("status") == "candidate" and project):
+            if project not in active_projects:
+                errors.append((rel_path, "project does not reference an active project"))
         if "context_id" in record and record.get("type") != "context" and record["context_id"] not in context_ids:
             errors.append((rel_path, "context_id does not reference an existing context"))
         if record.get("type") == "context_transition":
@@ -1511,8 +1541,55 @@ def _document_title(path, metadata):
     return path.stem or path.name
 
 
+def load_document_metadata(root):
+    path = _require_data_root(root) / "imports" / "document_metadata.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("Invalid document metadata file.") from exc
+    if data.get("format_version") != 1 or not isinstance(data.get("documents"), dict):
+        raise ValueError("Invalid document metadata file.")
+    return data["documents"]
+
+
+def save_document_metadata(root, documents):
+    path = _require_data_root(root) / "imports" / "document_metadata.json"
+    content = json.dumps({"format_version": 1, "documents": documents}, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    atomic_write_text(path, content)
+
+
+def document_meta_set(args):
+    root = _require_data_root(args.root)
+    relative_path = args.path.strip("/")
+    if document_source_kind(relative_path) is None:
+        raise ValueError("document metadata path is not an indexed document source.")
+    metadata = load_document_metadata(root)
+    current = dict(metadata.get(relative_path, {}))
+    for field in ["project", "workspace", "confidentiality", "context_id"]:
+        value = getattr(args, field)
+        if value is not None:
+            current[field] = value
+    if current.get("confidentiality") in {"internal", "restricted"} and current.get("workspace", "personal") != "work":
+        raise ValueError("internal or restricted document metadata requires workspace work.")
+    metadata[relative_path] = {key: value for key, value in current.items() if value not in {"", None}}
+    save_document_metadata(root, metadata)
+    return {"path": relative_path, "metadata": metadata[relative_path]}
+
+
+def document_meta_unset(args):
+    root = _require_data_root(args.root)
+    relative_path = args.path.strip("/")
+    metadata = load_document_metadata(root)
+    removed = metadata.pop(relative_path, None) is not None
+    save_document_metadata(root, metadata)
+    return {"path": relative_path, "removed": removed}
+
+
 def collect_document_items(root):
     root = _require_data_root(root)
+    document_metadata = load_document_metadata(root)
     items = []
     for base in [
         root / "imports" / "chatgpt" / "conversations",
@@ -1539,6 +1616,7 @@ def collect_document_items(root):
             except (OSError, UnicodeDecodeError):
                 continue
             metadata, body = parse_document_frontmatter(text)
+            metadata.update(document_metadata.get(rel_path, {}))
             if not body.strip():
                 continue
             source_id = metadata.get("conversation_id") or metadata.get("archive_id")
@@ -1973,6 +2051,19 @@ def _fts_query(text):
     return " AND ".join('"' + token.replace('"', '""') + '"' for token in tokens)
 
 
+def temporal_status(row, as_of):
+    status = row.get("status")
+    if status and status != "active":
+        return "historical" if status == "historical" else status
+    valid_from = row.get("valid_from")
+    valid_until = row.get("valid_until")
+    if valid_from and valid_from > as_of:
+        return "future"
+    if valid_until and valid_until < as_of:
+        return "expired"
+    return "current"
+
+
 def _index_fresh(conn, memory_items, document_items):
     memory_state = _database_index_state(conn)
     document_state = _database_document_state(conn)
@@ -1988,20 +2079,27 @@ def _search_memory(conn, args, query):
     values = [query]
     if args.project:
         if args.include_unassigned:
-            conditions.append("(m.project = ? OR m.project IS NULL)")
+            conditions.append("(m.project = ? OR m.project IS NULL OR m.scope = 'global')")
         else:
-            conditions.append("m.project = ?")
+            conditions.append("(m.project = ? OR m.scope = 'global')")
         values.append(args.project)
+    if args.context_id:
+        conditions.append("(m.context_id = ? OR m.context_id IS NULL)")
+        values.append(args.context_id)
     if args.workspace:
         conditions.append("m.workspace = ?")
         values.append(args.workspace)
     if args.status:
         conditions.append("m.status = ?")
         values.append(args.status)
+    as_of = args.as_of or date.today().isoformat()
+    conditions.append("(m.valid_from IS NULL OR m.valid_from <= ?)")
+    conditions.append("(m.valid_until IS NULL OR m.valid_until >= ?)")
+    values.extend([as_of, as_of])
     values.append(args.limit)
     sql = f"""
-        SELECT m.id, m.title, m.type, m.status, m.workspace, m.confidentiality,
-               m.project, m.context_id, m.updated, m.relative_path,
+        SELECT m.id, m.title, m.type, m.status, m.scope, m.workspace, m.confidentiality,
+               m.project, m.context_id, m.valid_from, m.valid_until, m.updated, m.relative_path,
                snippet(memory_fts, 2, '[', ']', '…', 20) AS excerpt,
                bm25(memory_fts) AS rank
         FROM memory_fts
@@ -2013,7 +2111,7 @@ def _search_memory(conn, args, query):
     rows = []
     for index, row in enumerate(conn.execute(sql, values), start=1):
         data = dict(row)
-        data.update({"kind": "memory", "source_kind": "memory", "score": 1.20 / (60 + index)})
+        data.update({"kind": "memory", "source_kind": "memory", "score": 1.20 / (60 + index), "temporal_status": temporal_status(data, as_of)})
         rows.append(data)
     return rows
 
@@ -2030,14 +2128,17 @@ def _search_documents(conn, args, query):
         else:
             conditions.append("d.project = ?")
         values.append(args.project)
+    if args.context_id:
+        conditions.append("(d.context_id = ? OR d.context_id IS NULL)")
+        values.append(args.context_id)
     if args.workspace:
         conditions.append("d.workspace = ?")
         values.append(args.workspace)
     values.append(args.limit)
     sql = f"""
-        SELECT d.id, d.source_kind, d.title, NULL AS type, NULL AS status,
+        SELECT d.id, d.source_kind, d.title, NULL AS type, NULL AS status, NULL AS scope,
                d.workspace, d.confidentiality, d.project, d.context_id,
-               d.updated, d.relative_path,
+               NULL AS valid_from, NULL AS valid_until, d.updated, d.relative_path,
                snippet(document_fts, 2, '[', ']', '…', 20) AS excerpt,
                bm25(document_fts) AS rank
         FROM document_fts
@@ -2049,7 +2150,7 @@ def _search_documents(conn, args, query):
     rows = []
     for index, row in enumerate(conn.execute(sql, values), start=1):
         data = dict(row)
-        data.update({"kind": "document", "score": 1.00 / (60 + index)})
+        data.update({"kind": "document", "score": 1.00 / (60 + index), "temporal_status": "current"})
         rows.append(data)
     return rows
 
@@ -2200,6 +2301,43 @@ def doctor_store(args):
     return result
 
 
+def project_status(args):
+    root, records, errors, _ = collect_validated_records(args.root)
+    if errors:
+        messages = [f"ERROR {rel_path}: {message}" for rel_path, message in errors]
+        raise ValueError("\n".join(messages + ["Project status aborted because validation failed."]))
+    as_of = args.as_of or date.today().isoformat()
+    project_records = [item for item in records if item["record"].get("type") == "project" and item["record"].get("project") == args.project and item["record"].get("status") == "active"]
+    project_memories = [item for item in records if item["record"].get("project") == args.project]
+    candidates = [item for item in project_memories if item["record"].get("status") == "candidate"]
+    conflicts = [item for item in project_memories if item["record"].get("status") == "conflict"]
+    expired = [item for item in project_memories if temporal_status(item["record"], as_of) == "expired"]
+    known_ids = {item["record"]["id"] for item in records}
+    unresolved = 0
+    for item in project_memories:
+        for field in ("supersedes", "superseded_by"):
+            unresolved += sum(1 for value in item["record"].get(field, []) if value not in known_ids)
+
+    state_dir = args.state_dir if args.state_dir else default_state_dir()
+    _, db = check_state_dir(root, state_dir)
+    documents = unassigned_documents = 0
+    if db.exists() and inspect_database(db).get("initialized"):
+        with sqlite3.connect(db) as conn:
+            documents = conn.execute("SELECT COUNT(*) FROM documents WHERE project = ?", (args.project,)).fetchone()[0]
+            unassigned_documents = conn.execute("SELECT COUNT(*) FROM documents WHERE project IS NULL").fetchone()[0]
+    return {
+        "project": args.project,
+        "status": "active" if project_records else "missing",
+        "project_memories": len(project_memories),
+        "documents": documents,
+        "unassigned_documents": unassigned_documents,
+        "candidates": len(candidates),
+        "conflicts": len(conflicts),
+        "expired": len(expired),
+        "unresolved_relations": unresolved,
+    }
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Manage file-based research memory.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2266,11 +2404,33 @@ def build_parser():
     search_parser.add_argument("--kind", choices=["all", "memory", "document"], default="all")
     search_parser.add_argument("--source-kind", choices=["chatgpt", "manual", "literature", "manuscript", "journal"])
     search_parser.add_argument("--project")
+    search_parser.add_argument("--context-id")
     search_parser.add_argument("--workspace")
     search_parser.add_argument("--status")
+    search_parser.add_argument("--as-of")
     search_parser.add_argument("--include-unassigned", action="store_true")
     search_parser.add_argument("--limit", type=int, default=20)
     search_parser.add_argument("--json", action="store_true")
+
+    meta_parser = subparsers.add_parser("document-meta", help="Manage authoritative document metadata overrides.")
+    meta_subparsers = meta_parser.add_subparsers(dest="meta_command", required=True)
+    meta_set = meta_subparsers.add_parser("set", help="Set document metadata.")
+    meta_set.add_argument("--root", required=True)
+    meta_set.add_argument("--path", required=True)
+    meta_set.add_argument("--project")
+    meta_set.add_argument("--workspace", choices=WORKSPACE_CHOICES)
+    meta_set.add_argument("--confidentiality", choices=CONFIDENTIALITY_CHOICES)
+    meta_set.add_argument("--context-id")
+    meta_unset = meta_subparsers.add_parser("unset", help="Remove document metadata.")
+    meta_unset.add_argument("--root", required=True)
+    meta_unset.add_argument("--path", required=True)
+
+    project_status_parser = subparsers.add_parser("project-status", help="Summarize project memory and evidence health.")
+    project_status_parser.add_argument("--root", required=True)
+    project_status_parser.add_argument("--state-dir", default=str(default_state_dir()))
+    project_status_parser.add_argument("--project", required=True)
+    project_status_parser.add_argument("--as-of")
+    project_status_parser.add_argument("--json", action="store_true")
 
     doctor_parser = subparsers.add_parser("doctor", help="Inspect data root and derived SQLite index health.")
     doctor_parser.add_argument("--root", required=True, help="Initialized data root.")
@@ -2384,6 +2544,30 @@ def main(argv=None):
                         print(f"  {row['excerpt']}")
                     print(f"  {row['relative_path']}")
                 print(f"Results: {len(rows)}")
+            return 0
+        if args.command == "document-meta":
+            if args.meta_command == "set":
+                summary = document_meta_set(args)
+                print(f"Metadata set: {summary['path']}")
+            else:
+                summary = document_meta_unset(args)
+                print(f"Metadata removed: {summary['path']}")
+                print(f"Removed: {summary['removed']}")
+            return 0
+        if args.command == "project-status":
+            summary = project_status(args)
+            if args.json:
+                print(json.dumps(summary, ensure_ascii=False, indent=2))
+            else:
+                print(f"Project: {summary['project']}")
+                print(f"Status: {summary['status']}")
+                print(f"Project memories: {summary['project_memories']}")
+                print(f"Documents: {summary['documents']}")
+                print(f"Unassigned documents: {summary['unassigned_documents']}")
+                print(f"Candidates: {summary['candidates']}")
+                print(f"Conflicts: {summary['conflicts']}")
+                print(f"Expired: {summary['expired']}")
+                print(f"Unresolved relations: {summary['unresolved_relations']}")
             return 0
         if args.command == "doctor":
             summary = doctor_store(args)

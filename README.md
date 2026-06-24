@@ -24,6 +24,8 @@ python3 src/memory.py db-init --root PATH
 python3 src/memory.py index --root PATH
 python3 src/memory.py db-rebuild --root PATH
 python3 src/memory.py search "QUERY" --root PATH
+python3 src/memory.py document-meta set ...
+python3 src/memory.py project-status --project PROJECT --root PATH
 python3 src/memory_distill.py review --root PATH
 ```
 
@@ -38,6 +40,7 @@ python3 src/memory_distill.py review --root PATH
 - 本地 SQLite FTS5 初始化
 - Markdown 记忆、ChatGPT 原始归档、手工原文、文献笔记和稿件文件增量索引
 - 统一全文搜索，可按记忆/文档、来源、项目和 workspace 过滤
+- 项目注册校验、文档元数据覆盖、时间有效性过滤和项目状态汇总
 - 中文二元词索引预处理
 - 候选记忆审核生命周期：candidate → accept/reject → active/accepted/rejected/conflict
 
@@ -283,6 +286,44 @@ python3 src/memory_distill.py reject --root "$DATA_ROOT" --id CANDIDATE_ID --rea
 ```
 
 `merge` 和 `support` 只合并 `source_refs`、`tags`、`relations` 等安全列表，不静默覆盖目标记忆的核心 `content`。
+
+## 项目治理
+
+项目作用域记忆必须引用已有 active `type: project` 记录。同一 project 只能有一个 active project 注册记录。
+
+文档项目元数据保存在权威文件 `imports/document_metadata.json`：
+
+```bash
+python3 src/memory.py document-meta set \
+  --root "$DATA_ROOT" \
+  --path imports/manual/raw/note.txt \
+  --project pdc-rock-manuscript \
+  --workspace personal \
+  --confidentiality personal
+
+python3 src/memory.py document-meta unset \
+  --root "$DATA_ROOT" \
+  --path imports/manual/raw/note.txt
+```
+
+搜索支持时间点过滤：
+
+```bash
+python3 src/memory.py search "论文证据链" \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --project pdc-rock-manuscript \
+  --as-of 2026-06-24
+```
+
+查看项目状态：
+
+```bash
+python3 src/memory.py project-status \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --project pdc-rock-manuscript
+```
 
 ## 情景迁移
 
