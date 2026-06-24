@@ -58,11 +58,16 @@
         "deprecated",
         "candidate",
         "conflict",
-        "archived",
+        "archived"
+      ]
+    },
+    "audit_status": {
+      "enum": [
         "prepared",
         "awaiting_review",
         "accepted",
         "rejected",
+        "conflict",
         "pending_delete",
         "deleted",
         "stale",

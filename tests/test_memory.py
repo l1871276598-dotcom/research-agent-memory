@@ -1983,7 +1983,7 @@ class UnifiedSearchCommandTests(unittest.TestCase):
             result = self.run_search(root, state_dir, "PDC")
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            rows = json.loads(result.stdout)
+            rows = json.loads(result.stdout)["results"]
             kinds = {row["kind"] for row in rows}
             self.assertIn("memory", kinds)
             self.assertIn("document", kinds)
@@ -1999,7 +1999,7 @@ class UnifiedSearchCommandTests(unittest.TestCase):
             result = self.run_search(root, state_dir, "PDC", "--kind", "document", "--source-kind", "literature", "--project", "ljq")
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            rows = json.loads(result.stdout)
+            rows = json.loads(result.stdout)["results"]
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["kind"], "document")
             self.assertEqual(rows[0]["source_kind"], "literature")
@@ -2020,10 +2020,10 @@ class UnifiedSearchCommandTests(unittest.TestCase):
             result = self.run_search(root, state_dir, "PDC", "--kind", "document", "--project", "ljq")
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            rows = json.loads(result.stdout)
+            rows = json.loads(result.stdout)["results"]
             self.assertEqual([row["relative_path"] for row in rows], ["manuscripts/current/public.md"])
 
-    def test_search_supports_manual_raw_chatgpt_literature_and_manuscript_sources(self):
+    def test_search_supports_manual_text_chatgpt_literature_and_manuscript_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
             root, state_dir, _ = self.setup_store(tmp)
             self.write_document(
@@ -2032,22 +2032,51 @@ class UnifiedSearchCommandTests(unittest.TestCase):
                 "PDC ChatGPT archive discussion",
                 {"conversation_id": "thread-1", "title": "Archive Thread"},
             )
-            self.write_document(root, "imports/manual/raw/note.txt", "PDC manual raw note")
+            self.write_document(root, "imports/manual/text/note.md", "PDC manual text note")
             self.write_document(root, "literature/notes/pdc-note.md", "PDC literature note")
             self.write_document(root, "manuscripts/current/paper.md", "PDC manuscript sentence")
             self.assertEqual(self.run_index(root, state_dir).returncode, 0)
 
             for source_kind, expected_path in [
                 ("chatgpt", "imports/chatgpt/conversations/2026/06/thread.md"),
-                ("manual", "imports/manual/raw/note.txt"),
+                ("manual", "imports/manual/text/note.md"),
                 ("literature", "literature/notes/pdc-note.md"),
                 ("manuscript", "manuscripts/current/paper.md"),
             ]:
                 with self.subTest(source_kind=source_kind):
                     result = self.run_search(root, state_dir, "PDC", "--kind", "document", "--source-kind", source_kind)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    rows = json.loads(result.stdout)
+                    rows = json.loads(result.stdout)["results"]
                     self.assertEqual([row["relative_path"] for row in rows], [expected_path])
+
+    def test_manual_text_sidecar_wins_over_raw_and_binary_raw_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            self.write_document(root, "imports/manual/raw/2026/06/abcd-note.txt", "PDC duplicate raw")
+            self.write_document(
+                root,
+                "imports/manual/text/2026/06/abcd-note.md",
+                "PDC duplicate text",
+                {
+                    "source_path": "imports/manual/raw/2026/06/abcd-note.txt",
+                    "source_sha256": "0" * 64,
+                    "original_name": "note.txt",
+                    "media_type": "text/plain",
+                    "extractor": "utf-8",
+                    "imported_at": "2026-06-24T00:00:00+00:00",
+                },
+            )
+            binary = root / "imports/manual/raw/2026/06/file.pdf"
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_bytes(b"%PDF-\xff\x00PDC")
+
+            result = self.run_index(root, state_dir)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.rows(db, "SELECT relative_path FROM documents ORDER BY relative_path"), [("imports/manual/text/2026/06/abcd-note.md",)])
+            self.assertEqual(self.rows(db, "SELECT COUNT(*) FROM document_fts"), [(1,)])
+            metadata = json.loads(self.rows(db, "SELECT metadata_json FROM documents")[0][0])
+            self.assertEqual(metadata["source_path"], "imports/manual/raw/2026/06/abcd-note.txt")
 
     def test_index_tracks_document_update_delete_and_avoids_duplicate_fts_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2086,7 +2115,7 @@ class UnifiedSearchCommandTests(unittest.TestCase):
             filtered = self.run_search(root, state_dir, "PDC", "--kind", "document", "--workspace", "work")
 
             self.assertEqual(filtered.returncode, 0, filtered.stdout + filtered.stderr)
-            rows = json.loads(filtered.stdout)
+            rows = json.loads(filtered.stdout)["results"]
             self.assertEqual([row["relative_path"] for row in rows], ["manuscripts/current/work.md"])
 
             doc.write_text("PDC changed work manuscript", encoding="utf-8")
@@ -2169,7 +2198,7 @@ class ProjectGovernanceCommandTests(unittest.TestCase):
     def search(self, root, state_dir, query, *extra):
         result = self.run_cli("search", query, "--root", str(root), "--state-dir", str(state_dir), "--json", *extra)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        return json.loads(result.stdout)
+        return json.loads(result.stdout)["results"]
 
     def write_document(self, root, relative, text):
         path = root / relative
@@ -2227,6 +2256,39 @@ class ProjectGovernanceCommandTests(unittest.TestCase):
 
             self.assertEqual(personal, [])
             self.assertEqual(work, [])
+
+    def test_document_metadata_changes_are_reindexed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.write_document(root, "imports/manual/text/note.md", "PDC metadata reindex document")
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            self.assertEqual(self.search(root, state_dir, "PDC", "--kind", "document", "--project", "pdc"), [])
+
+            result = self.run_cli(
+                "document-meta",
+                "set",
+                "--root",
+                str(root),
+                "--path",
+                "imports/manual/text/note.md",
+                "--project",
+                "pdc",
+                "--workspace",
+                "personal",
+                "--confidentiality",
+                "personal",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            self.assertEqual(
+                [row["relative_path"] for row in self.search(root, state_dir, "PDC", "--kind", "document", "--project", "pdc")],
+                ["imports/manual/text/note.md"],
+            )
+
+            result = self.run_cli("document-meta", "unset", "--root", str(root), "--path", "imports/manual/text/note.md")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            self.assertEqual(self.search(root, state_dir, "PDC", "--kind", "document", "--project", "pdc"), [])
 
     def test_search_as_of_context_and_project_isolation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2511,8 +2573,12 @@ class RetrievalEvaluationCommandTests(unittest.TestCase):
             result = self.run_cli("search", "PDC", "--root", str(root), "--state-dir", str(state_dir), "--mode", "hybrid", "--json")
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            rows = json.loads(result.stdout)
+            payload = json.loads(result.stdout)
+            rows = payload["results"]
             self.assertTrue(rows)
+            self.assertEqual(payload["requested_mode"], "hybrid")
+            self.assertEqual(payload["effective_mode"], "lexical")
+            self.assertTrue(payload["warnings"])
             self.assertIn("falling back to lexical", result.stderr)
 
     def test_retrieval_eval_template_exists(self):

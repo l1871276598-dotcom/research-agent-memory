@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import html
 import json
+import mimetypes
 import re
 import sqlite3
 import sys
@@ -20,7 +21,9 @@ from memory import (
 
 CJK_RUN = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF]+")
 IMPORTER_VERSION = 2
-TEXT_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".json", ".html", ".htm", ".rtf", ".pdf", ".docx"}
+TEXT_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".json", ".html", ".htm", ".rtf"}
+ARCHIVE_ONLY_SUFFIXES = {".pdf", ".docx"}
+MANUAL_SUFFIXES = TEXT_SUFFIXES | ARCHIVE_ONLY_SUFFIXES
 
 
 def _query_tokens(text):
@@ -251,9 +254,14 @@ def _atomic_write_bytes(path, data):
 
 def _manual_text(path):
     suffix = path.suffix.lower()
-    if suffix not in TEXT_SUFFIXES:
-        raise ValueError("Manual import supports PDF/DOCX/RTF/HTML/TXT/Markdown/CSV/JSON only when text is directly readable.")
-    text = path.read_text(encoding="utf-8")
+    if suffix not in MANUAL_SUFFIXES:
+        raise ValueError("Manual import supports PDF/DOCX/RTF/HTML/TXT/Markdown/CSV/JSON.")
+    if suffix in ARCHIVE_ONLY_SUFFIXES:
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return None
     if suffix in {".html", ".htm"}:
         text = html.unescape(re.sub(r"<[^>]+>", " ", text))
     elif suffix == ".json":
@@ -280,23 +288,32 @@ def import_manual(args):
     relative_base = Path(f"{now.year:04d}/{now.month:02d}/{digest[:16]}-{safe_slug(source.stem)}")
     raw_relative = Path("imports/manual/raw") / relative_base.with_suffix(source.suffix.lower())
     text_relative = Path("imports/manual/text") / relative_base.with_suffix(".md")
+    written_paths = [raw_relative.as_posix()]
     title = source.stem or source.name
-    markdown = "\n".join(
-        [
-            "---",
-            f"title: {json.dumps(title, ensure_ascii=False)}",
-            f"source_name: {json.dumps(source.name, ensure_ascii=False)}",
-            f"source_sha256: {json.dumps(digest)}",
-            f"imported_at: {json.dumps(now.isoformat())}",
-            'source: "manual_import"',
-            "---",
-            "",
-            f"# {title}",
-            "",
-            text,
-            "",
-        ]
-    )
+    markdown = None
+    if text is not None:
+        written_paths.append(text_relative.as_posix())
+        markdown = "\n".join(
+            [
+                "---",
+                f"title: {json.dumps(title, ensure_ascii=False)}",
+                f"source_path: {json.dumps(raw_relative.as_posix())}",
+                f"source_sha256: {json.dumps(digest)}",
+                f"original_name: {json.dumps(source.name, ensure_ascii=False)}",
+                f"media_type: {json.dumps(mimetypes.guess_type(source.name)[0] or 'application/octet-stream')}",
+                'extractor: "utf-8"',
+                f"imported_at: {json.dumps(now.isoformat())}",
+                'source: "manual_import"',
+                "---",
+                "",
+                f"# {title}",
+                "",
+                text,
+                "",
+            ]
+        )
+    raw_exists = (root / raw_relative).exists()
+    text_exists = (root / text_relative).exists() if text is not None else True
     report = {
         "format_version": 1,
         "importer_version": IMPORTER_VERSION,
@@ -304,22 +321,27 @@ def import_manual(args):
         "input_path": str(source),
         "input_sha256": digest,
         "imported_at": now.isoformat(),
-        "new": 0 if (root / raw_relative).exists() and (root / text_relative).exists() else 1,
+        "new": 0 if raw_exists and text_exists else 1,
         "updated": 0,
-        "duplicate": 1 if (root / raw_relative).exists() and (root / text_relative).exists() else 0,
+        "duplicate": 1 if raw_exists and text_exists else 0,
         "failed": 0,
-        "written_paths": [raw_relative.as_posix(), text_relative.as_posix()],
+        "archived_without_text": 1 if text is None else 0,
+        "written_paths": written_paths,
         "index_result": "not_run",
-        "restore_suggestion": "",
+        "restore_suggestion": "Install or run a dedicated extractor, then import a text/Markdown sidecar." if text is None else "",
     }
     if not args.dry_run:
         (root / raw_relative).parent.mkdir(parents=True, exist_ok=True)
-        (root / text_relative).parent.mkdir(parents=True, exist_ok=True)
         _atomic_write_bytes(root / raw_relative, raw)
-        atomic_write_text(root / text_relative, markdown)
+        if markdown is not None:
+            (root / text_relative).parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(root / text_relative, markdown)
         report["report_path"] = _write_import_report(root, "manual", digest, report)
     print(f"Raw: {raw_relative.as_posix()}")
-    print(f"Text: {text_relative.as_posix()}")
+    if text is None:
+        print("Text: archived_without_text")
+    else:
+        print(f"Text: {text_relative.as_posix()}")
     if args.dry_run:
         print("Dry run: no files changed")
     else:
@@ -365,7 +387,7 @@ def import_chatgpt(args):
             }
         )
 
-    raw_only = unchanged if not getattr(args, "restore_recent", False) else 0
+    raw_only = unchanged
     report = {
         "format_version": 1,
         "importer_version": IMPORTER_VERSION,
@@ -387,7 +409,7 @@ def import_chatgpt(args):
         "failed": preflight["invalid_conversations"],
         "written_paths": [record["path"] for record in records],
         "index_result": "not_run",
-        "restore_suggestion": "Run import-chatgpt --restore-recent only if a future recent pipeline explicitly supports it.",
+        "restore_suggestion": "No recent restore is performed by import-chatgpt in v0.6.0.",
     }
     manifest = {
         "format_version": 1,
@@ -432,7 +454,6 @@ def build_parser():
     import_parser.add_argument("--zip", required=True)
     import_parser.add_argument("--root", required=True)
     import_parser.add_argument("--dry-run", action="store_true")
-    import_parser.add_argument("--restore-recent", action="store_true")
 
     manual_parser = subparsers.add_parser("import-manual", help="Import a local readable file as raw evidence plus text sidecar.")
     manual_parser.add_argument("--path", required=True)

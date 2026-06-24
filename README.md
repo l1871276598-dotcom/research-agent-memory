@@ -1,114 +1,126 @@
 # Research Agent Memory
 
-## 项目简介
+本仓库是本地优先的个人科研 Agent 记忆库。GitHub 只保存代码、Schema、模板、测试和文档；Markdown 记忆、raw 原始证据和稳定文本副本保存在用户选择的数据目录；活动 SQLite、WAL/SHM、缓存和日志必须保存在本地 state 目录。
 
-这是一个本地优先的个人科研 Agent 记忆库。
+真实记忆、真实 ChatGPT ZIP、真实聊天记录、未发表资料、PDF、SQLite、日志、缓存、API key、密码、SSH 私钥和 token 不得提交到 GitHub。
 
-- GitHub 保存代码、Schema、模板、测试和文档。
-- iCloud 数据目录保存 Markdown 记忆、JSONL、文献笔记、文献矩阵和允许同步的归档文件。
-- Mac 本地运行目录保存 SQLite、缓存和日志。
+## 当前版本状态
 
-真实记忆、未发表资料、PDF 和运行数据库不得进入 GitHub。活动 SQLite 数据库不得直接放入 iCloud。
+- 当前软件版本：v0.6.0
+- SQLite schema：v3
+- 默认检索模式：lexical
+- 主要支持平台：macOS
+- 支持的 Python：3.11 或更高版本
+
+## 环境要求
+
+- Python 3.11+
+- 标准库 `sqlite3` 必须启用 FTS5
+- macOS 是主要使用平台；CI 使用 Ubuntu + Python 3.11
+- 当前代码不调用 `pdftotext` 或 `textutil`
+- 当前代码不需要 Codex CLI、语义模型、云 API 或付费 API
+
+没有文本提取器时，`import-manual` 对 PDF/DOCX 只归档 raw 原始文件，报告 `archived_without_text: 1`，不会生成 text sidecar，也不会进入全文索引。要索引 PDF/DOCX 内容，需要先用外部工具生成 Markdown/TXT，再导入该文本文件。
 
 ## 当前能力
 
-### 核心记忆命令
+- 初始化本地数据目录
+- 添加、验证和导出结构化 Markdown 记忆
+- `profile`、`context`、`principle`、`project`、`decision`、`procedure`、`session` 和 `context_transition`
+- workspace、project、confidentiality 和时间有效性过滤
+- SQLite FTS5 schema v3 派生索引
+- 结构化记忆与文档的统一 lexical 检索
+- ChatGPT 官方 ZIP 本地手动导入
+- 手动文件 raw 归档和稳定 text sidecar
+- 文档元数据覆盖
+- 候选记忆审核：`apply` → `review` → `accept` / `reject`
+- Agent Context Pack JSON/Markdown 输出
+- lexical 检索评测框架
+- `semantic` / `hybrid` 模式接口的显式 lexical 回退
+- `doctor` 健康检查
+- GitHub Actions 在 push / pull_request 运行测试、compileall 和 whitespace 检查
 
-```bash
-python3 src/memory.py init --root PATH
-python3 src/memory.py add ...
-python3 src/memory.py validate --root PATH
-python3 src/memory.py export --root PATH
-python3 src/memory.py context-transition ...
-python3 src/memory.py db-init --root PATH
-python3 src/memory.py index --root PATH
-python3 src/memory.py db-rebuild --root PATH
-python3 src/memory.py search "QUERY" --root PATH
-python3 src/memory.py document-meta set ...
-python3 src/memory.py project-status --project PROJECT --root PATH
-python3 src/memory.py context "TASK QUERY" --root PATH
-python3 src/memory.py evaluate-search --cases CASES.json --root PATH
-python3 src/memory_distill.py review --root PATH
-```
+## 尚未实现能力
 
-已实现：
+- 新导入对话自动批量生成候选记忆
+- ChatGPT 附件导入
+- PDF/DOCX 深度结构化解析
+- 文献矩阵自动填充
+- Zotero / EndNote 同步
+- 真实本地向量 embedding
+- 真实语义相似度检索
+- 真实 lexical + semantic 混合排序
+- MCP 接口
+- 总控 Agent
 
-- 标准数据目录初始化
-- `profile`、`context`、`principle`、`project`、`decision`、`procedure`、`session` 等结构化记忆
-- 单文件与跨文件验证
-- workspace 与保密级别隔离
-- 确定性 JSONL 导出和 SHA-256 清单
-- 事务式情景迁移
-- 本地 SQLite FTS5 初始化
-- Markdown 记忆、ChatGPT 原始归档、手工原文、文献笔记和稿件文件增量索引
-- 统一全文搜索，可按记忆/文档、来源、项目和 workspace 过滤
-- 项目注册校验、文档元数据覆盖、时间有效性过滤和项目状态汇总
-- Agent Context Pack (`context-pack/v1`) JSON/Markdown 输出
-- lexical 检索评测框架，`semantic`/`hybrid` 可选接口默认安全回退 lexical
-- 中文二元词索引预处理
-- 候选记忆审核生命周期：candidate → accept/reject → active/accepted/rejected/conflict
+候选审核生命周期已经实现；自动候选生成调度尚未实现。
 
-### 轻量扩展命令
+## 目录布局
 
-ChatGPT ZIP 和手工文件导入暂放在一个轻量入口中：
-
-```bash
-python3 src/memory_tools.py import-chatgpt ...
-python3 src/memory_tools.py import-manual ...
-```
-
-已实现：
-
-- 从 ChatGPT 官方导出 ZIP 中识别 `conversations.json`
-- ZIP 预检、CRC 检查、重复 `conversations.json` 检查和导入报告
-- 将本地可读文件保存为 raw 证据和稳定 Markdown 文本副本
-- 使用对话 ID 和内容哈希进行幂等更新
-- `--dry-run` 预演
-- 导入清单生成
-
-导入只负责原始证据档案，不会自动把每段对话或文件晋升为长期记忆。
-
-## 推荐目录
+`init` 会创建以下数据目录和文件：
 
 ```text
-GitHub 代码仓库
-└── research-agent-memory/
-    ├── src/
-    ├── tests/
-    ├── schemas/
-    ├── templates/
-    └── .github/workflows/
-
-iCloud 数据目录
-└── ResearchAgent/
-    ├── memory/
-    ├── literature/
-    ├── manuscripts/
-    ├── imports/chatgpt/
-    ├── exports/
-    └── backups/
-
-Mac 本地运行目录
-└── ~/Library/Application Support/ResearchAgent/
-    └── memory.sqlite
+ResearchAgent/
+├── memory/
+│   ├── profile/
+│   ├── contexts/
+│   ├── transitions/
+│   ├── principles/
+│   ├── projects/
+│   ├── decisions/
+│   ├── procedures/
+│   └── sessions/
+├── imports/
+│   ├── chatgpt/
+│   │   └── conversations/
+│   ├── manual/
+│   │   ├── raw/
+│   │   └── text/
+│   └── document_metadata.json
+├── literature/
+│   ├── inbox/
+│   ├── pdf/
+│   ├── notes/
+│   ├── journals/
+│   └── literature_matrix.csv
+├── manuscripts/
+│   ├── current/
+│   ├── evidence/
+│   └── archive/
+├── exports/
+│   ├── database_snapshots/
+│   ├── import_reports/
+│   └── index_manifest.json
+└── backups/
 ```
+
+本地 state 目录至少包含：
+
+```text
+~/Library/Application Support/ResearchAgent/
+└── memory.sqlite
+```
+
+SQLite、WAL、SHM、锁、缓存和日志都属于可重建的本地派生状态，不应放在 iCloud 数据目录。
 
 ## 快速开始
 
-以下示例使用建议路径：
-
 ```bash
+REPO_ROOT="/Users/user/projects/research-agent-memory"
 DATA_ROOT="$HOME/Library/Mobile Documents/com~apple~CloudDocs/ResearchAgent"
 STATE_DIR="$HOME/Library/Application Support/ResearchAgent"
+cd "$REPO_ROOT"
 ```
-
-### 1. 初始化数据目录
 
 ```bash
 python3 src/memory.py init --root "$DATA_ROOT"
 ```
 
-### 2. 添加一条记忆
+```bash
+python3 src/memory.py db-init \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR"
+```
 
 ```bash
 python3 src/memory.py add \
@@ -124,25 +136,47 @@ python3 src/memory.py add \
   --tags coding architecture
 ```
 
-### 3. 验证记忆库
-
 ```bash
 python3 src/memory.py validate --root "$DATA_ROOT"
 ```
 
-### 4. 初始化并更新本地索引
-
 ```bash
-python3 src/memory.py db-init \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR"
-
 python3 src/memory.py index \
   --root "$DATA_ROOT" \
   --state-dir "$STATE_DIR"
 ```
 
-可先预演索引变化：
+```bash
+python3 src/memory.py search "代码最少" \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR"
+```
+
+```bash
+python3 src/memory.py doctor \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR"
+```
+
+## 添加结构化记忆
+
+```bash
+python3 src/memory.py add \
+  --root "$DATA_ROOT" \
+  --type project \
+  --title "PDC 项目" \
+  --scope project \
+  --project pdc \
+  --workspace personal \
+  --confidentiality personal \
+  --source user \
+  --confidence confirmed \
+  --content "PDC project memory registry."
+```
+
+项目作用域的 `decision`、`procedure` 或其他记忆必须引用已有 active `type: project` 记录。
+
+## 统一索引
 
 ```bash
 python3 src/memory.py index \
@@ -151,7 +185,13 @@ python3 src/memory.py index \
   --dry-run
 ```
 
-如需从 Markdown 和原始文本证据重建 SQLite 派生索引：
+```bash
+python3 src/memory.py index \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR"
+```
+
+如需重建派生 SQLite：
 
 ```bash
 python3 src/memory.py db-rebuild \
@@ -159,28 +199,18 @@ python3 src/memory.py db-rebuild \
   --state-dir "$STATE_DIR"
 ```
 
-## 搜索记忆
+Markdown 记忆、raw 原始证据和 text 稳定文本副本是权威数据。SQLite 是派生索引；`db-rebuild` 从权威文件重建临时数据库，验证通过后原子替换，失败时旧数据库保留。
 
-基础搜索：
-
-```bash
-python3 src/memory.py search "代码最少" \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR"
-```
-
-按项目和来源过滤：
+## 搜索
 
 ```bash
 python3 src/memory.py search "论文证据链" \
   --root "$DATA_ROOT" \
   --state-dir "$STATE_DIR" \
-  --project pdc-rock-manuscript \
   --kind document \
-  --source-kind manuscript
+  --source-kind manuscript \
+  --project pdc
 ```
-
-输出 JSON：
 
 ```bash
 python3 src/memory.py search "RMRE" \
@@ -189,30 +219,39 @@ python3 src/memory.py search "RMRE" \
   --json
 ```
 
-搜索前必须先完成 `db-init` 和 `index`。索引过期时搜索会拒绝返回结果，并提示先重新运行 `index`。
+JSON 输出形如：
 
-默认搜索会合并结构化记忆和已索引文档。文档来源包括：
+```json
+{
+  "requested_mode": "lexical",
+  "effective_mode": "lexical",
+  "warnings": [],
+  "results": []
+}
+```
+
+当前索引源：
 
 - `imports/chatgpt/conversations/`
-- `imports/manual/raw/`
+- `imports/manual/text/`
+- `imports/manual/raw/`，仅当没有对应 text sidecar 且 raw 是 UTF-8 可读文本
 - `literature/notes/`
 - `literature/journals/`
 - `manuscripts/current/`
 - `manuscripts/evidence/`
 - `manuscripts/archive/`
 
-## 导入 ChatGPT 官方导出
+手动导入资料优先索引 `imports/manual/text/`。同一份 TXT/JSON/CSV 等文件有 text sidecar 时，raw 不进入 FTS，避免重复结果。PDF/DOCX 等二进制 raw 不直接进入 FTS。
 
-手动流程：
+## ChatGPT ZIP 手动导入
+
+当前唯一入口是：
 
 ```text
-用户在 ChatGPT 中申请数据导出
-→ 用户自行从邮件下载 ZIP
-→ 手动运行 import-chatgpt
-→ 归档为 Markdown
+用户手动申请官方数据导出
+→ 用户自行下载 ZIP
+→ 本地运行 import-chatgpt
 ```
-
-先预演：
 
 ```bash
 python3 src/memory_tools.py import-chatgpt \
@@ -221,28 +260,30 @@ python3 src/memory_tools.py import-chatgpt \
   --dry-run
 ```
 
-正式导入：
-
 ```bash
 python3 src/memory_tools.py import-chatgpt \
   --zip "$HOME/Downloads/chatgpt-export.zip" \
   --root "$DATA_ROOT"
 ```
 
-输出位置：
+导入输出：
 
 ```text
 imports/chatgpt/conversations/YYYY/MM/*.md
 imports/chatgpt/import_manifest.json
+exports/import_reports/*-chatgpt-*.json
 ```
 
-重复导入相同内容不会重复创建对话文件；对话内容发生变化时会更新原文件。
+导入会检查 ZIP 是否存在、是否为符号链接、ZIP CRC、唯一 `conversations.json`、JSON 根节点是否为 list、conversation 基本结构，并报告 `conversation_count`、`message_count`、`new`、`updated`、`unchanged`、`raw_only` 和 `failed`。报告不包含完整聊天正文。重复导入旧 ZIP 不会重建 recent，也不会把旧内容晋升为长期记忆。
 
-该仓库只支持用户自行下载官方导出 ZIP 后再运行 `import-chatgpt`；重复导入保持幂等。
+## 手动文件导入
 
-## 导入手工文件
-
-手工文件导入会保存一份 raw 原文件，并为可直接提取文本的文件生成稳定 Markdown 文本副本：
+```bash
+python3 src/memory_tools.py import-manual \
+  --path "$HOME/Downloads/note.txt" \
+  --root "$DATA_ROOT" \
+  --dry-run
+```
 
 ```bash
 python3 src/memory_tools.py import-manual \
@@ -250,27 +291,42 @@ python3 src/memory_tools.py import-manual \
   --root "$DATA_ROOT"
 ```
 
-输出位置：
+支持的单文件入口参数是 `--path`。当前不支持目录扫描、inbox 扫描、`--file` 或 `--scan-inbox`。
+
+文本类文件会写入：
 
 ```text
 imports/manual/raw/YYYY/MM/*
 imports/manual/text/YYYY/MM/*.md
-exports/import_reports/*.json
+exports/import_reports/*-manual-*.json
 ```
 
-## 诊断
+text sidecar front matter 包含 `source_path`、`source_sha256`、`original_name`、`media_type`、`extractor` 和 `imported_at`，可追溯到 raw 原始证据。重复导入同一文件会报告 duplicate。导入不会自动运行 `index`。
+
+PDF/DOCX 或无法 UTF-8 解码的文件只写 raw 和导入报告，报告 `archived_without_text: 1`，不写 text sidecar，不进入全文索引。
+
+## Doctor
 
 ```bash
 python3 src/memory.py doctor \
   --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR"
+  --state-dir "$STATE_DIR" \
+  --json
 ```
 
-`doctor` 只读检查数据根、SQLite schema、WAL、memory/document 索引新鲜度、哈希不一致和手工 raw/text 孤立文件。
+`doctor` 检查数据根、SQLite schema、WAL、memory/document 索引新鲜度、哈希不一致、manual raw/text 孤立文件和旧网络残留标记。
 
-## 候选记忆审核
+## 候选审核
 
-Codex 或其他自动蒸馏流程应先生成候选，不直接写入正式 active 记忆：
+候选审核只有一套当前实现的流程：
+
+```text
+apply
+→ review
+→ accept / reject
+```
+
+当前 `memory_distill.py` 不提供 `prepare`、`run`、`purge` 或 `status` 子命令。
 
 ```bash
 python3 src/memory_distill.py apply \
@@ -283,68 +339,99 @@ python3 src/memory_distill.py apply \
   --confidentiality personal \
   --source codex \
   --content "候选内容"
-
-python3 src/memory_distill.py review --root "$DATA_ROOT"
-python3 src/memory_distill.py accept --root "$DATA_ROOT" --id CANDIDATE_ID
-python3 src/memory_distill.py reject --root "$DATA_ROOT" --id CANDIDATE_ID --reason "证据不足"
 ```
 
-`merge` 和 `support` 只合并 `source_refs`、`tags`、`relations` 等安全列表，不静默覆盖目标记忆的核心 `content`。
+```bash
+python3 src/memory_distill.py review \
+  --root "$DATA_ROOT" \
+  --json
+```
+
+```bash
+python3 src/memory_distill.py accept \
+  --root "$DATA_ROOT" \
+  --id CANDIDATE_ID
+```
+
+```bash
+python3 src/memory_distill.py reject \
+  --root "$DATA_ROOT" \
+  --id CANDIDATE_ID \
+  --reason "证据不足"
+```
+
+记忆文件状态与审核状态分离：
+
+- 记忆 `status`：`candidate`、`active`、`conflict`、`historical`、`archived`、`deprecated`
+- 审核 `audit_status`：`prepared`、`awaiting_review`、`accepted`、`rejected`、`conflict`、`pending_delete`、`deleted`、`stale`、`failed`
+
+行为边界：
+
+- `create`：候选通过后变为 `status: active`、`audit_status: accepted`
+- `merge`：目标必须存在；只合并 `source_refs`、`tags`、`relations`；候选归档为 `audit_status: accepted`
+- `support`：不改目标核心 `content`；只增加来源和证据；候选归档为 `audit_status: accepted`
+- `supersede`：新记录 active；旧记录 historical；维护双向 supersession 关系
+- `conflict`：不覆盖正式记忆；候选变为 `status: conflict`、`audit_status: conflict`
+- `reject`：候选归档为 `status: archived`、`audit_status: rejected`，保存 `review_reason`
+
+如果候选记录带有 `source_path` 和 `source_sha256`，accept 前会重新校验 source hash，防止证据变化后继续审核。
+
+## 记忆生命周期
+
+当前 v0.6.0 支持的真实生命周期：
+
+```text
+ChatGPT ZIP / manual import
+→ raw 原始证据归档
+→ 可读文本生成 text sidecar
+→ index 写入 SQLite FTS
+→ 人工或自动流程调用 apply 生成 candidate
+→ review
+→ accept / reject
+→ active / archived / conflict / historical
+```
+
+raw 原始证据不会被 `index`、`db-rebuild`、`accept` 或 `reject` 删除。当前没有 recent purge 命令、删除宽限期命令或自动 recent 生命周期管理。
 
 ## 项目治理
-
-项目作用域记忆必须引用已有 active `type: project` 记录。同一 project 只能有一个 active project 注册记录。
-
-文档项目元数据保存在权威文件 `imports/document_metadata.json`：
 
 ```bash
 python3 src/memory.py document-meta set \
   --root "$DATA_ROOT" \
-  --path imports/manual/raw/note.txt \
-  --project pdc-rock-manuscript \
+  --path imports/manual/text/2026/06/note.md \
+  --project pdc \
   --workspace personal \
   --confidentiality personal
-
-python3 src/memory.py document-meta unset \
-  --root "$DATA_ROOT" \
-  --path imports/manual/raw/note.txt
 ```
-
-搜索支持时间点过滤：
 
 ```bash
-python3 src/memory.py search "论文证据链" \
+python3 src/memory.py document-meta unset \
   --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR" \
-  --project pdc-rock-manuscript \
-  --as-of 2026-06-24
+  --path imports/manual/text/2026/06/note.md
 ```
 
-查看项目状态：
+`document-meta` 使用相对 `DATA_ROOT` 的 `--path`。路径必须属于真实索引源，不能逃逸到 data root 外部。
 
 ```bash
 python3 src/memory.py project-status \
   --root "$DATA_ROOT" \
   --state-dir "$STATE_DIR" \
-  --project pdc-rock-manuscript
+  --project pdc \
+  --json
 ```
 
-## Agent Context Pack
-
-为 Codex、LJQ 或其他本地 Agent 生成受控上下文包：
+## Context Pack
 
 ```bash
 python3 src/memory.py context \
   "本次任务查询" \
   --root "$DATA_ROOT" \
   --state-dir "$STATE_DIR" \
-  --project pdc-rock-manuscript \
+  --project pdc \
   --workspace personal \
   --format json \
   --max-chars 16000
 ```
-
-可输出 Markdown 或写入文件：
 
 ```bash
 python3 src/memory.py context \
@@ -355,11 +442,11 @@ python3 src/memory.py context \
   --output context-pack.md
 ```
 
-生成前会检查 SQLite 索引是否过期；过期时拒绝生成，提示先重新运行 `index`。
+生成前会检查 SQLite 索引是否过期；过期时拒绝生成，提示先运行 `index`。
 
 ## 检索评测
 
-评测用例模板在 `templates/retrieval_eval.json`。真实评测数据应放在用户数据目录，不提交仓库。
+评测模板在 `templates/retrieval_eval.json`。真实评测数据应放在用户数据目录，不提交仓库。
 
 ```bash
 python3 src/memory.py evaluate-search \
@@ -370,7 +457,43 @@ python3 src/memory.py evaluate-search \
   --json
 ```
 
-`search` 支持 `--mode lexical|semantic|hybrid`。当前默认和实际执行模式都是 `lexical`；`semantic`/`hybrid` 在没有本地语义模块时会回退 lexical 并输出 warning。
+输出包含 `requested_mode`、`effective_mode`、`warnings`、Top-1/Top-5、泄漏率和延迟统计。
+
+## Semantic / Hybrid 能力边界
+
+已实现：
+
+- lexical FTS5 检索
+- 检索评测框架
+- `--mode lexical|semantic|hybrid` 接口
+- semantic/hybrid 后端不可用时的显式 lexical 回退
+
+未实现：
+
+- embedding 模型加载
+- 文本向量生成
+- chunk / embedding 表
+- 向量持久化
+- cosine similarity
+- semantic 排序
+- lexical + semantic 混合 RRF
+
+示例：
+
+```bash
+python3 src/memory.py search "PDC" \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --mode hybrid
+```
+
+文本输出会显示：
+
+```text
+Requested mode: hybrid
+Effective mode: lexical
+Warning: hybrid search unavailable; falling back to lexical
+```
 
 ## 情景迁移
 
@@ -387,39 +510,68 @@ python3 src/memory.py context-transition \
   --dry-run
 ```
 
-旧 Context 不会被删除，而是转为 `historical`，并通过 `supersedes` 和 `superseded_by` 建立关系。
+旧 context 不会被删除，而是转为 `historical`，并通过 `supersedes` / `superseded_by` 建立关系。
 
 ## 保密规则
 
-- `public` 和 `personal` 默认可导出。
-- `internal` 默认不导出，可用 `--include-internal` 显式包含。
-- `restricted` 永远不导出。
-- `internal` 和 `restricted` 必须属于 `work` workspace。
-- 密码、API key、SSH 私钥和其他凭证不得写入记忆库。
-- 原始 ChatGPT 导出 ZIP、真实记忆、PDF、SQLite 和 token 不得提交到 GitHub。
+- `public` 和 `personal` 默认可导出
+- `internal` 默认不导出，可用 `--include-internal` 显式包含
+- `restricted` 永远不导出
+- `internal` 和 `restricted` 必须属于 `work` workspace
+- 搜索和 Context Pack 默认不返回 restricted 文档
+- 密码、API key、SSH 私钥和其他凭证不得写入记忆库
 
-## 自动测试
+## 备份与恢复
 
-GitHub Actions 在 push 和 pull request 时自动执行：
+需要备份：
+
+- Markdown 记忆
+- raw 原始证据
+- text 稳定文本副本
+- `imports/document_metadata.json`
+- `imports/chatgpt/import_manifest.json`
+- 必要的项目资料
+
+可以重建：
+
+- `memory.sqlite`
+- FTS 表
+- 缓存
+- 临时任务目录
+
+恢复后执行：
+
+```bash
+python3 src/memory.py db-rebuild \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR"
+```
+
+SQLite 不是唯一备份对象，也不是权威数据源。
+
+## 自动测试与 CI
+
+本地发布门禁：
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m compileall src
+python3 -m compileall -q src
+git diff --check
 ```
 
-本地也可以运行相同命令。
+GitHub Actions 已配置在 push 和 pull request 时运行：
 
-## 尚未实现
+```bash
+python3 -m unittest discover -s tests -v
+python3 -m compileall -q src
+git diff --check
+```
 
-- 对话自动提取并审核候选长期记忆
-- ChatGPT 附件导入
-- 官方 ZIP 与实时快照自动对账
-- Mac 离线时的加密云队列
-- PDF 自动解析和文献矩阵自动填充
-- Zotero 或 EndNote 同步
-- Chroma、向量嵌入和语义检索
-- MCP 接口
-- 总控 Agent
+尚未推送分支或运行远程 workflow 时，不应声称远程 CI 已通过。
+
+## 不属于 v0.6.0
+
+iCloud 多端同步、设备注册、设备状态、移动端写入、自动索引刷新、实时同步、自动 ZIP 下载、ChatGPT 自动登录、Web 服务、GUI、桌面 App、云数据库、独立向量数据库和常驻后台监听服务不属于 v0.6.0，本次未实现。
 
 ## 许可证
 

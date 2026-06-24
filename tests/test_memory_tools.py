@@ -236,22 +236,23 @@ class MemoryToolsTests(unittest.TestCase):
             self.assertEqual(report["invalid_conversations"], 2)
             self.assertEqual(report["conversations"], [])
 
-    def test_import_chatgpt_reports_raw_only_without_restore_recent(self):
+    def test_import_chatgpt_reports_raw_only_without_recent_restore(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             root = self.make_root(base)
             export = base / "export.zip"
             self.sample_export(export)
-            args = argparse.Namespace(root=str(root), zip=str(export), dry_run=False, restore_recent=False)
+            args = argparse.Namespace(root=str(root), zip=str(export), dry_run=False)
             with redirect_stdout(StringIO()):
                 TOOLS.import_chatgpt(args)
             with redirect_stdout(StringIO()):
                 report = TOOLS.import_chatgpt(args)
             self.assertEqual(report["raw_only"], 1)
-            args.restore_recent = True
-            with redirect_stdout(StringIO()):
-                restored = TOOLS.import_chatgpt(args)
-            self.assertEqual(restored["raw_only"], 0)
+            self.assertIn("No recent restore", report["restore_suggestion"])
+            parser = TOOLS.build_parser()
+            with redirect_stderr(StringIO()):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args(["import-chatgpt", "--zip", "x.zip", "--root", "root", "--restore-recent"])
 
     def test_import_manual_writes_raw_text_sidecar_and_report(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -268,8 +269,30 @@ class MemoryToolsTests(unittest.TestCase):
             text = root / report["written_paths"][1]
             self.assertTrue(raw.is_file())
             self.assertTrue(text.is_file())
-            self.assertIn("Manual PDC sidecar text", text.read_text(encoding="utf-8"))
+            text_content = text.read_text(encoding="utf-8")
+            self.assertIn("Manual PDC sidecar text", text_content)
+            self.assertIn(f'source_path: "{report["written_paths"][0]}"', text_content)
+            self.assertIn('original_name: "note.txt"', text_content)
+            self.assertEqual(report["archived_without_text"], 0)
             self.assertTrue(list((root / "exports/import_reports").glob("*.json")))
+
+    def test_import_manual_archives_binary_without_text_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = self.make_root(base)
+            source = base / "paper.pdf"
+            source.write_bytes(b"%PDF-\xff\x00not utf8")
+            args = argparse.Namespace(root=str(root), path=str(source), dry_run=False)
+
+            with redirect_stdout(StringIO()):
+                report = TOOLS.import_manual(args)
+
+            self.assertEqual(report["archived_without_text"], 1)
+            self.assertEqual(len(report["written_paths"]), 1)
+            self.assertTrue((root / report["written_paths"][0]).is_file())
+            self.assertFalse((root / "imports/manual/text").exists())
+            saved = json.loads(list((root / "exports/import_reports").glob("*.json"))[0].read_text(encoding="utf-8"))
+            self.assertEqual(saved["archived_without_text"], 1)
 
     def test_serve_chatgpt_command_is_removed(self):
         parser = TOOLS.build_parser()

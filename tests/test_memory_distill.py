@@ -111,6 +111,7 @@ class MemoryDistillReviewTests(unittest.TestCase):
             path, text = self.record_by_id(root, candidate_id)
 
             self.assertIn('status: "candidate"', text)
+            self.assertIn('audit_status: "awaiting_review"', text)
             self.assertIn('candidate_action: "create"', text)
             self.assertIn('confidence: "inferred"', text)
             self.assertTrue(path.name.startswith(candidate_id + "-"))
@@ -125,6 +126,7 @@ class MemoryDistillReviewTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             _, text = self.record_by_id(root, candidate_id)
             self.assertIn('status: "active"', text)
+            self.assertIn('audit_status: "accepted"', text)
             self.assertIn("reviewed_at:", text)
 
     def test_accept_merge_only_merges_safe_lists(self):
@@ -142,7 +144,8 @@ class MemoryDistillReviewTests(unittest.TestCase):
             self.assertIn("source_refs:", target)
             self.assertIn('  - "doc:one"', target)
             self.assertIn("relations:", target)
-            self.assertIn('status: "accepted"', candidate)
+            self.assertIn('status: "archived"', candidate)
+            self.assertIn('audit_status: "accepted"', candidate)
 
     def test_accept_support_does_not_change_target_content(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -157,6 +160,9 @@ class MemoryDistillReviewTests(unittest.TestCase):
             self.assertIn("do not overwrite", target)
             self.assertNotIn("replacement", target)
             self.assertIn('  - "doc:two"', target)
+            _, candidate = self.record_by_id(root, candidate_id)
+            self.assertIn('status: "archived"', candidate)
+            self.assertIn('audit_status: "accepted"', candidate)
 
     def test_accept_supersede_links_records(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -172,7 +178,24 @@ class MemoryDistillReviewTests(unittest.TestCase):
             self.assertIn('status: "historical"', target)
             self.assertIn(f'  - "{candidate_id}"', target)
             self.assertIn('status: "active"', candidate)
+            self.assertIn('audit_status: "accepted"', candidate)
             self.assertIn(f'  - "{target_id}"', candidate)
+
+    def test_accept_conflict_preserves_target_and_marks_audit_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.init_root(tmp)
+            target_id = self.add_memory(root, content="confirmed content")
+            candidate_id = self.distill_apply(root, action="conflict", target_id=target_id, content="conflicting content")
+
+            result = self.distill_accept(root, candidate_id)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            _, target = self.record_by_id(root, target_id)
+            _, candidate = self.record_by_id(root, candidate_id)
+            self.assertIn("confirmed content", target)
+            self.assertNotIn("conflicting content", target)
+            self.assertIn('status: "conflict"', candidate)
+            self.assertIn('audit_status: "conflict"', candidate)
 
     def test_reject_records_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -183,7 +206,8 @@ class MemoryDistillReviewTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             _, text = self.record_by_id(root, candidate_id)
-            self.assertIn('status: "rejected"', text)
+            self.assertIn('status: "archived"', text)
+            self.assertIn('audit_status: "rejected"', text)
             self.assertIn('review_reason: "weak evidence"', text)
 
     def test_accept_blocks_changed_source_hash_and_missing_target(self):

@@ -15,9 +15,13 @@ venv/
 *.sqlite3
 *.sqlite-wal
 *.sqlite-shm
+*.zip
+*.log
 chroma/
 cache/
 logs/
+distillation/
+~/Library/Application Support/ResearchAgent/
 
 memory.jsonl
 database_snapshots/

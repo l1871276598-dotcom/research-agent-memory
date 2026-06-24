@@ -82,6 +82,7 @@ def apply_candidate(args):
         "created": today,
         "updated": today,
         "status": "candidate",
+        "audit_status": "awaiting_review",
         "scope": args.scope,
         "workspace": args.workspace,
         "confidentiality": args.confidentiality,
@@ -126,9 +127,10 @@ def _check_source(root, record):
         raise ValueError("source hash changed")
 
 
-def _reviewed(record, status, reason=None):
+def _reviewed(record, status, audit_status, reason=None):
     reviewed = dict(record)
     reviewed["status"] = status
+    reviewed["audit_status"] = audit_status
     reviewed["updated"] = _today()
     reviewed["reviewed_at"] = _today()
     if reason is not None:
@@ -149,14 +151,14 @@ def accept_candidate(args):
 
     operations = []
     if action == "create":
-        final = _reviewed(candidate, "active")
+        final = _reviewed(candidate, "active", "accepted")
         operations.append((candidate_item["path"], render_existing_memory(candidate_item["path"], final)))
     elif action == "merge":
         target = dict(target_item["record"])
         for field in SAFE_MERGE_LISTS:
             target[field] = _merge_unique(_list(target.get(field)), _list(candidate.get(field)))
         target["updated"] = _today()
-        final = _reviewed(candidate, "accepted")
+        final = _reviewed(candidate, "archived", "accepted")
         operations.extend(
             [
                 (target_item["path"], render_existing_memory(target_item["path"], target)),
@@ -167,7 +169,7 @@ def accept_candidate(args):
         target = dict(target_item["record"])
         target["source_refs"] = _merge_unique(_list(target.get("source_refs")), _list(candidate.get("source_refs")) + _list(candidate.get("evidence")))
         target["updated"] = _today()
-        final = _reviewed(candidate, "accepted")
+        final = _reviewed(candidate, "archived", "accepted")
         operations.extend(
             [
                 (target_item["path"], render_existing_memory(target_item["path"], target)),
@@ -179,7 +181,7 @@ def accept_candidate(args):
         target["status"] = "historical"
         target["updated"] = _today()
         target["superseded_by"] = _merge_unique(_list(target.get("superseded_by")), [candidate["id"]])
-        final = _reviewed(candidate, "active")
+        final = _reviewed(candidate, "active", "accepted")
         final["supersedes"] = _merge_unique(_list(final.get("supersedes")), [target["id"]])
         operations.extend(
             [
@@ -188,10 +190,10 @@ def accept_candidate(args):
             ]
         )
     elif action == "conflict":
-        final = _reviewed(candidate, "conflict")
+        final = _reviewed(candidate, "conflict", "conflict")
         operations.append((candidate_item["path"], render_existing_memory(candidate_item["path"], final)))
     else:
-        final = _reviewed(candidate, "rejected", "discarded by candidate action")
+        final = _reviewed(candidate, "archived", "rejected", "discarded by candidate action")
         operations.append((candidate_item["path"], render_existing_memory(candidate_item["path"], final)))
 
     _replace_transaction(operations, [])
@@ -201,9 +203,9 @@ def accept_candidate(args):
 def reject_candidate(args):
     root, records = _records_by_id(args.root)
     candidate_item = _require_candidate(records, args.id)
-    final = _reviewed(candidate_item["record"], "rejected", args.reason)
+    final = _reviewed(candidate_item["record"], "archived", "rejected", args.reason)
     _replace_transaction([(candidate_item["path"], render_existing_memory(candidate_item["path"], final))], [])
-    return {"candidate_id": args.id, "status": "rejected"}
+    return {"candidate_id": args.id, "status": "archived", "audit_status": "rejected"}
 
 
 def review_candidates(args):

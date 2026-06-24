@@ -53,10 +53,13 @@ STATUS_CHOICES = [
     "candidate",
     "conflict",
     "archived",
+]
+AUDIT_STATUS_CHOICES = [
     "prepared",
     "awaiting_review",
     "accepted",
     "rejected",
+    "conflict",
     "pending_delete",
     "deleted",
     "stale",
@@ -66,6 +69,7 @@ SCOPE_CHOICES = ["global", "context", "project"]
 WORKSPACE_CHOICES = ["personal", "work"]
 CONFIDENTIALITY_CHOICES = ["public", "personal", "internal", "restricted"]
 CONFIDENCE_CHOICES = ["confirmed", "inferred", "uncertain"]
+TEXT_DOCUMENT_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".json", ".html", ".htm", ".rtf"}
 
 TYPE_DIRS = {
     "profile": "memory/profile",
@@ -105,6 +109,7 @@ ALLOWED_FIELDS = set(REQUIRED_FIELDS) | {
     "effective_date",
     "reason",
     "candidate_action",
+    "audit_status",
     "target_id",
     "source_id",
     "source_path",
@@ -359,6 +364,7 @@ def render_front_matter(record):
         "effective_date",
         "reason",
         "candidate_action",
+        "audit_status",
         "target_id",
         "source_id",
         "source_path",
@@ -616,6 +622,7 @@ def validate_record(record, path, rel_path, expected_type):
     for field, choices in [
         ("type", TYPE_CHOICES),
         ("status", STATUS_CHOICES),
+        ("audit_status", AUDIT_STATUS_CHOICES),
         ("scope", SCOPE_CHOICES),
         ("workspace", WORKSPACE_CHOICES),
         ("confidentiality", CONFIDENTIALITY_CHOICES),
@@ -631,7 +638,7 @@ def validate_record(record, path, rel_path, expected_type):
         errors.append("content must be a string")
 
     dates = {}
-    for field in ("created", "updated", "valid_from", "valid_until", "effective_date"):
+    for field in ("created", "updated", "valid_from", "valid_until", "effective_date", "reviewed_at"):
         if field in record:
             parsed = _real_date(record[field])
             if parsed is None:
@@ -1490,6 +1497,16 @@ def document_source_kind(relative_path):
     return None
 
 
+def _manual_document_key(relative_path):
+    path = Path(relative_path)
+    for prefix in ("imports/manual/raw", "imports/manual/text"):
+        try:
+            return path.relative_to(prefix).with_suffix("").as_posix()
+        except ValueError:
+            continue
+    return None
+
+
 def parse_document_frontmatter(text):
     metadata = {
         "workspace": "personal",
@@ -1510,7 +1527,22 @@ def parse_document_frontmatter(text):
             key, raw = line.split(":", 1)
             key = key.strip()
             raw = raw.strip()
-            if key not in {"title", "conversation_id", "archive_id", "workspace", "confidentiality", "project", "context_id", "updated"}:
+            if key not in {
+                "title",
+                "conversation_id",
+                "archive_id",
+                "workspace",
+                "confidentiality",
+                "project",
+                "context_id",
+                "updated",
+                "source_path",
+                "source_sha256",
+                "original_name",
+                "media_type",
+                "extractor",
+                "imported_at",
+            }:
                 continue
             try:
                 value = json.loads(raw) if raw.startswith('"') else raw
@@ -1591,6 +1623,11 @@ def document_meta_unset(args):
 def collect_document_items(root):
     root = _require_data_root(root)
     document_metadata = load_document_metadata(root)
+    manual_text_keys = {
+        _manual_document_key(path.relative_to(root).as_posix())
+        for path in (root / "imports" / "manual" / "text").rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
     items = []
     for base in [
         root / "imports" / "chatgpt" / "conversations",
@@ -1611,6 +1648,11 @@ def collect_document_items(root):
             source_kind = document_source_kind(rel_path)
             if source_kind is None:
                 continue
+            if rel_path.startswith("imports/manual/raw/"):
+                if _manual_document_key(rel_path) in manual_text_keys:
+                    continue
+                if path.suffix.lower() not in TEXT_DOCUMENT_SUFFIXES:
+                    continue
             try:
                 raw = path.read_bytes()
                 text = raw.decode("utf-8")
@@ -1622,6 +1664,7 @@ def collect_document_items(root):
                 continue
             source_id = metadata.get("conversation_id") or metadata.get("archive_id")
             sha256 = hashlib.sha256(raw).hexdigest()
+            metadata_json = json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             item = {
                 "id": document_id_for_path(rel_path, source_kind, source_id, sha256),
                 "source_kind": source_kind,
@@ -1635,8 +1678,9 @@ def collect_document_items(root):
                 "updated": metadata.get("updated"),
                 "relative_path": rel_path,
                 "sha256": sha256,
+                "index_sha256": hashlib.sha256((sha256 + "\n" + metadata_json).encode("utf-8")).hexdigest(),
                 "mtime_ns": path.stat().st_mtime_ns,
-                "metadata_json": json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                "metadata_json": metadata_json,
             }
             items.append(item)
     return sorted(items, key=lambda value: value["relative_path"])
@@ -1755,7 +1799,7 @@ def plan_document_changes(conn, items):
         fts_count = state["fts_counts"].get(document_id, 0)
         if (
             state_row
-            and state_row["sha256"] == item["sha256"]
+            and state_row["sha256"] == item["index_sha256"]
             and document_row
             and document_row["relative_path"] == relative_path
             and path_row
@@ -1842,7 +1886,7 @@ def _upsert_document(conn, item, indexed_at):
             mtime_ns = excluded.mtime_ns,
             indexed_at = excluded.indexed_at
         """,
-        (item["relative_path"], item["sha256"], item["mtime_ns"], indexed_at),
+        (item["relative_path"], item["index_sha256"], item["mtime_ns"], indexed_at),
     )
 
 
@@ -2069,7 +2113,7 @@ def _index_fresh(conn, memory_items, document_items):
     memory_state = _database_index_state(conn)
     document_state = _database_document_state(conn)
     current_memory = {item["relative_path"]: item["sha256"] for item in memory_items}
-    current_documents = {item["relative_path"]: item["sha256"] for item in document_items}
+    current_documents = {item["relative_path"]: item["index_sha256"] for item in document_items}
     indexed_memory = {key: value["sha256"] for key, value in memory_state["index_state"].items()}
     indexed_documents = {key: value["sha256"] for key, value in document_state["index_state"].items()}
     return current_memory == indexed_memory and current_documents == indexed_documents
@@ -2186,6 +2230,15 @@ def search_store(args):
     return rows[: args.limit]
 
 
+def search_mode_summary(requested_mode):
+    warnings = []
+    effective_mode = requested_mode
+    if requested_mode in {"semantic", "hybrid"}:
+        warnings.append(f"{requested_mode} search unavailable; falling back to lexical")
+        effective_mode = "lexical"
+    return effective_mode, warnings
+
+
 def _state_sha_map(state):
     return {key: value["sha256"] for key, value in state["index_state"].items()}
 
@@ -2194,7 +2247,7 @@ def _freshness_details(conn, memory_items, document_items):
     memory_state = _database_index_state(conn)
     document_state = _database_document_state(conn)
     current_memory = {item["relative_path"]: item["sha256"] for item in memory_items}
-    current_documents = {item["relative_path"]: item["sha256"] for item in document_items}
+    current_documents = {item["relative_path"]: item["index_sha256"] for item in document_items}
     indexed_memory = _state_sha_map(memory_state)
     indexed_documents = _state_sha_map(document_state)
     return {
@@ -2549,11 +2602,7 @@ def _p95(values):
 
 def evaluate_search(args):
     cases = _load_eval_cases(args.cases)
-    warnings = []
-    mode = args.mode
-    if mode in {"semantic", "hybrid"}:
-        warnings.append(f"{mode} search unavailable; falling back to lexical")
-        mode = "lexical"
+    mode, warnings = search_mode_summary(args.mode)
     top1 = top5 = no_result = project_leaks = restricted_leaks = synonym_hits = synonym_total = 0
     latencies = []
     for case in cases:
@@ -2598,6 +2647,7 @@ def evaluate_search(args):
             restricted_leaks += 1
     denominator = len(cases) or 1
     return {
+        "requested_mode": args.mode,
         "mode": args.mode,
         "effective_mode": mode,
         "case_count": len(cases),
@@ -2826,12 +2876,28 @@ def main(argv=None):
             print(f"Database: {summary['database']}")
             return 0
         if args.command == "search":
-            if args.mode in {"semantic", "hybrid"}:
-                print(f"{args.mode} search unavailable; falling back to lexical", file=sys.stderr)
+            effective_mode, warnings = search_mode_summary(args.mode)
+            for warning in warnings:
+                print(warning, file=sys.stderr)
             rows = search_store(args)
             if args.json:
-                print(json.dumps(rows, ensure_ascii=False, indent=2))
+                print(
+                    json.dumps(
+                        {
+                            "requested_mode": args.mode,
+                            "effective_mode": effective_mode,
+                            "warnings": warnings,
+                            "results": rows,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
             else:
+                print(f"Requested mode: {args.mode}")
+                print(f"Effective mode: {effective_mode}")
+                for warning in warnings:
+                    print(f"Warning: {warning}")
                 for row in rows:
                     source = f" source={row['source_kind']}" if row.get("source_kind") else ""
                     project = f" project={row['project']}" if row.get("project") else ""
@@ -2878,8 +2944,10 @@ def main(argv=None):
             if args.json:
                 print(json.dumps(summary, ensure_ascii=False, indent=2))
             else:
-                print(f"Mode: {summary['mode']}")
+                print(f"Requested mode: {summary['requested_mode']}")
                 print(f"Effective mode: {summary['effective_mode']}")
+                for warning in summary["warnings"]:
+                    print(f"Warning: {warning}")
                 print(f"Cases: {summary['case_count']}")
                 print(f"Top-1: {summary['top1']:.3f}")
                 print(f"Top-5: {summary['top5']:.3f}")
