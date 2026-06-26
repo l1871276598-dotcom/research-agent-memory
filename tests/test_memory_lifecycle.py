@@ -314,6 +314,10 @@ class DistillationLifecycleTests(unittest.TestCase):
         self.assertEqual(self.run_cli(MEMORY_CLI, "init", "--root", str(root)).returncode, 0)
         self.assertEqual(self.run_cli(MEMORY_CLI, "db-init", "--root", str(root), "--state-dir", str(state_dir)).returncode, 0)
 
+    def db_rows(self, db, sql, params=()):
+        with sqlite3.connect(db) as conn:
+            return conn.execute(sql, params).fetchall()
+
     def add_recent_with_raw(self, root, days_old=30, protected="false"):
         raw = root / "imports" / "manual" / "raw" / "2026" / "05" / "abc-note.txt"
         raw.parent.mkdir(parents=True, exist_ok=True)
@@ -672,6 +676,69 @@ content: |-
 
             self.assertNotEqual(wrong_hash.returncode, 0)
             self.assertNotEqual(unknown_action.returncode, 0)
+            self.assertTrue(recent.exists())
+            self.assertFalse(list((root / "memory" / "principles").glob("*.md")))
+            self.assertTrue(raw.exists())
+
+    def test_apply_rejects_extra_top_level_result_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            self.init_store(root, state_dir)
+            recent, raw = self.add_recent_with_raw(root)
+            self.assertEqual(self.run_cli(MEMORY_CLI, "index", "--root", str(root), "--state-dir", str(state_dir)).returncode, 0)
+            prepare = self.run_cli(DISTILL_CLI, "prepare", "--root", str(root), "--state-dir", str(state_dir), "--today", date.today().isoformat(), "--json")
+            task = json.loads(prepare.stdout)["tasks"][0]
+            task_json = json.loads((Path(task["task_dir"]) / "task.json").read_text(encoding="utf-8"))
+            (Path(task["task_dir"]) / "distillation_result.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "distillation-result/v1",
+                        "source_id": "recent-manual-abc",
+                        "source_sha256": task_json["source_sha256"],
+                        "candidates": [],
+                        "unresolved_conflicts": [],
+                        "memories": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = self.run_cli(DISTILL_CLI, "apply", "--root", str(root), "--state-dir", str(state_dir), "--task-dir", task["task_dir"], "--json")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("top-level keys", result.stderr)
+            self.assertTrue(recent.exists())
+            self.assertTrue(raw.exists())
+            self.assertEqual(self.db_rows(state_dir / "memory.sqlite", "SELECT COUNT(*) FROM distillation_audit")[0][0], 0)
+
+    def test_apply_rejects_create_candidate_missing_contract_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            self.init_store(root, state_dir)
+            recent, raw = self.add_recent_with_raw(root)
+            self.assertEqual(self.run_cli(MEMORY_CLI, "index", "--root", str(root), "--state-dir", str(state_dir)).returncode, 0)
+            prepare = self.run_cli(DISTILL_CLI, "prepare", "--root", str(root), "--state-dir", str(state_dir), "--today", date.today().isoformat(), "--json")
+            task = json.loads(prepare.stdout)["tasks"][0]
+            task_json = json.loads((Path(task["task_dir"]) / "task.json").read_text(encoding="utf-8"))
+            (Path(task["task_dir"]) / "distillation_result.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "distillation-result/v1",
+                        "source_id": "recent-manual-abc",
+                        "source_sha256": task_json["source_sha256"],
+                        "candidates": [{"action": "create"}],
+                        "unresolved_conflicts": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = self.run_cli(DISTILL_CLI, "apply", "--root", str(root), "--state-dir", str(state_dir), "--task-dir", task["task_dir"], "--json")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("missing required field", result.stderr)
             self.assertTrue(recent.exists())
             self.assertFalse(list((root / "memory" / "principles").glob("*.md")))
             self.assertTrue(raw.exists())

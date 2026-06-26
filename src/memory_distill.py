@@ -12,6 +12,34 @@ import memory
 
 
 ACTION_CHOICES = {"create", "merge", "support", "supersede", "conflict", "discard"}
+RESULT_KEYS = {"schema", "source_id", "source_sha256", "candidates", "unresolved_conflicts"}
+CANDIDATE_FIELDS = {
+    "action",
+    "type",
+    "title",
+    "subject",
+    "predicate",
+    "object",
+    "content",
+    "evidence",
+    "relations",
+    "scope",
+    "workspace",
+    "confidentiality",
+    "confidence",
+    "project",
+    "target_id",
+    "old_status",
+    "tags",
+}
+ACTION_REQUIRED_FIELDS = {
+    "create": {"type", "title", "subject", "predicate", "object", "content", "evidence"},
+    "conflict": {"type", "title", "subject", "predicate", "object", "content", "evidence"},
+    "supersede": {"target_id", "type", "title", "subject", "predicate", "object", "content"},
+    "merge": {"target_id"},
+    "support": {"target_id"},
+    "discard": set(),
+}
 
 
 def _today(value=None):
@@ -211,6 +239,10 @@ def _load_task(task_dir):
 
 
 def _validate_result(task, result):
+    if not isinstance(result, dict):
+        raise ValueError("Distillation result must be a JSON object.")
+    if set(result) != RESULT_KEYS:
+        raise ValueError("Distillation result top-level keys are invalid.")
     if result.get("schema") != "distillation-result/v1":
         raise ValueError("Invalid distillation result schema.")
     if result.get("source_id") != task["source_id"]:
@@ -222,8 +254,22 @@ def _validate_result(task, result):
     if not isinstance(result.get("unresolved_conflicts", []), list):
         raise ValueError("Distillation unresolved_conflicts must be a list.")
     for candidate in result["candidates"]:
+        if not isinstance(candidate, dict):
+            raise ValueError("Distillation candidate must be an object.")
+        unknown = set(candidate) - CANDIDATE_FIELDS
+        if unknown:
+            raise ValueError("Distillation candidate has unknown field.")
         if candidate.get("action") not in ACTION_CHOICES:
             raise ValueError("Distillation candidate action is invalid.")
+        missing = ACTION_REQUIRED_FIELDS[candidate["action"]] - set(candidate)
+        if missing:
+            raise ValueError("Distillation candidate missing required field.")
+        for field in ["type", "title", "subject", "predicate", "object", "content", "evidence", "target_id"]:
+            if field in candidate and (not isinstance(candidate[field], str) or not candidate[field]):
+                raise ValueError("Distillation candidate field must be a non-empty string.")
+        for field in ["relations", "tags"]:
+            if field in candidate and not isinstance(candidate[field], list):
+                raise ValueError(f"Distillation candidate {field} must be a list.")
         for relation in candidate.get("relations", []):
             name, target = memory._relation_parts(relation)
             if name not in memory.RELATION_CHOICES or not target:
