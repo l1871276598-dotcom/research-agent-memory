@@ -54,6 +54,37 @@ class MemoryToolsTests(unittest.TestCase):
         MEMORY.index_store(argparse.Namespace(root=str(root), state_dir=str(state), dry_run=False))
         return state / "memory.sqlite"
 
+    def add_memory(self, root, title, workspace="personal", confidentiality="personal", relations=None):
+        memory_id, _path, _type, _status = MEMORY.add_memory(
+            argparse.Namespace(
+                root=str(root),
+                type="principle",
+                title=title,
+                status="active",
+                scope="global",
+                workspace=workspace,
+                confidentiality=confidentiality,
+                source="user",
+                confidence="confirmed",
+                content=f"{title} content",
+                tags=[],
+                context_id=None,
+                project=None,
+                valid_from=None,
+                valid_until=None,
+                from_context=None,
+                to_context=None,
+                effective_date=None,
+                reason=None,
+            )
+        )
+        if relations:
+            path = next((root / "memory" / "principles").glob(f"{memory_id}-*.md"))
+            text = path.read_text(encoding="utf-8")
+            relation_text = "\n".join(f'  - "{value}"' for value in relations)
+            path.write_text(text.replace("tags: []", f"relations:\n{relation_text}\ntags: []"), encoding="utf-8")
+        return memory_id
+
     def test_chinese_partial_query_uses_bigrams(self):
         self.assertEqual(TOOLS._fts_query("代码最少"), '"代码" AND "码最" AND "最少"')
 
@@ -73,6 +104,39 @@ class MemoryToolsTests(unittest.TestCase):
             row = json.loads(output.getvalue())[0]
             self.assertEqual(row["title"], "代码最少原则")
             self.assertTrue(row["id"].startswith("principle-"))
+
+    def test_recall_does_not_return_links_to_restricted_memories_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = self.make_root(base)
+            state = base / "state"
+            restricted_id = self.add_memory(root, "受限原则", workspace="work", confidentiality="restricted")
+            allowed_id = self.add_memory(root, "公开原则", relations=[f"related_to:{restricted_id}"])
+            MEMORY.db_init(argparse.Namespace(root=str(root), state_dir=str(state)))
+            MEMORY.index_store(argparse.Namespace(root=str(root), state_dir=str(state), dry_run=False))
+
+            summary = TOOLS.recall(argparse.Namespace(root=str(root), state_dir=str(state), query="公开原则", workspace="personal"))
+
+            self.assertEqual([row["id"] for row in summary["primary"]], [allowed_id])
+            self.assertEqual(summary["related"], [])
+
+    def test_relation_queries_do_not_return_restricted_sources_or_targets_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = self.make_root(base)
+            state = base / "state"
+            restricted_id = self.add_memory(root, "受限原则", workspace="work", confidentiality="restricted")
+            allowed_id = self.add_memory(root, "公开原则", relations=[f"related_to:{restricted_id}"])
+            MEMORY.db_init(argparse.Namespace(root=str(root), state_dir=str(state)))
+            MEMORY.index_store(argparse.Namespace(root=str(root), state_dir=str(state), dry_run=False))
+
+            outgoing = TOOLS.link_query(argparse.Namespace(root=str(root), state_dir=str(state), target_id=allowed_id, workspace="personal"), "outgoing")
+            backlinks = TOOLS.link_query(argparse.Namespace(root=str(root), state_dir=str(state), target_id=restricted_id, workspace="personal"), "backlinks")
+            related = TOOLS.link_query(argparse.Namespace(root=str(root), state_dir=str(state), target_id="", workspace="personal"), "related")
+
+            self.assertEqual(outgoing["links"], [])
+            self.assertEqual(backlinks["links"], [])
+            self.assertEqual(related["links"], [])
 
     def sample_export(self, path, title="测试 对话"):
         conversations = [

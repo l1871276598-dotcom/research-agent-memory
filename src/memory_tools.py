@@ -290,6 +290,18 @@ def _db(root, state_dir):
     return db
 
 
+def _access_filter(args, table="memories"):
+    workspace = getattr(args, "workspace", None) or "personal"
+    access_args = argparse.Namespace(workspace=workspace, include_restricted=False)
+    confidentialities = memory._allowed_confidentiality(access_args)
+    where = [
+        f"{table}.workspace = ?",
+        f"{table}.status = 'active'",
+        f"{table}.confidentiality IN (" + ", ".join("?" for _ in confidentialities) + ")",
+    ]
+    return " AND ".join(where), [workspace, *confidentialities]
+
+
 def _json_list(value):
     try:
         data = json.loads(value or "[]")
@@ -310,15 +322,14 @@ def recall(args):
     db = _db(root, args.state_dir)
     query = args.query
     with sqlite3.connect(db) as conn:
+        access_sql, access_params = _access_filter(args)
         rows = conn.execute(
-            """
+            f"""
             SELECT id, title, type, tier, status, workspace, confidentiality, relative_path, aliases
             FROM memories
-            WHERE workspace = ?
-              AND confidentiality IN ('public', 'personal')
-              AND status = 'active'
+            WHERE {access_sql}
             """,
-            (args.workspace,),
+            access_params,
         ).fetchall()
         memories = [_memory_row(row) for row in rows]
         exact = [
@@ -330,28 +341,59 @@ def recall(args):
         related = []
         if primary_ids:
             marks = ", ".join("?" for _ in primary_ids)
+            link_access_sql, link_access_params = _link_access_filter(args)
             related = [
                 dict(zip(["source_id", "target_id", "target_ref", "relation", "resolved"], row))
                 for row in conn.execute(
-                    f"SELECT source_id, target_id, target_ref, relation, resolved FROM links WHERE source_id IN ({marks}) OR target_id IN ({marks})",
-                    tuple(primary_ids) + tuple(primary_ids),
+                    f"""
+                    SELECT links.source_id, links.target_id, links.target_ref, links.relation, links.resolved
+                    FROM links
+                    WHERE ({link_access_sql})
+                      AND (links.source_id IN ({marks}) OR links.target_id IN ({marks}))
+                    """,
+                    tuple(link_access_params) + tuple(primary_ids) + tuple(primary_ids),
                 )
             ]
         recent = [row for row in memories if row["tier"] == "recent" and query in (row["title"] + " " + " ".join(row["aliases"]))]
     return {"primary": exact, "related": related, "recent_evidence": recent, "unresolved": []}
 
 
+def _link_access_filter(args):
+    source_sql, source_params = _access_filter(args, "source")
+    target_sql, target_params = _access_filter(args, "target")
+    return (
+        "links.source_id IN (SELECT source.id FROM memories source WHERE "
+        + source_sql
+        + ") AND (links.target_id IS NULL OR links.target_id IN (SELECT target.id FROM memories target WHERE "
+        + target_sql
+        + "))"
+    ), source_params + target_params
+
+
 def link_query(args, mode):
     db = _db(args.root, args.state_dir)
     with sqlite3.connect(db) as conn:
+        access_sql, access_params = _link_access_filter(args)
         if mode == "outgoing":
-            rows = conn.execute("SELECT " + ", ".join(memory.LINK_COLUMNS) + " FROM links WHERE source_id = ? ORDER BY target_ref", (args.target_id,)).fetchall()
+            rows = conn.execute(
+                "SELECT " + ", ".join(memory.LINK_COLUMNS) + f" FROM links WHERE {access_sql} AND source_id = ? ORDER BY target_ref",
+                tuple(access_params) + (args.target_id,),
+            ).fetchall()
         elif mode == "backlinks":
-            rows = conn.execute("SELECT " + ", ".join(memory.LINK_COLUMNS) + " FROM links WHERE target_id = ? OR target_ref = ? ORDER BY source_id", (args.target_id, args.target_id)).fetchall()
+            rows = conn.execute(
+                "SELECT " + ", ".join(memory.LINK_COLUMNS) + f" FROM links WHERE {access_sql} AND (target_id = ? OR target_ref = ?) ORDER BY source_id",
+                tuple(access_params) + (args.target_id, args.target_id),
+            ).fetchall()
         elif mode == "unresolved":
-            rows = conn.execute("SELECT " + ", ".join(memory.LINK_COLUMNS) + " FROM links WHERE resolved = 0 ORDER BY source_id, target_ref").fetchall()
+            rows = conn.execute(
+                "SELECT " + ", ".join(memory.LINK_COLUMNS) + f" FROM links WHERE {access_sql} AND resolved = 0 ORDER BY source_id, target_ref",
+                access_params,
+            ).fetchall()
         else:
-            rows = conn.execute("SELECT " + ", ".join(memory.LINK_COLUMNS) + " FROM links ORDER BY source_id, target_ref").fetchall()
+            rows = conn.execute(
+                "SELECT " + ", ".join(memory.LINK_COLUMNS) + f" FROM links WHERE {access_sql} ORDER BY source_id, target_ref",
+                access_params,
+            ).fetchall()
     links = [dict(zip(memory.LINK_COLUMNS, row)) for row in rows]
     key = "unresolved" if mode == "unresolved" else "links"
     return {key: links, "count": len(links)}
@@ -435,17 +477,20 @@ def build_parser():
         item.add_argument("target_id")
         item.add_argument("--root", required=True)
         item.add_argument("--state-dir", required=True)
+        item.add_argument("--workspace", default="personal", choices=memory.WORKSPACE_CHOICES)
         item.add_argument("--depth", type=int, default=1)
         item.add_argument("--json", action="store_true", dest="json_output")
 
     unresolved = sub.add_parser("unresolved")
     unresolved.add_argument("--root", required=True)
     unresolved.add_argument("--state-dir", required=True)
+    unresolved.add_argument("--workspace", default="personal", choices=memory.WORKSPACE_CHOICES)
     unresolved.add_argument("--json", action="store_true", dest="json_output")
 
     check = sub.add_parser("check-links")
     check.add_argument("--root", required=True)
     check.add_argument("--state-dir", required=True)
+    check.add_argument("--workspace", default="personal", choices=memory.WORKSPACE_CHOICES)
     check.add_argument("--json", action="store_true", dest="json_output")
 
     launchd = sub.add_parser("launchd-plist")
