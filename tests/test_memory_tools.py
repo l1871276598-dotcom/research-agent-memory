@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import importlib.util
 import json
 import sys
@@ -54,6 +55,38 @@ class MemoryToolsTests(unittest.TestCase):
         MEMORY.index_store(argparse.Namespace(root=str(root), state_dir=str(state), dry_run=False))
         return state / "memory.sqlite"
 
+    def add_memory(self, root, title, workspace="personal", confidentiality="personal", content=None):
+        memory_id, _path, _type, _status = MEMORY.add_memory(
+            argparse.Namespace(
+                root=str(root),
+                type="principle",
+                title=title,
+                status="active",
+                scope="global",
+                workspace=workspace,
+                confidentiality=confidentiality,
+                source="user",
+                confidence="confirmed",
+                content=content or f"{title} content",
+                tags=[],
+                context_id=None,
+                project=None,
+                valid_from=None,
+                valid_until=None,
+                from_context=None,
+                to_context=None,
+                effective_date=None,
+                reason=None,
+            )
+        )
+        return memory_id
+
+    def file_hashes(self, root):
+        return {
+            path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted((root / "memory").rglob("*.md"))
+        }
+
     def test_chinese_partial_query_uses_bigrams(self):
         self.assertEqual(TOOLS._fts_query("代码最少"), '"代码" AND "码最" AND "最少"')
 
@@ -73,6 +106,52 @@ class MemoryToolsTests(unittest.TestCase):
             row = json.loads(output.getvalue())[0]
             self.assertEqual(row["title"], "代码最少原则")
             self.assertTrue(row["id"].startswith("principle-"))
+
+    def test_context_returns_bounded_read_only_access_filtered_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = self.make_root(base)
+            state = base / "state"
+            allowed_id = self.add_memory(
+                root,
+                "内部 Alpha 原则",
+                workspace="work",
+                confidentiality="internal",
+                content="alpha " * 80,
+            )
+            self.add_memory(
+                root,
+                "受限 Alpha 原则",
+                workspace="work",
+                confidentiality="restricted",
+                content="alpha restricted",
+            )
+            MEMORY.db_init(argparse.Namespace(root=str(root), state_dir=str(state)))
+            MEMORY.index_store(argparse.Namespace(root=str(root), state_dir=str(state), dry_run=False))
+            before_files = self.file_hashes(root)
+            db = state / "memory.sqlite"
+            before_db = hashlib.sha256(db.read_bytes()).hexdigest()
+
+            summary = TOOLS.context(
+                argparse.Namespace(
+                    root=str(root),
+                    state_dir=str(state),
+                    query="alpha",
+                    workspace="work",
+                    type=None,
+                    project=None,
+                    context_id=None,
+                    limit=10,
+                    max_chars=120,
+                )
+            )
+
+            self.assertEqual([row["id"] for row in summary["results"]], [allowed_id])
+            self.assertLessEqual(len(summary["context"]), 120)
+            self.assertIn("内部 Alpha 原则", summary["context"])
+            self.assertNotIn("受限 Alpha 原则", summary["context"])
+            self.assertEqual(self.file_hashes(root), before_files)
+            self.assertEqual(hashlib.sha256(db.read_bytes()).hexdigest(), before_db)
 
     def sample_export(self, path, title="测试 对话"):
         conversations = [

@@ -55,6 +55,52 @@ def search(args):
     return summary["count"]
 
 
+def _context_text(results, max_chars):
+    if max_chars < 1:
+        raise ValueError("--max-chars must be positive.")
+    blocks = []
+    for row in results:
+        blocks.append(
+            "\n".join(
+                [
+                    f"- {row['title']}",
+                    f"  id: {row['id']}",
+                    f"  type: {row['type']}",
+                    f"  path: {row['relative_path']}",
+                    f"  excerpt: {row['excerpt']}",
+                ]
+            )
+        )
+    text = "\n".join(blocks)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip()
+
+
+def context(args):
+    compat = argparse.Namespace(
+        query=args.query,
+        root=args.root,
+        state_dir=args.state_dir,
+        workspace=args.workspace or "personal",
+        type=args.type,
+        project=args.project,
+        context_id=getattr(args, "context_id", None),
+        status=None,
+        include_historical=False,
+        include_restricted=False,
+        limit=args.limit,
+    )
+    summary = memory.search_store(compat)
+    return {
+        "query": summary["query"],
+        "workspace": summary["workspace"],
+        "count": summary["count"],
+        "context": _context_text(summary["results"], args.max_chars),
+        "results": summary["results"],
+    }
+
+
 def _load_conversations(zip_path):
     return chatgpt_export_sync._load_conversations(zip_path)
 
@@ -408,6 +454,18 @@ def build_parser():
     search_parser.add_argument("--limit", type=int, default=20)
     search_parser.add_argument("--json", action="store_true")
 
+    ctx = sub.add_parser("context", help="Build bounded Codex recall context from indexed memory.")
+    ctx.add_argument("query")
+    ctx.add_argument("--root", required=True)
+    ctx.add_argument("--state-dir", required=True)
+    ctx.add_argument("--workspace", default="personal", choices=memory.WORKSPACE_CHOICES)
+    ctx.add_argument("--type", choices=memory.TYPE_CHOICES)
+    ctx.add_argument("--project")
+    ctx.add_argument("--context-id", dest="context_id")
+    ctx.add_argument("--limit", type=int, default=5)
+    ctx.add_argument("--max-chars", type=int, default=4000)
+    ctx.add_argument("--json", action="store_true", dest="json_output")
+
     import_parser = sub.add_parser("import-chatgpt", help="Import an official ChatGPT export ZIP.")
     import_parser.add_argument("--zip", required=True)
     import_parser.add_argument("--root", required=True)
@@ -471,6 +529,8 @@ def main(argv=None):
             return 0
         if args.command == "import-manual":
             summary = import_manual(args)
+        elif args.command == "context":
+            summary = context(args)
         elif args.command == "recall":
             summary = recall(args)
         elif args.command in {"backlinks", "outgoing", "related", "unresolved", "check-links"}:
@@ -482,6 +542,8 @@ def main(argv=None):
             return 2
         if getattr(args, "json_output", False):
             print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+        elif args.command == "context":
+            print(summary["context"])
         elif args.command == "launchd-plist":
             print(summary["plist"], end="")
         else:
