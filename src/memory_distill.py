@@ -12,6 +12,10 @@ import memory
 
 
 ACTION_CHOICES = {"create", "merge", "support", "supersede", "conflict", "discard"}
+DEFAULT_MAX_EXISTING = 50
+DEFAULT_MAX_CONTENT_CHARS = 2000
+DEFAULT_MAX_SOURCE_CHARS = 20000
+TRUNCATED_MARKER = "\n[truncated]"
 
 
 def _today(value=None):
@@ -51,18 +55,44 @@ def _audit_by_recent(conn):
     }
 
 
+def _positive_limit(args, name, default):
+    value = getattr(args, name, default)
+    if value is None:
+        value = default
+    if value < 1:
+        raise ValueError(f"--{name.replace('_', '-')} must be positive.")
+    return value
+
+
+def _clip_text(text, limit):
+    text = "" if text is None else str(text)
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + TRUNCATED_MARKER
+
+
+def _bounded_record(record, max_content_chars):
+    bounded = dict(record)
+    if "content" in bounded:
+        bounded["content"] = _clip_text(bounded["content"], max_content_chars)
+    return bounded
+
+
 def prepare(args):
     root, state, db = _state(args.root, Path(args.state_dir))
     today = _today(args.today)
+    max_existing = _positive_limit(args, "max_existing", DEFAULT_MAX_EXISTING)
+    max_content_chars = _positive_limit(args, "max_content_chars", DEFAULT_MAX_CONTENT_CHARS)
+    max_source_chars = _positive_limit(args, "max_source_chars", DEFAULT_MAX_SOURCE_CHARS)
     tasks_dir = state / "distillation" / "tasks"
     tasks = []
     with _db_connect(db) as conn:
         audit = _audit_by_recent(conn)
     existing = [
-        {"relative_path": item["relative_path"], "record": item["record"]}
+        {"relative_path": item["relative_path"], "record": _bounded_record(item["record"], max_content_chars)}
         for item in memory.collect_validated_records(root)[1]
         if item["record"].get("schema") != "recent/v1"
-    ]
+    ][:max_existing]
     for item in _recent_items(root):
         record = item["record"]
         retention = memory._real_date(record.get("retention_until"))
@@ -78,7 +108,7 @@ def prepare(args):
         task_dir = tasks_dir / task_id
         if not args.dry_run:
             task_dir.mkdir(parents=True, exist_ok=True)
-            (task_dir / "source.md").write_text(item["path"].read_text(encoding="utf-8"), encoding="utf-8")
+            (task_dir / "source.md").write_text(_clip_text(item["path"].read_text(encoding="utf-8"), max_source_chars), encoding="utf-8")
             (task_dir / "existing_memories.json").write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
             (task_dir / "result_schema.json").write_text(json.dumps({"schema": "distillation-result/v1"}, indent=2), encoding="utf-8")
             (task_dir / "instructions.md").write_text(
@@ -503,6 +533,9 @@ def build_parser():
         item.add_argument("--json", action="store_true", dest="json_output")
         if name == "prepare":
             item.add_argument("--dry-run", action="store_true")
+            item.add_argument("--max-existing", type=int, default=DEFAULT_MAX_EXISTING)
+            item.add_argument("--max-content-chars", type=int, default=DEFAULT_MAX_CONTENT_CHARS)
+            item.add_argument("--max-source-chars", type=int, default=DEFAULT_MAX_SOURCE_CHARS)
         if name == "purge":
             item.add_argument("--dry-run", action="store_true")
         if name == "apply":

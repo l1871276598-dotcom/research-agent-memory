@@ -689,6 +689,64 @@ content: |-
             self.assertEqual(prepare.returncode, 0, prepare.stdout + prepare.stderr)
             self.assertEqual(json.loads(prepare.stdout)["count"], 0)
 
+    def test_prepare_bounds_codex_context_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            self.init_store(root, state_dir)
+            for index in range(5):
+                result = self.run_cli(
+                    MEMORY_CLI,
+                    "add",
+                    "--root",
+                    str(root),
+                    "--type",
+                    "principle",
+                    "--title",
+                    f"长期记忆 {index}",
+                    "--scope",
+                    "global",
+                    "--workspace",
+                    "personal",
+                    "--confidentiality",
+                    "personal",
+                    "--source",
+                    "user",
+                    "--confidence",
+                    "confirmed",
+                    "--content",
+                    "x" * 80,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            recent, _raw = self.add_recent_with_raw(root)
+            recent.write_text(recent.read_text(encoding="utf-8").replace("这是一条可蒸馏事实。", "y" * 120), encoding="utf-8")
+            self.assertEqual(self.run_cli(MEMORY_CLI, "index", "--root", str(root), "--state-dir", str(state_dir)).returncode, 0)
+            module = load_distill_module()
+
+            summary = module.prepare(
+                type(
+                    "Args",
+                    (),
+                    {
+                        "root": str(root),
+                        "state_dir": str(state_dir),
+                        "today": date.today().isoformat(),
+                        "dry_run": False,
+                        "max_existing": 3,
+                        "max_content_chars": 20,
+                        "max_source_chars": 40,
+                    },
+                )()
+            )
+            task_dir = Path(summary["tasks"][0]["task_dir"])
+            existing = json.loads((task_dir / "existing_memories.json").read_text(encoding="utf-8"))
+            source_text = (task_dir / "source.md").read_text(encoding="utf-8")
+
+            self.assertEqual(len(existing), 3)
+            self.assertTrue(all(row["record"]["content"].endswith("[truncated]") for row in existing))
+            self.assertTrue(all(len(row["record"]["content"]) <= 35 for row in existing))
+            self.assertLessEqual(len(source_text), 55)
+
     def test_apply_support_and_supersede_update_existing_memory(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "data"
