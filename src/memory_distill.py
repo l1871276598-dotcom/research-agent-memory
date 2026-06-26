@@ -360,6 +360,9 @@ def apply(args):
                 has_conflict = True
             path, record = _candidate_record(root, recent_item["record"], candidate)
             created.append((path, record))
+        status = "conflict" if has_conflict else "pending_delete"
+        today = _today(args.today)
+        delete_after = None if has_conflict else (today + timedelta(days=memory.DELETION_GRACE_DAYS)).isoformat()
         try:
             for path, record, _old_text in updated:
                 memory.atomic_write_text(path, memory.render_existing_memory(path, record))
@@ -369,6 +372,33 @@ def apply(args):
             if errors:
                 raise ValueError("Distillation apply produced invalid memory.")
             memory.index_store(type("Args", (), {"root": str(root), "state_dir": str(state), "dry_run": False})())
+            with _db_connect(db) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO distillation_audit(recent_id, relative_path, source_sha256, status, result_json, distilled_at, delete_after, error)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(recent_id) DO UPDATE SET
+                      relative_path = excluded.relative_path,
+                      source_sha256 = excluded.source_sha256,
+                      status = excluded.status,
+                      result_json = excluded.result_json,
+                      distilled_at = excluded.distilled_at,
+                      delete_after = excluded.delete_after,
+                      deleted_at = NULL,
+                      error = excluded.error
+                    """,
+                    (
+                        task["source_id"],
+                        recent_item["relative_path"],
+                        task["source_sha256"],
+                        status,
+                        json.dumps(result, ensure_ascii=False, sort_keys=True),
+                        today.isoformat(),
+                        delete_after,
+                        None,
+                    ),
+                )
+                conn.commit()
         except Exception:
             for path, _ in created:
                 path.unlink(missing_ok=True)
@@ -379,36 +409,6 @@ def apply(args):
             except Exception:
                 pass
             raise
-        status = "conflict" if has_conflict else "pending_delete"
-        today = _today(args.today)
-        delete_after = None if has_conflict else (today + timedelta(days=memory.DELETION_GRACE_DAYS)).isoformat()
-        with _db_connect(db) as conn:
-            conn.execute(
-                """
-                INSERT INTO distillation_audit(recent_id, relative_path, source_sha256, status, result_json, distilled_at, delete_after, error)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(recent_id) DO UPDATE SET
-                  relative_path = excluded.relative_path,
-                  source_sha256 = excluded.source_sha256,
-                  status = excluded.status,
-                  result_json = excluded.result_json,
-                  distilled_at = excluded.distilled_at,
-                  delete_after = excluded.delete_after,
-                  deleted_at = NULL,
-                  error = excluded.error
-                """,
-                (
-                    task["source_id"],
-                    recent_item["relative_path"],
-                    task["source_sha256"],
-                    status,
-                    json.dumps(result, ensure_ascii=False, sort_keys=True),
-                    today.isoformat(),
-                    delete_after,
-                    None,
-                ),
-            )
-            conn.commit()
         return {"applied": len(created), "status": status, "delete_after": delete_after}
 
 

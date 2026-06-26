@@ -10,6 +10,7 @@ import unittest
 import zipfile
 from datetime import date, timedelta
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -760,6 +761,81 @@ content: |-
             self.assertIn("supports:recent-manual-abc", old_text)
             self.assertIn("superseded_by:", old_text)
             self.assertIn("supersedes:" + target_id, new_text)
+
+    def test_apply_rolls_back_files_when_audit_write_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state_dir = Path(tmp) / "state"
+            self.init_store(root, state_dir)
+            recent, raw = self.add_recent_with_raw(root)
+            self.assertEqual(self.run_cli(MEMORY_CLI, "index", "--root", str(root), "--state-dir", str(state_dir)).returncode, 0)
+            prepare = self.run_cli(DISTILL_CLI, "prepare", "--root", str(root), "--state-dir", str(state_dir), "--today", date.today().isoformat(), "--json")
+            task = json.loads(prepare.stdout)["tasks"][0]
+            task_json = json.loads((Path(task["task_dir"]) / "task.json").read_text(encoding="utf-8"))
+            (Path(task["task_dir"]) / "distillation_result.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "distillation-result/v1",
+                        "source_id": "recent-manual-abc",
+                        "source_sha256": task_json["source_sha256"],
+                        "candidates": [
+                            {
+                                "action": "create",
+                                "type": "principle",
+                                "title": "蒸馏事实",
+                                "subject": "agent",
+                                "predicate": "remembers",
+                                "object": "facts",
+                                "content": "这是一条可蒸馏事实。",
+                                "evidence": "这是一条可蒸馏事实",
+                            }
+                        ],
+                        "unresolved_conflicts": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            module = load_distill_module()
+
+            class FailingAuditConnection:
+                def __init__(self, db):
+                    self.conn = sqlite3.connect(db)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    self.conn.close()
+
+                def execute(self, sql, params=()):
+                    if "INSERT INTO distillation_audit" in sql:
+                        raise sqlite3.DatabaseError("forced audit failure")
+                    return self.conn.execute(sql, params)
+
+                def commit(self):
+                    self.conn.commit()
+
+            with mock.patch.object(module, "_db_connect", side_effect=lambda db: FailingAuditConnection(db)):
+                with self.assertRaisesRegex(sqlite3.DatabaseError, "forced audit failure"):
+                    module.apply(
+                        type(
+                            "Args",
+                            (),
+                            {
+                                "root": str(root),
+                                "state_dir": str(state_dir),
+                                "task_dir": task["task_dir"],
+                                "today": date.today().isoformat(),
+                            },
+                        )()
+                    )
+
+            self.assertTrue(recent.exists())
+            self.assertTrue(raw.exists())
+            self.assertFalse(list((root / "memory" / "principles").glob("*.md")))
+            with sqlite3.connect(state_dir / "memory.sqlite") as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM distillation_audit").fetchone()[0], 0)
 
 
 if __name__ == "__main__":
