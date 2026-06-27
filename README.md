@@ -6,7 +6,7 @@
 
 ## 当前版本状态
 
-- 当前软件版本：v0.6.0
+- 当前软件版本：v0.7.0
 - SQLite schema：v3
 - 默认检索模式：lexical
 - 主要支持平台：macOS
@@ -33,7 +33,7 @@
 - ChatGPT 官方 ZIP 本地手动导入
 - 手动文件 raw 归档和稳定 text sidecar
 - 文档元数据覆盖
-- 候选记忆审核：`apply` → `review` → `accept` / `reject`
+- Trusted Memory Loop：确定性 `ADD` / `UPDATE` / `DEPRECATE` / `NOOP` / `REVIEW_REQUIRED`，写前校验、人工闸门、自动重索引、写后验证和 durable resume journal
 - Agent Context Pack JSON/Markdown 输出
 - lexical 检索评测框架
 - `semantic` / `hybrid` 模式接口的显式 lexical 回退
@@ -51,7 +51,9 @@
 - 真实语义相似度检索
 - 真实 lexical + semantic 混合排序
 - MCP 接口
-- 总控 Agent
+- owner/agent 身份认证与多 Agent 授权
+- 自动语义冲突合并
+- 向量数据库、GUI 和大型 coordinator / 总控 Agent
 
 候选审核生命周期已经实现；自动候选生成调度尚未实现。
 
@@ -174,7 +176,9 @@ python3 src/memory.py add \
   --content "PDC project memory registry."
 ```
 
-项目作用域的 `decision`、`procedure` 或其他记忆必须引用已有 active `type: project` 记录。
+项目作用域的 `decision`、`procedure` 或其他记忆必须引用已经 review/accept 的 active `type: project` 记录。
+
+所有创建类命令和函数只生成 `candidate`；`active` 只能由统一的 `memory_distill.py review/accept` 路径产生。兼容参数 `--confirmed` 仅记录 `confirmation: explicit` metadata，不会直接激活记录，也不会改写调用者提供的 `source`。当前版本不验证 review/accept 操作者的真实身份；owner/agent 身份认证仍未实现。
 
 ## 统一索引
 
@@ -202,6 +206,8 @@ python3 src/memory.py db-rebuild \
 Markdown 记忆、raw 原始证据和 text 稳定文本副本是权威数据。SQLite 是派生索引；`db-rebuild` 从权威文件重建临时数据库，验证通过后原子替换，失败时旧数据库保留。
 
 ## 搜索
+
+默认搜索只返回 `active`、非 `restricted` 且符合项目边界的结果。未传 `--project` 时只返回 project 为空的记录；传入项目时只返回该项目和 project 为空的共享记录。只有显式 `--include-restricted` 或 `--include-inactive` 才放宽对应限制。`memory_tools.py search` 委托给 `memory.py search_store()`，没有独立 tokenizer 或过滤规则。
 
 ```bash
 python3 src/memory.py search "论文证据链" \
@@ -274,7 +280,7 @@ imports/chatgpt/import_manifest.json
 exports/import_reports/*-chatgpt-*.json
 ```
 
-导入会检查 ZIP 是否存在、是否为符号链接、ZIP CRC、唯一 `conversations.json`、JSON 根节点是否为 list、conversation 基本结构，并报告 `conversation_count`、`message_count`、`new`、`updated`、`unchanged`、`raw_only` 和 `failed`。报告不包含完整聊天正文。重复导入旧 ZIP 不会重建 recent，也不会把旧内容晋升为长期记忆。
+导入会检查 ZIP 是否存在、是否为符号链接、ZIP CRC、唯一 `conversations.json`、JSON 根节点是否为 list、conversation 基本结构，并报告 `conversation_count`、`message_count`、`new`、`updated`、`unchanged`、`raw_only` 和 `failed`。报告不包含完整聊天正文。raw 使用独占创建；同路径同内容为 NOOP，同路径不同内容生成新的 hash 版本路径，既有文件不会被覆盖。重复导入旧 ZIP 不会重建 recent，也不会把旧内容晋升为长期记忆。
 
 ## 手动文件导入
 
@@ -301,7 +307,7 @@ imports/manual/text/YYYY/MM/*.md
 exports/import_reports/*-manual-*.json
 ```
 
-text sidecar front matter 包含 `source_path`、`source_sha256`、`original_name`、`media_type`、`extractor` 和 `imported_at`，可追溯到 raw 原始证据。重复导入同一文件会报告 duplicate。导入不会自动运行 `index`。
+text sidecar front matter 包含 `source_path`、`source_sha256`、`original_name`、`media_type`、`extractor` 和 `imported_at`，可追溯到 raw 原始证据。manual raw 同样使用独占创建和 hash 版本路径，永不覆盖既有 raw；重复导入同一文件会报告 duplicate。导入不会自动运行 `index`。
 
 PDF/DOCX 或无法 UTF-8 解码的文件只写 raw 和导入报告，报告 `archived_without_text: 1`，不写 text sidecar，不进入全文索引。
 
@@ -370,15 +376,15 @@ python3 src/memory_distill.py reject \
 - `create`：候选通过后变为 `status: active`、`audit_status: accepted`
 - `merge`：目标必须存在；只合并 `source_refs`、`tags`、`relations`；候选归档为 `audit_status: accepted`
 - `support`：不改目标核心 `content`；只增加来源和证据；候选归档为 `audit_status: accepted`
-- `supersede`：新记录 active；旧记录 historical；维护双向 supersession 关系
+- `supersede`：accept 后新记录 active；旧记录 deprecated；维护双向 supersession 关系
 - `conflict`：不覆盖正式记忆；候选变为 `status: conflict`、`audit_status: conflict`
 - `reject`：候选归档为 `status: archived`、`audit_status: rejected`，保存 `review_reason`
 
-如果候选记录带有 `source_path` 和 `source_sha256`，accept 前会重新校验 source hash，防止证据变化后继续审核。
+如果候选记录带有 `source_path` 和 `source_sha256`，accept 前会重新校验 source hash。UPDATE/DEPRECATE proposal 同时保存目标 ID、预期状态和预期文件 SHA256；accept 会基于当前 store 重新校验并运行完整 hypothetical validation，变化时返回结构化 `stale_target`，不会修改文件或索引。
 
 ## 记忆生命周期
 
-当前 v0.6.0 支持的真实生命周期：
+当前 v0.7.0 支持的真实生命周期：
 
 ```text
 ChatGPT ZIP / manual import
@@ -510,7 +516,7 @@ python3 src/memory.py context-transition \
   --dry-run
 ```
 
-旧 context 不会被删除，而是转为 `historical`，并通过 `supersedes` / `superseded_by` 建立关系。
+`context-transition` 只创建一条 transition candidate，不直接修改旧 context 或创建 active 新 context。accept 重新验证旧记录状态和 hash 后，在同一文件事务中将旧记录转为 `deprecated`、创建 active 新记录、归档 accepted transition，并维护 `supersedes` / `superseded_by`；随后才 reindex 和 verify。
 
 ## 保密规则
 
@@ -569,9 +575,9 @@ git diff --check
 
 尚未推送分支或运行远程 workflow 时，不应声称远程 CI 已通过。
 
-## 不属于 v0.6.0
+## 不属于 v0.7.0
 
-iCloud 多端同步、设备注册、设备状态、移动端写入、自动索引刷新、实时同步、自动 ZIP 下载、ChatGPT 自动登录、Web 服务、GUI、桌面 App、云数据库、独立向量数据库和常驻后台监听服务不属于 v0.6.0，本次未实现。
+iCloud 多端同步、设备注册、设备状态、移动端写入、自动索引刷新、实时同步、自动 ZIP 下载、ChatGPT 自动登录、Web 服务、GUI、桌面 App、云数据库、独立向量数据库和常驻后台监听服务不属于 v0.7.0，本次未实现。
 
 ## 许可证
 

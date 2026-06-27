@@ -170,6 +170,11 @@
     },
     "candidate_action": {
       "enum": [
+        "ADD",
+        "UPDATE",
+        "DEPRECATE",
+        "NOOP",
+        "REVIEW_REQUIRED",
         "create",
         "merge",
         "support",
@@ -177,6 +182,10 @@
         "conflict",
         "discard"
       ]
+    },
+    "requested_action": {
+      "type": "string",
+      "minLength": 1
     },
     "target_id": {
       "type": "string",
@@ -193,6 +202,33 @@
     "source_sha256": {
       "type": "string",
       "pattern": "^[a-fA-F0-9]{64}$"
+    },
+    "confirmation": {
+      "enum": [
+        "explicit"
+      ]
+    },
+    "expected_target_status": {
+      "enum": [
+        "active",
+        "historical",
+        "deprecated",
+        "candidate",
+        "conflict",
+        "archived"
+      ]
+    },
+    "expected_target_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "proposal_input_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "new_record_json": {
+      "type": "string",
+      "minLength": 2
     },
     "reviewed_at": {
       "type": "string",

@@ -3,6 +3,7 @@ import hashlib
 import html
 import json
 import mimetypes
+import os
 import re
 import sqlite3
 import sys
@@ -15,65 +16,35 @@ from memory import (
     atomic_write_text,
     check_state_dir,
     default_state_dir,
-    inspect_database,
     safe_slug,
+    search_store,
 )
 
-CJK_RUN = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF]+")
 IMPORTER_VERSION = 2
 TEXT_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".json", ".html", ".htm", ".rtf"}
 ARCHIVE_ONLY_SUFFIXES = {".pdf", ".docx"}
 MANUAL_SUFFIXES = TEXT_SUFFIXES | ARCHIVE_ONLY_SUFFIXES
 
 
-def _query_tokens(text):
-    parts = []
-    last = 0
-    for match in CJK_RUN.finditer(text):
-        parts.extend(text[last : match.start()].split())
-        run = match.group(0)
-        parts.extend(run[index : index + 2] for index in range(max(1, len(run) - 1)))
-        last = match.end()
-    parts.extend(text[last:].split())
-    return [part for part in parts if part]
-
-
-def _fts_query(text):
-    tokens = _query_tokens(text)
-    if not tokens:
-        raise ValueError("Search query must not be empty.")
-    return " AND ".join('"' + token.replace('"', '""') + '"' for token in tokens)
-
-
 def search(args):
-    root = _require_data_root(args.root)
-    _, db = check_state_dir(root, args.state_dir or default_state_dir())
-    if not db.is_file() or not inspect_database(db).get("initialized"):
-        raise ValueError("Database is not initialized. Run db-init and index first.")
-
-    conditions = ["memory_fts MATCH ?"]
-    values = [_fts_query(args.query)]
-    for column in ("type", "project", "workspace", "status"):
-        value = getattr(args, column)
-        if value:
-            conditions.append(f"m.{column} = ?")
-            values.append(value)
-    values.append(args.limit)
-
-    sql = f"""
-        SELECT m.id, m.title, m.type, m.project, m.status, m.workspace,
-               m.confidentiality, m.updated, m.relative_path,
-               snippet(memory_fts, 2, '[', ']', '…', 20) AS snippet,
-               bm25(memory_fts) AS rank
-        FROM memory_fts
-        JOIN memories AS m ON m.id = memory_fts.id
-        WHERE {' AND '.join(conditions)}
-        ORDER BY rank, m.updated DESC, m.id
-        LIMIT ?
-    """
-    with sqlite3.connect(db) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = [dict(row) for row in conn.execute(sql, values)]
+    delegated = argparse.Namespace(
+        root=args.root,
+        state_dir=args.state_dir,
+        query=args.query,
+        kind="memory",
+        source_kind=None,
+        type=getattr(args, "type", None),
+        project=getattr(args, "project", None),
+        context_id=None,
+        workspace=getattr(args, "workspace", None),
+        status=getattr(args, "status", None),
+        as_of=None,
+        include_unassigned=True,
+        include_restricted=getattr(args, "include_restricted", False),
+        include_inactive=getattr(args, "include_inactive", False),
+        limit=args.limit,
+    )
+    rows = search_store(delegated)
 
     if args.json:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
@@ -81,8 +52,8 @@ def search(args):
         for row in rows:
             project = f" project={row['project']}" if row["project"] else ""
             print(f"{row['id']}  {row['title']}  type={row['type']}{project}")
-            if row["snippet"]:
-                print(f"  {row['snippet']}")
+            if row["excerpt"]:
+                print(f"  {row['excerpt']}")
             print(f"  {row['relative_path']}")
         print(f"Results: {len(rows)}")
     return len(rows)
@@ -243,13 +214,50 @@ def _write_import_report(root, kind, input_sha256, report):
     return relative.as_posix()
 
 
-def _atomic_write_bytes(path, data):
-    tmp = path.with_name(f".tmp-{path.name}-{hashlib.sha256(data).hexdigest()[:16]}")
-    try:
-        tmp.write_bytes(data)
-        tmp.replace(path)
-    finally:
-        tmp.unlink(missing_ok=True)
+def _write_versioned_bytes(preferred, data, write=True):
+    preferred = Path(preferred)
+    digest = hashlib.sha256(data).hexdigest()
+    index = 0
+    while True:
+        if index == 0:
+            target = preferred
+        elif index == 1:
+            target = preferred.with_name(f"{preferred.stem}-{digest[:12]}{preferred.suffix}")
+        elif index == 2:
+            target = preferred.with_name(f"{preferred.stem}-{digest}{preferred.suffix}")
+        else:
+            target = preferred.with_name(f"{preferred.stem}-{digest}-{index - 2}{preferred.suffix}")
+
+        if not write:
+            if not target.exists() and not target.is_symlink():
+                return target, True
+            if not target.is_symlink() and target.is_file() and _file_sha256(target) == digest:
+                return target, False
+            index += 1
+            continue
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        created = False
+        try:
+            with target.open("xb") as handle:
+                created = True
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            descriptor = os.open(target.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            return target, True
+        except FileExistsError:
+            if not target.is_symlink() and target.is_file() and _file_sha256(target) == digest:
+                return target, False
+            index += 1
+        except Exception:
+            if created:
+                target.unlink(missing_ok=True)
+            raise
 
 
 def _manual_text(path):
@@ -286,8 +294,11 @@ def import_manual(args):
     text = _manual_text(source)
     now = datetime.now(timezone.utc).replace(microsecond=0)
     relative_base = Path(f"{now.year:04d}/{now.month:02d}/{digest[:16]}-{safe_slug(source.stem)}")
-    raw_relative = Path("imports/manual/raw") / relative_base.with_suffix(source.suffix.lower())
-    text_relative = Path("imports/manual/text") / relative_base.with_suffix(".md")
+    preferred = root / "imports/manual/raw" / relative_base.with_suffix(source.suffix.lower())
+    raw_target, raw_created = _write_versioned_bytes(preferred, raw, write=not args.dry_run)
+    raw_relative = raw_target.relative_to(root)
+    raw_tail = raw_relative.relative_to("imports/manual/raw")
+    text_relative = Path("imports/manual/text") / raw_tail.with_suffix(".md")
     written_paths = [raw_relative.as_posix()]
     title = source.stem or source.name
     markdown = None
@@ -312,7 +323,6 @@ def import_manual(args):
                 "",
             ]
         )
-    raw_exists = (root / raw_relative).exists()
     text_exists = (root / text_relative).exists() if text is not None else True
     report = {
         "format_version": 1,
@@ -321,9 +331,9 @@ def import_manual(args):
         "input_path": str(source),
         "input_sha256": digest,
         "imported_at": now.isoformat(),
-        "new": 0 if raw_exists and text_exists else 1,
+        "new": 1 if raw_created or not text_exists else 0,
         "updated": 0,
-        "duplicate": 1 if raw_exists and text_exists else 0,
+        "duplicate": 1 if not raw_created and text_exists else 0,
         "failed": 0,
         "archived_without_text": 1 if text is None else 0,
         "written_paths": written_paths,
@@ -331,9 +341,7 @@ def import_manual(args):
         "restore_suggestion": "Install or run a dedicated extractor, then import a text/Markdown sidecar." if text is None else "",
     }
     if not args.dry_run:
-        (root / raw_relative).parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_bytes(root / raw_relative, raw)
-        if markdown is not None:
+        if markdown is not None and not (root / text_relative).exists():
             (root / text_relative).parent.mkdir(parents=True, exist_ok=True)
             atomic_write_text(root / text_relative, markdown)
         report["report_path"] = _write_import_report(root, "manual", digest, report)
@@ -364,19 +372,19 @@ def import_chatgpt(args):
         title = (conversation.get("title") or "Untitled conversation").strip()
         stamp = datetime.fromtimestamp(conversation.get("create_time") or 0, timezone.utc)
         relative = Path(f"{stamp.year:04d}/{stamp.month:02d}/{safe_slug(conversation_id)}.md")
-        target = output_root / relative
         content, message_count = _render_conversation(conversation)
-        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        existing = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else None
-        if existing == digest:
-            unchanged += 1
-        elif target.exists():
+        encoded = content.encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        preferred = output_root / relative
+        preferred_exists = preferred.exists() or preferred.is_symlink()
+        target, wrote = _write_versioned_bytes(preferred, encoded, write=not args.dry_run)
+        relative = target.relative_to(output_root)
+        if wrote and preferred_exists:
             updated += 1
-        else:
+        elif wrote:
             created += 1
-        if not args.dry_run and existing != digest:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(target, content)
+        else:
+            unchanged += 1
         records.append(
             {
                 "conversation_id": conversation_id,
@@ -409,12 +417,23 @@ def import_chatgpt(args):
         "failed": preflight["invalid_conversations"],
         "written_paths": [record["path"] for record in records],
         "index_result": "not_run",
-        "restore_suggestion": "No recent restore is performed by import-chatgpt in v0.6.0.",
+        "restore_suggestion": "No recent restore is performed by import-chatgpt in v0.7.0.",
+    }
+    previous_records = []
+    if manifest_path.is_file():
+        try:
+            previous_records = json.loads(manifest_path.read_text(encoding="utf-8")).get("conversations", [])
+        except (OSError, json.JSONDecodeError, AttributeError):
+            previous_records = []
+    merged_records = {
+        (record.get("path"), record.get("sha256")): record
+        for record in previous_records + records
+        if isinstance(record, dict) and record.get("path") and record.get("sha256")
     }
     manifest = {
         "format_version": 1,
         "source": Path(args.zip).name,
-        "conversations": sorted(records, key=lambda item: item["conversation_id"]),
+        "conversations": sorted(merged_records.values(), key=lambda item: (item["conversation_id"], item["path"])),
     }
     if not args.dry_run:
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -447,6 +466,8 @@ def build_parser():
     search_parser.add_argument("--project")
     search_parser.add_argument("--workspace")
     search_parser.add_argument("--status")
+    search_parser.add_argument("--include-restricted", action="store_true")
+    search_parser.add_argument("--include-inactive", action="store_true")
     search_parser.add_argument("--limit", type=int, default=20)
     search_parser.add_argument("--json", action="store_true")
 

@@ -1,3 +1,4 @@
+import argparse
 import json
 import hashlib
 import importlib.util
@@ -8,12 +9,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing, contextmanager
 from unittest import mock
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MEMORY_CLI = REPO_ROOT / "src" / "memory.py"
+DISTILL_CLI = REPO_ROOT / "src" / "memory_distill.py"
 CSV_HEADER = "id,doi,title,authors,journal,year,status,pdf_path,note_path,project,tags"
 
 
@@ -22,6 +25,28 @@ def load_memory_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def finish_add_fixture(root, result, status="active"):
+    if result.returncode != 0:
+        return result
+    memory_id = re.search(r"memory_id: (.+)", result.stdout).group(1)
+    if status == "candidate":
+        return result
+    if status != "active":
+        for path in (Path(root) / "memory").rglob("*.md"):
+            text = path.read_text(encoding="utf-8")
+            if f'id: "{memory_id}"' in text:
+                path.write_text(text.replace('status: "candidate"', f'status: "{status}"', 1), encoding="utf-8")
+                return result
+        raise AssertionError(f"missing fixture memory {memory_id}")
+    state = Path(root).parent / "state"
+    if not (state / "memory.sqlite").is_file():
+        return result
+    return subprocess.run(
+        [sys.executable, str(DISTILL_CLI), "accept", "--root", str(root), "--state-dir", str(state), "--id", memory_id],
+        capture_output=True, text=True, cwd=REPO_ROOT,
+    )
 
 EXPECTED_DIRS = [
     "memory/profile",
@@ -42,6 +67,13 @@ EXPECTED_DIRS = [
     "exports/database_snapshots",
     "backups",
 ]
+
+
+@contextmanager
+def sqlite_connection(path):
+    with closing(sqlite3.connect(path)) as conn:
+        with conn:
+            yield conn
 
 
 class InitCommandTests(unittest.TestCase):
@@ -122,6 +154,7 @@ class AddCommandTests(unittest.TestCase):
     def run_add(self, root, *extra):
         base = [
             "add",
+            "--confirmed",
             "--root",
             str(root),
             "--type",
@@ -175,6 +208,48 @@ class AddCommandTests(unittest.TestCase):
             self.assertIn("# 代码最少原则", text)
             self.assertIn("该记忆的结构化内容保存在 front matter 的 content 字段中。", text)
             self.assertIn(str(created.relative_to(root)), result.stdout)
+
+    def test_add_defaults_to_candidate_without_explicit_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            result = self.run_cli(
+                "add", "--root", str(root), "--type", "principle", "--title", "Candidate default",
+                "--scope", "global", "--workspace", "personal", "--confidentiality", "personal",
+                "--source", "codex", "--confidence", "inferred", "--content", "candidate content",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            text = self.memory_files(root)[0].read_text(encoding="utf-8")
+            self.assertIn('status: "candidate"', text)
+
+    def test_add_confirmed_remains_candidate_and_preserves_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            result = self.run_add(root)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            text = self.memory_files(root)[0].read_text(encoding="utf-8")
+            self.assertIn('status: "candidate"', text)
+            self.assertIn('source: "user"', text)
+            self.assertNotIn('source: "manual:user_confirmed"', text)
+            self.assertIn("Review/accept required", result.stdout)
+
+    def test_add_confirmed_codex_cannot_create_active_or_rewrite_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            result = self.run_cli(
+                "add", "--confirmed", "--root", str(root), "--type", "principle",
+                "--title", "Codex proposal", "--scope", "global", "--workspace", "personal",
+                "--confidentiality", "personal", "--source", "codex", "--confidence", "confirmed",
+                "--content", "proposal content", "--status", "active",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            text = self.memory_files(root)[0].read_text(encoding="utf-8")
+            self.assertIn('status: "candidate"', text)
+            self.assertIn('source: "codex"', text)
+            self.assertNotIn('status: "active"', text)
+            self.assertNotIn('source: "manual:user_confirmed"', text)
 
     def test_add_same_title_twice_creates_distinct_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -389,6 +464,7 @@ class ValidateCommandTests(unittest.TestCase):
     def run_add(self, root, memory_type="principle", title="代码最少原则", scope="global", **kwargs):
         args = [
             "add",
+            "--confirmed",
             "--root",
             str(root),
             "--type",
@@ -593,6 +669,8 @@ class ValidateCommandTests(unittest.TestCase):
             self.assertEqual(self.run_init(root).returncode, 0)
             self.assertEqual(self.run_add(root, "context", "一", "context", context_id="ctx-1").returncode, 0)
             self.assertEqual(self.run_add(root, "context", "二", "context", context_id="ctx-2").returncode, 0)
+            for path in self.memory_files(root):
+                self.replace_in_file(path, 'status: "candidate"', 'status: "active"')
 
             result = self.run_validate(root)
 
@@ -736,37 +814,19 @@ class ContextTransitionCommandTests(unittest.TestCase):
         return self.run_cli(*(base + list(extra)))
 
     def run_add_context(self, root, context_id, title="研究生阶段", workspace="personal", confidentiality="personal", status="active", valid_from="2023-09-01", content="当前处于研究生科研阶段。"):
-        args = [
-            "add",
-            "--root",
-            str(root),
-            "--type",
-            "context",
-            "--title",
-            title,
-            "--scope",
-            "context",
-            "--workspace",
-            workspace,
-            "--confidentiality",
-            confidentiality,
-            "--source",
-            "user",
-            "--confidence",
-            "confirmed",
-            "--content",
-            content,
-            "--context-id",
-            context_id,
-            "--valid-from",
-            valid_from,
-            "--tags",
-            "education",
-            "research",
-            "--status",
-            status,
-        ]
-        return self.run_cli(*args)
+        module = load_memory_module()
+        memory_id = f"context-fixture-{hashlib.sha256(context_id.encode()).hexdigest()[:8]}"
+        path = root / "memory/contexts" / f"{memory_id}-{module.safe_slug(title)}.md"
+        record = {
+            "id": memory_id, "type": "context", "title": title,
+            "created": "2026-06-27", "updated": "2026-06-27", "status": status,
+            "scope": "context", "workspace": workspace, "confidentiality": confidentiality,
+            "source": "test:fixture", "confidence": "confirmed", "content": content,
+            "context_id": context_id, "valid_from": valid_from,
+            "tags": ["education", "research"],
+        }
+        module.atomic_write_text(path, module.render_memory(record))
+        return subprocess.CompletedProcess([], 0, "", "")
 
     def records(self, root):
         module = load_memory_module()
@@ -798,7 +858,37 @@ class ContextTransitionCommandTests(unittest.TestCase):
     def all_names(self, root):
         return sorted(path.name for path in (root / "memory").rglob("*") if path.is_file())
 
-    def test_context_transition_same_workspace_updates_source_and_creates_records(self):
+    def test_context_transition_creates_one_candidate_without_changing_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add_context(root, "university-student").returncode, 0)
+            source_path, source = self.record_by_context(root, "university-student")
+            source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+
+            result = self.run_transition(
+                root, "--source", "codex", "--confidence", "inferred",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(hashlib.sha256(source_path.read_bytes()).hexdigest(), source_hash)
+            self.assertEqual(self.record_by_context(root, "university-student")[1]["status"], "active")
+            self.assertEqual(len(self.records(root)), 2)
+            [(candidate_path, candidate)] = self.transition_records(root)
+            self.assertEqual(candidate["status"], "candidate")
+            self.assertEqual(candidate["audit_status"], "awaiting_review")
+            self.assertEqual(candidate["source"], "codex")
+            self.assertEqual(candidate["confidence"], "inferred")
+            self.assertEqual(candidate["target_id"], source["id"])
+            self.assertEqual(candidate["expected_target_status"], "active")
+            self.assertEqual(candidate["expected_target_sha256"], source_hash)
+            self.assertEqual(len(candidate["proposal_input_hash"]), 64)
+            new_record = json.loads(candidate["new_record_json"])
+            self.assertEqual(new_record["context_id"], "industry-engineer")
+            self.assertEqual(new_record["status"], "active")
+            self.assertIn(str(candidate_path.relative_to(root)), result.stdout)
+
+    def test_context_transition_same_workspace_leaves_source_active_and_creates_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "data-root"
             self.assertEqual(self.run_init(root).returncode, 0)
@@ -808,18 +898,15 @@ class ContextTransitionCommandTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             source_path, source = self.record_by_context(root, "university-student")
-            target_path, target = self.record_by_context(root, "industry-engineer")
             transitions = self.transition_records(root)
-            self.assertEqual(source["status"], "historical")
-            self.assertEqual(source["valid_until"], "2027-06-30")
-            self.assertEqual(target["status"], "active")
-            self.assertEqual(target_path.parent, root / "memory" / "contexts")
+            self.assertEqual(source["status"], "active")
+            self.assertNotIn("valid_until", source)
+            self.assertEqual([record for _, record in self.records(root) if record.get("context_id") == "industry-engineer"], [])
             self.assertEqual(len(transitions), 1)
-            self.assertIn(source["id"], target["supersedes"])
-            self.assertIn(target["id"], source["superseded_by"])
-            self.assertIn(f"Updated: {source_path.relative_to(root)}", result.stdout)
+            self.assertEqual(transitions[0][1]["status"], "candidate")
+            self.assertIn(f"Source unchanged: {source_path.relative_to(root)}", result.stdout)
 
-    def test_context_transition_cross_workspace_creates_work_context(self):
+    def test_context_transition_cross_workspace_records_planned_work_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "data-root"
             self.assertEqual(self.run_init(root).returncode, 0)
@@ -828,7 +915,8 @@ class ContextTransitionCommandTests(unittest.TestCase):
             result = self.run_transition(root)
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            _, target = self.record_by_context(root, "industry-engineer")
+            [( _, candidate)] = self.transition_records(root)
+            target = json.loads(candidate["new_record_json"])
             self.assertEqual(target["workspace"], "work")
             self.assertEqual(target["confidentiality"], "internal")
             self.assertEqual(self.run_validate(root).returncode, 0)
@@ -846,7 +934,7 @@ class ContextTransitionCommandTests(unittest.TestCase):
             after_body = source_path.read_text(encoding="utf-8").split("---", 2)[2]
             self.assertEqual(after_body, before_body)
 
-    def test_context_transition_sets_supersession_links(self):
+    def test_context_transition_candidate_records_planned_supersession(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "data-root"
             self.assertEqual(self.run_init(root).returncode, 0)
@@ -855,8 +943,9 @@ class ContextTransitionCommandTests(unittest.TestCase):
             self.assertEqual(self.run_transition(root).returncode, 0)
 
             _, source = self.record_by_context(root, "university-student")
-            _, target = self.record_by_context(root, "industry-engineer")
-            self.assertEqual(source["superseded_by"], [target["id"]])
+            [(_, candidate)] = self.transition_records(root)
+            target = json.loads(candidate["new_record_json"])
+            self.assertNotIn("superseded_by", source)
             self.assertEqual(target["supersedes"], [source["id"]])
 
     def test_context_transition_record_contains_required_fields(self):
@@ -1029,33 +1118,12 @@ class ContextTransitionCommandTests(unittest.TestCase):
 
             self.assertFalse([name for name in self.all_names(root) if name.startswith(".tmp-")])
 
-    def test_context_transition_rolls_back_when_create_fails_before_source_replace(self):
+    def test_context_transition_candidate_write_failure_keeps_source_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "data-root"
             module = load_memory_module()
             self.assertEqual(module.init_store(root)[0], root.resolve())
-            add_args = mock.Mock(
-                root=str(root),
-                type="context",
-                title="研究生阶段",
-                scope="context",
-                workspace="personal",
-                confidentiality="personal",
-                source="user",
-                confidence="confirmed",
-                content="当前处于研究生科研阶段。",
-                status="active",
-                context_id="university-student",
-                project=None,
-                valid_from="2023-09-01",
-                valid_until=None,
-                tags=["education", "research"],
-                from_context=None,
-                to_context=None,
-                effective_date=None,
-                reason=None,
-            )
-            module.add_memory(add_args)
+            self.assertEqual(self.run_add_context(root, "university-student").returncode, 0)
             before = self.hashes(root)
             transition_args = mock.Mock(
                 root=str(root),
@@ -1073,16 +1141,20 @@ class ContextTransitionCommandTests(unittest.TestCase):
                 dry_run=False,
             )
 
-            original_replace = Path.replace
-            calls = []
+            original_replace = module.os.replace
+            calls = 0
+            failed = False
 
-            def fail_second_replace(path, target):
-                calls.append(Path(target).name)
-                if len(calls) == 2:
+            def fail_first_replace(path, target):
+                nonlocal calls, failed
+                if Path(path).name.startswith(".tmp-"):
+                    calls += 1
+                if calls == 1 and not failed:
+                    failed = True
                     raise OSError("disk full")
                 return original_replace(path, target)
 
-            with mock.patch.object(Path, "replace", fail_second_replace):
+            with mock.patch.object(module.os, "replace", side_effect=fail_first_replace):
                 with self.assertRaises(OSError):
                     module.context_transition(transition_args)
 
@@ -1108,6 +1180,7 @@ class DbInitCommandTests(unittest.TestCase):
     def run_add(self, root):
         return self.run_cli(
             "add",
+            "--confirmed",
             "--root",
             str(root),
             "--type",
@@ -1132,7 +1205,7 @@ class DbInitCommandTests(unittest.TestCase):
         return state_dir / "memory.sqlite"
 
     def sqlite_objects(self, db):
-        with sqlite3.connect(db) as conn:
+        with sqlite_connection(db) as conn:
             return dict(
                 conn.execute(
                     """
@@ -1147,7 +1220,7 @@ class DbInitCommandTests(unittest.TestCase):
             )
 
     def columns(self, db, table):
-        with sqlite3.connect(db) as conn:
+        with sqlite_connection(db) as conn:
             return [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
 
     def test_db_init_creates_database(self):
@@ -1170,7 +1243,7 @@ class DbInitCommandTests(unittest.TestCase):
             self.assertEqual(self.run_db_init(root, state_dir).returncode, 0)
             db = self.db_path(state_dir)
 
-            with sqlite3.connect(db) as conn:
+            with sqlite_connection(db) as conn:
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
                 mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
                 objects = self.sqlite_objects(db)
@@ -1400,7 +1473,7 @@ class DbInitCommandTests(unittest.TestCase):
             state_dir = Path(tmp) / "state"
             state_dir.mkdir()
             db = self.db_path(state_dir)
-            with sqlite3.connect(db) as conn:
+            with sqlite_connection(db) as conn:
                 conn.execute("PRAGMA user_version = 2")
             before = db.read_bytes()
             self.assertEqual(self.run_init(root).returncode, 0)
@@ -1431,7 +1504,7 @@ class DbInitCommandTests(unittest.TestCase):
             self.assertEqual(self.run_init(root).returncode, 0)
             self.assertEqual(self.run_db_init(root, state_dir).returncode, 0)
             db = self.db_path(state_dir)
-            with sqlite3.connect(db) as conn:
+            with sqlite_connection(db) as conn:
                 conn.execute(
                     """
                     INSERT INTO memories (
@@ -1462,7 +1535,7 @@ class DbInitCommandTests(unittest.TestCase):
             result = self.run_db_init(root, state_dir)
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            with sqlite3.connect(db) as conn:
+            with sqlite_connection(db) as conn:
                 rows = conn.execute("SELECT id FROM memories").fetchall()
             self.assertEqual(rows, [("m1",)])
 
@@ -1511,6 +1584,7 @@ class IndexCommandTests(unittest.TestCase):
     def run_add(self, root, **kwargs):
         args = [
             "add",
+            "--confirmed",
             "--root",
             str(root),
             "--type",
@@ -1550,7 +1624,7 @@ class IndexCommandTests(unittest.TestCase):
         return sorted(path for path in (root / "memory").rglob("*.md") if path.is_file())
 
     def counts(self, db):
-        with sqlite3.connect(db) as conn:
+        with sqlite_connection(db) as conn:
             return {
                 "memories": conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0],
                 "memory_fts": conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0],
@@ -1558,7 +1632,7 @@ class IndexCommandTests(unittest.TestCase):
             }
 
     def rows(self, db, sql, params=()):
-        with sqlite3.connect(db) as conn:
+        with sqlite_connection(db) as conn:
             return conn.execute(sql, params).fetchall()
 
     def db_hash(self, db):
@@ -1675,7 +1749,7 @@ class IndexCommandTests(unittest.TestCase):
             root, state_dir, db = self.setup_store(tmp)
             self.assertEqual(self.run_add(root).returncode, 0)
             self.assertEqual(self.run_index(root, state_dir).returncode, 0)
-            with sqlite3.connect(db) as conn:
+            with sqlite_connection(db) as conn:
                 conn.execute("DELETE FROM memory_fts")
 
             result = self.run_index(root, state_dir)
@@ -1688,7 +1762,7 @@ class IndexCommandTests(unittest.TestCase):
             root, state_dir, db = self.setup_store(tmp)
             self.assertEqual(self.run_add(root).returncode, 0)
             self.assertEqual(self.run_index(root, state_dir).returncode, 0)
-            with sqlite3.connect(db) as conn:
+            with sqlite_connection(db) as conn:
                 conn.execute("DELETE FROM memories")
 
             result = self.run_index(root, state_dir)
@@ -1873,8 +1947,10 @@ class UnifiedSearchCommandTests(unittest.TestCase):
         return self.run_cli("doctor", "--root", str(root), "--state-dir", str(state_dir), "--json")
 
     def run_add(self, root, **kwargs):
+        status = kwargs.pop("status", "active")
         args = [
             "add",
+            "--confirmed",
             "--root",
             str(root),
             "--type",
@@ -1901,7 +1977,7 @@ class UnifiedSearchCommandTests(unittest.TestCase):
                 args.extend(value)
             elif value is not None:
                 args.extend([flag, value])
-        return self.run_cli(*args)
+        return finish_add_fixture(root, self.run_cli(*args), status)
 
     def setup_store(self, tmp):
         root = Path(tmp) / "data"
@@ -1911,7 +1987,7 @@ class UnifiedSearchCommandTests(unittest.TestCase):
         return root, state_dir, state_dir / "memory.sqlite"
 
     def rows(self, db, sql, params=()):
-        with sqlite3.connect(db) as conn:
+        with sqlite_connection(db) as conn:
             return conn.execute(sql, params).fetchall()
 
     def write_document(self, root, relative, body, front_matter=None):
@@ -2022,6 +2098,43 @@ class UnifiedSearchCommandTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             rows = json.loads(result.stdout)["results"]
             self.assertEqual([row["relative_path"] for row in rows], ["manuscripts/current/public.md"])
+
+    def test_search_enforces_inactive_restricted_and_project_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            common = {"content": "BoundarySafetyProbe durable evidence"}
+            projects = [
+                self.run_add(root, memory_type="project", title="PDC project", project="pdc", scope="project"),
+                self.run_add(root, memory_type="project", title="Other project", project="other", scope="project"),
+            ]
+            self.assertTrue(all(result.returncode == 0 for result in projects), [result.stderr for result in projects])
+            additions = [
+                self.run_add(root, title="global active", **common),
+                self.run_add(root, title="global restricted", confidentiality="restricted", workspace="work", **common),
+                self.run_add(root, title="global deprecated", status="deprecated", **common),
+                self.run_add(root, title="pdc active", project="pdc", scope="project", **common),
+                self.run_add(root, title="other active", project="other", scope="project", **common),
+            ]
+            self.assertTrue(all(result.returncode == 0 for result in additions), [result.stderr for result in additions])
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            default = self.run_search(root, state_dir, "BoundarySafetyProbe", "--kind", "memory")
+            self.assertEqual(default.returncode, 0, default.stdout + default.stderr)
+            self.assertEqual({row["title"] for row in json.loads(default.stdout)["results"]}, {"global active"})
+
+            project = self.run_search(root, state_dir, "BoundarySafetyProbe", "--kind", "memory", "--project", "pdc")
+            self.assertEqual(project.returncode, 0, project.stdout + project.stderr)
+            self.assertEqual({row["title"] for row in json.loads(project.stdout)["results"]}, {"global active", "pdc active"})
+
+            opted_in = self.run_search(
+                root, state_dir, "BoundarySafetyProbe", "--kind", "memory",
+                "--include-restricted", "--include-inactive",
+            )
+            self.assertEqual(opted_in.returncode, 0, opted_in.stdout + opted_in.stderr)
+            self.assertEqual(
+                {row["title"] for row in json.loads(opted_in.stdout)["results"]},
+                {"global active", "global restricted", "global deprecated"},
+            )
 
     def test_search_supports_manual_text_chatgpt_literature_and_manuscript_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2138,8 +2251,10 @@ class UnifiedSearchCommandTests(unittest.TestCase):
             summary = json.loads(result.stdout)
             self.assertTrue(summary["memory_index_fresh"])
             self.assertFalse(summary["document_index_fresh"])
-            self.assertEqual(summary["manual_orphan_raw"], ["note"])
+            self.assertEqual(summary["manual_orphan_raw"], [])
             self.assertEqual(summary["manual_orphan_text"], ["orphan"])
+            self.assertEqual(summary["raw_files"], 1)
+            self.assertEqual(summary["supported_documents"], 2)
             self.assertEqual(summary["hash_mismatches"], [{"kind": "document", "relative_path": "imports/manual/raw/note.txt"}])
 
 
@@ -2162,8 +2277,10 @@ class ProjectGovernanceCommandTests(unittest.TestCase):
         return self.run_cli("index", "--root", str(root), "--state-dir", str(state_dir))
 
     def run_add(self, root, memory_type="principle", title="记忆", scope="global", content="内容", **kwargs):
+        status = kwargs.pop("status", "active")
         args = [
             "add",
+            "--confirmed",
             "--root",
             str(root),
             "--type",
@@ -2186,7 +2303,7 @@ class ProjectGovernanceCommandTests(unittest.TestCase):
         for option, value in kwargs.items():
             if value is not None:
                 args.extend(["--" + option.replace("_", "-"), value])
-        return self.run_cli(*args)
+        return finish_add_fixture(root, self.run_cli(*args), status)
 
     def setup_store(self, tmp):
         root = Path(tmp) / "data"
@@ -2255,14 +2372,17 @@ class ProjectGovernanceCommandTests(unittest.TestCase):
             work = self.search(root, state_dir, "PDC", "--kind", "document", "--workspace", "work", "--project", "pdc")
 
             self.assertEqual(personal, [])
-            self.assertEqual(work, [])
+            self.assertEqual([row["relative_path"] for row in work], ["imports/manual/raw/note.txt"])
 
     def test_document_metadata_changes_are_reindexed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root, state_dir = self.setup_store(tmp)
             self.write_document(root, "imports/manual/text/note.md", "PDC metadata reindex document")
             self.assertEqual(self.run_index(root, state_dir).returncode, 0)
-            self.assertEqual(self.search(root, state_dir, "PDC", "--kind", "document", "--project", "pdc"), [])
+            self.assertEqual(
+                [row["relative_path"] for row in self.search(root, state_dir, "PDC", "--kind", "document", "--project", "pdc")],
+                ["imports/manual/text/note.md"],
+            )
 
             result = self.run_cli(
                 "document-meta",
@@ -2288,7 +2408,10 @@ class ProjectGovernanceCommandTests(unittest.TestCase):
             result = self.run_cli("document-meta", "unset", "--root", str(root), "--path", "imports/manual/text/note.md")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(self.run_index(root, state_dir).returncode, 0)
-            self.assertEqual(self.search(root, state_dir, "PDC", "--kind", "document", "--project", "pdc"), [])
+            self.assertEqual(
+                [row["relative_path"] for row in self.search(root, state_dir, "PDC", "--kind", "document", "--project", "pdc")],
+                ["imports/manual/text/note.md"],
+            )
 
     def test_search_as_of_context_and_project_isolation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2359,6 +2482,7 @@ class ContextPackCommandTests(unittest.TestCase):
     def run_add(self, root, memory_type="principle", title="记忆", scope="global", content="内容", **kwargs):
         args = [
             "add",
+            "--confirmed",
             "--root",
             str(root),
             "--type",
@@ -2383,6 +2507,8 @@ class ContextPackCommandTests(unittest.TestCase):
                 args.extend(["--" + option.replace("_", "-"), value])
         result = self.run_cli(*args)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        accepted = finish_add_fixture(root, result)
+        self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
         return re.search(r"memory_id: (.+)", result.stdout).group(1)
 
     def setup_store(self, tmp):
@@ -2500,6 +2626,7 @@ class RetrievalEvaluationCommandTests(unittest.TestCase):
     def run_add(self, root, title, content, **kwargs):
         args = [
             "add",
+            "--confirmed",
             "--root",
             str(root),
             "--type",
@@ -2524,6 +2651,8 @@ class RetrievalEvaluationCommandTests(unittest.TestCase):
                 args.extend(["--" + option.replace("_", "-"), value])
         result = self.run_cli(*args)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        accepted = finish_add_fixture(root, result)
+        self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
         return re.search(r"memory_id: (.+)", result.stdout).group(1)
 
     def setup_store(self, tmp):
@@ -2606,6 +2735,7 @@ class ExportCommandTests(unittest.TestCase):
     def run_add(self, root, memory_type="principle", title="代码最少原则", scope="global", **kwargs):
         args = [
             "add",
+            "--confirmed",
             "--root",
             str(root),
             "--type",
@@ -2654,7 +2784,15 @@ class ExportCommandTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((root / "exports" / "memory.jsonl").read_text(encoding="utf-8"), "")
-            self.assertEqual(self.load_manifest(root), {"format_version": 1, "records": []})
+            manifest = self.load_manifest(root)
+            self.assertEqual(manifest["format_version"], 1)
+            self.assertEqual(manifest["schema_version"], 3)
+            self.assertEqual(manifest["record_count"], 0)
+            self.assertEqual(manifest["records"], [])
+            self.assertEqual(manifest["source_root"], str(root.resolve()))
+            self.assertEqual(manifest["content_hash"], hashlib.sha256(b"").hexdigest())
+            self.assertIn("generated_at", manifest)
+            self.assertIn("database_hash", manifest)
             self.assertIn("Exported: 0 records", result.stdout)
 
     def test_export_valid_memory(self):
@@ -2678,7 +2816,7 @@ class ExportCommandTests(unittest.TestCase):
             manifest_row = self.load_manifest(root)["records"][0]
             self.assertEqual(manifest_row["id"], row["record"]["id"])
             self.assertEqual(manifest_row["type"], "principle")
-            self.assertEqual(manifest_row["status"], "active")
+            self.assertEqual(manifest_row["status"], "candidate")
             self.assertEqual(manifest_row["workspace"], "personal")
             self.assertEqual(manifest_row["confidentiality"], "personal")
             self.assertEqual(manifest_row["relative_path"], row["relative_path"])
@@ -2824,6 +2962,317 @@ class ExportCommandTests(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse((root / "exports" / "memory.jsonl").exists())
+
+
+class V070MigrationAndSafetyTests(unittest.TestCase):
+    def make_v2_database(self, base):
+        module = load_memory_module()
+        root = base / "data"
+        module.init_store(root)
+        record = {
+            "id": "principle-legacy-1",
+            "type": "principle",
+            "title": "Legacy principle",
+            "created": "2026-06-22",
+            "updated": "2026-06-22",
+            "status": "active",
+            "scope": "global",
+            "workspace": "personal",
+            "confidentiality": "personal",
+            "source": "user",
+            "confidence": "confirmed",
+            "content": "legacy migration probe",
+            "tags": [],
+        }
+        path = root / "memory/principles/principle-legacy-1-probe.md"
+        module.atomic_write_text(path, module.render_memory(record))
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        source = base / "legacy-v2.sqlite"
+        conn = sqlite3.connect(source)
+        try:
+            conn.executescript(
+                """
+                PRAGMA journal_mode = WAL;
+                CREATE TABLE memories (
+                    id TEXT PRIMARY KEY,
+                    schema TEXT NOT NULL DEFAULT 'memory/v1',
+                    tier TEXT NOT NULL DEFAULT 'long',
+                    type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    body TEXT NOT NULL DEFAULT '',
+                    tags TEXT NOT NULL DEFAULT '[]',
+                    aliases TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    workspace TEXT NOT NULL,
+                    confidentiality TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    confidence TEXT NOT NULL,
+                    source_id TEXT,
+                    source_path TEXT,
+                    source_sha256 TEXT,
+                    context_id TEXT,
+                    project TEXT,
+                    valid_from TEXT,
+                    valid_until TEXT,
+                    created TEXT NOT NULL,
+                    updated TEXT NOT NULL,
+                    relative_path TEXT NOT NULL UNIQUE,
+                    sha256 TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX idx_memories_type ON memories(type);
+                CREATE INDEX idx_memories_project ON memories(project);
+                CREATE INDEX idx_memories_context ON memories(context_id);
+                CREATE INDEX idx_memories_workspace_status ON memories(workspace, status);
+                CREATE VIRTUAL TABLE memory_fts USING fts5(
+                    id UNINDEXED, title, content, body, tags, aliases, tokenize='unicode61'
+                );
+                CREATE TABLE index_state (
+                    relative_path TEXT PRIMARY KEY, sha256 TEXT NOT NULL,
+                    mtime_ns INTEGER NOT NULL, indexed_at TEXT NOT NULL
+                );
+                CREATE TABLE links (
+                    source_id TEXT NOT NULL, target_id TEXT, target_ref TEXT NOT NULL,
+                    relation TEXT NOT NULL, source_kind TEXT NOT NULL,
+                    target_heading TEXT, target_block TEXT, context TEXT,
+                    resolved INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX idx_links_ref ON links(target_ref);
+                CREATE INDEX idx_links_source ON links(source_id);
+                CREATE INDEX idx_links_target ON links(target_id);
+                CREATE TABLE distillation_audit (
+                    recent_id TEXT PRIMARY KEY, relative_path TEXT NOT NULL,
+                    source_sha256 TEXT NOT NULL, status TEXT NOT NULL,
+                    result_json TEXT NOT NULL DEFAULT '{}', distilled_at TEXT,
+                    delete_after TEXT, deleted_at TEXT, error TEXT
+                );
+                PRAGMA user_version = 2;
+                """
+            )
+            conn.execute(
+                """INSERT INTO memories (
+                    id,type,title,content,status,scope,workspace,confidentiality,
+                    source,confidence,created,updated,relative_path,sha256
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    record["id"], record["type"], record["title"], record["content"],
+                    record["status"], record["scope"], record["workspace"],
+                    record["confidentiality"], record["source"], record["confidence"],
+                    record["created"], record["updated"], path.relative_to(root).as_posix(), digest,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO memory_fts(id,title,content,body,tags,aliases) VALUES (?,?,?,?,?,?)",
+                (record["id"], record["title"], record["content"], "", "", ""),
+            )
+            conn.execute(
+                "INSERT INTO index_state VALUES (?,?,?,?)",
+                (path.relative_to(root).as_posix(), digest, path.stat().st_mtime_ns, "2026-06-22T00:00:00+00:00"),
+            )
+            conn.execute(
+                "INSERT INTO links(source_id,target_ref,relation,source_kind,resolved) VALUES (?,?,?,?,?)",
+                (record["id"], "legacy-ref", "related_to", "body", 0),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return module, root, source, digest
+
+    def test_migrate_v2_preserves_legacy_schema_and_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            module, root, source, digest = self.make_v2_database(base)
+            before = hashlib.sha256(source.read_bytes()).hexdigest()
+            output = base / "candidate-v3.sqlite"
+
+            summary = module.migrate_database_v2_to_v3(source, output, root)
+
+            self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), before)
+            self.assertEqual(module.inspect_database(output), {"initialized": True, "version": 3})
+            conn = sqlite3.connect(output)
+            try:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(memories)")}
+                self.assertTrue({"schema", "tier", "body", "aliases", "source_id", "source_path", "source_sha256", "metadata_json"}.issubset(columns))
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM index_state").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM links").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT sha256 FROM memories").fetchone()[0], digest)
+            finally:
+                conn.close()
+            self.assertEqual(summary["memories"], 1)
+
+    def test_migrate_v2_is_repeatable_but_never_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            module, root, source, _ = self.make_v2_database(base)
+            first = base / "first.sqlite"
+            second = base / "second.sqlite"
+
+            module.migrate_database_v2_to_v3(source, first, root)
+            module.migrate_database_v2_to_v3(source, second, root)
+
+            self.assertEqual(module.inspect_database(first), module.inspect_database(second))
+            with self.assertRaisesRegex(ValueError, "must differ"):
+                module.migrate_database_v2_to_v3(source, source, root)
+
+    def test_migration_failure_removes_partial_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            module, root, source, _ = self.make_v2_database(base)
+            conn = sqlite3.connect(source)
+            try:
+                conn.execute("DROP TABLE index_state")
+                conn.commit()
+            finally:
+                conn.close()
+            output = base / "broken-output.sqlite"
+
+            with self.assertRaises(ValueError):
+                module.migrate_database_v2_to_v3(source, output, root)
+
+            self.assertFalse(output.exists())
+
+    def test_inspect_accepts_extra_columns_but_rejects_missing_or_wrong_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            module = load_memory_module()
+            compatible = base / "compatible.sqlite"
+            module.create_database(compatible)
+            conn = sqlite3.connect(compatible)
+            try:
+                conn.execute("ALTER TABLE memories ADD COLUMN legacy_note TEXT")
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(module.inspect_database(compatible)["initialized"])
+
+            equivalent = base / "equivalent-index.sqlite"
+            shutil.copy2(compatible, equivalent)
+            conn = sqlite3.connect(equivalent)
+            try:
+                conn.execute("DROP INDEX idx_memories_type")
+                conn.execute("CREATE INDEX legacy_custom_type_index ON memories(type)")
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(module.inspect_database(equivalent)["initialized"])
+
+            missing = base / "missing.sqlite"
+            shutil.copy2(compatible, missing)
+            conn = sqlite3.connect(missing)
+            try:
+                conn.execute("ALTER TABLE memories DROP COLUMN source")
+                conn.commit()
+            finally:
+                conn.close()
+            with self.assertRaisesRegex(ValueError, "columns"):
+                module.inspect_database(missing)
+
+            wrong = base / "wrong.sqlite"
+            shutil.copy2(compatible, wrong)
+            conn = sqlite3.connect(wrong)
+            try:
+                conn.execute("PRAGMA writable_schema = ON")
+                conn.execute("UPDATE sqlite_master SET sql=replace(sql, 'source TEXT NOT NULL', 'source BLOB NOT NULL') WHERE name='memories'")
+                conn.execute("PRAGMA writable_schema = OFF")
+                version = conn.execute("PRAGMA schema_version").fetchone()[0]
+                conn.execute(f"PRAGMA schema_version = {version + 1}")
+                conn.commit()
+            finally:
+                conn.close()
+            with self.assertRaisesRegex(ValueError, "column types"):
+                module.inspect_database(wrong)
+
+            broken_fts = base / "broken-fts.sqlite"
+            shutil.copy2(compatible, broken_fts)
+            conn = sqlite3.connect(broken_fts)
+            try:
+                conn.execute("DROP TABLE memory_fts")
+                conn.execute("CREATE TABLE memory_fts(id TEXT, title TEXT, content TEXT, body TEXT, tags TEXT, aliases TEXT)")
+                conn.commit()
+            finally:
+                conn.close()
+            with self.assertRaisesRegex(ValueError, "FTS5"):
+                module.inspect_database(broken_fts)
+
+    def test_migrated_legacy_recent_is_preserved_by_index_and_hidden_from_search(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            module, root, source, digest = self.make_v2_database(base)
+            old_path = next((root / "memory/principles").glob("*.md"))
+            recent_dir = root / "memory/recent"
+            recent_dir.mkdir(parents=True)
+            recent_path = recent_dir / old_path.name
+            old_path.replace(recent_path)
+            relative = recent_path.relative_to(root).as_posix()
+            conn = sqlite3.connect(source)
+            try:
+                conn.execute(
+                    "UPDATE memories SET tier='recent', relative_path=? WHERE id='principle-legacy-1'",
+                    (relative,),
+                )
+                conn.execute("DELETE FROM index_state")
+                conn.execute(
+                    "INSERT INTO index_state VALUES (?,?,?,?)",
+                    (relative, digest, recent_path.stat().st_mtime_ns, "2026-06-22T00:00:00+00:00"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            state = base / "state"
+            state.mkdir()
+            output = state / "memory.sqlite"
+            module.migrate_database_v2_to_v3(source, output, root)
+
+            result = module.index_store(argparse.Namespace(root=str(root), state_dir=str(state), dry_run=False))
+
+            self.assertEqual(result["deleted"], 0)
+            conn = sqlite3.connect(output)
+            try:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM index_state").fetchone()[0], 1)
+            finally:
+                conn.close()
+            rows = module.search_store(argparse.Namespace(
+                root=str(root), state_dir=str(state), query="Legacy migration probe",
+                kind="memory", source_kind=None, type=None, project=None, context_id=None,
+                workspace=None, status=None, as_of=None, include_unassigned=True,
+                include_restricted=False, include_inactive=False, limit=20,
+            ))
+            self.assertEqual(rows, [])
+
+    def test_replace_transaction_restores_all_existing_targets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_memory_module()
+            base = Path(tmp)
+            first = base / "first.md"
+            second = base / "second.md"
+            first.write_text("old first", encoding="utf-8")
+            second.write_text("old second", encoding="utf-8")
+            original_replace = module.os.replace
+            replacements = 0
+            failed = False
+
+            def fail_second(source, target):
+                nonlocal replacements, failed
+                if Path(target) in {first, second} and Path(source).name.startswith(".tmp-"):
+                    replacements += 1
+                    if replacements == 2 and not failed:
+                        failed = True
+                        raise OSError("injected failure")
+                return original_replace(source, target)
+
+            with mock.patch.object(module.os, "replace", side_effect=fail_second):
+                with self.assertRaisesRegex(OSError, "injected failure"):
+                    module._replace_transaction([(first, "new first"), (second, "new second")], [])
+
+            self.assertEqual(first.read_text(encoding="utf-8"), "old first")
+            self.assertEqual(second.read_text(encoding="utf-8"), "old second")
+            self.assertFalse([p for p in base.iterdir() if p.name.startswith((".tmp-", ".backup-"))])
 
 
 if __name__ == "__main__":
