@@ -1,546 +1,665 @@
 import argparse
 import hashlib
 import json
+import os
 import sqlite3
-import subprocess
 import sys
 import uuid
+from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-import memory
+from memory import (
+    CONFIDENTIALITY_CHOICES,
+    CONFIDENCE_CHOICES,
+    SCOPE_CHOICES,
+    TYPE_CHOICES,
+    TYPE_DIRS,
+    WORKSPACE_CHOICES,
+    _replace_transaction,
+    _require_data_root,
+    _validate_hypothetical_records,
+    atomic_write_text,
+    collect_validated_records,
+    default_state_dir,
+    index_store,
+    inspect_database,
+    render_existing_memory,
+    render_memory,
+    safe_slug,
+    validate_record,
+)
 
 
-ACTION_CHOICES = {"create", "merge", "support", "supersede", "conflict", "discard"}
+CANONICAL_ACTIONS = {"ADD", "UPDATE", "DEPRECATE", "NOOP", "REVIEW_REQUIRED"}
+ACTION_ALIASES = {
+    "create": "ADD", "merge": "UPDATE", "support": "UPDATE",
+    "supersede": "DEPRECATE", "conflict": "REVIEW_REQUIRED", "discard": "NOOP",
+}
+REVIEW_ACTIONS = CANONICAL_ACTIONS | set(ACTION_ALIASES)
+SAFE_MERGE_LISTS = ("source_refs", "tags", "relations")
+ERROR_CODES = {
+    "missing_source", "invalid_schema", "invalid_transition", "duplicate_content",
+    "conflict_requires_review", "permission_denied", "raw_integrity_violation",
+    "apply_failed", "index_failed", "verify_failed", "repeated_failure",
+    "max_iterations_reached", "stale_target",
+}
+STOP_STATUSES = {
+    "completed", "no_change", "waiting_for_human", "missing_source", "low_confidence",
+    "conflict_requires_review", "permission_denied", "repeated_failure",
+    "max_iterations_reached", "apply_failed", "raw_integrity_violation",
+    "index_failed", "verify_failed",
+}
 
 
-def _today(value=None):
-    return date.fromisoformat(value) if value else date.today()
+class DistillError(ValueError):
+    def __init__(self, code, message, recoverable=False, next_action="review"):
+        super().__init__(message)
+        self.feedback = {
+            "code": code, "recoverable": recoverable,
+            "message": message, "next_action": next_action,
+        }
 
 
-def _state(root, state_dir):
-    root = memory._require_data_root(root)
-    state, db = memory.check_state_dir(root, state_dir or memory.default_state_dir())
-    if not db.exists():
-        raise ValueError("Database is not initialized. Run db-init first.")
-    return root, state, db
+def _today():
+    return date.today().isoformat()
 
 
-def _db_connect(db):
-    conn = sqlite3.connect(db)
-    conn.execute("PRAGMA busy_timeout = 5000")
-    return conn
+def _timestamp():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _recent_items(root):
-    _, records, errors, _ = memory.collect_validated_records(root)
+def _journal_path(root):
+    return root / "state/distill_runs.jsonl"
+
+
+def _append_journal(root, **event):
+    path = _journal_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_id": event["run_id"],
+        "status": event["status"],
+        "iteration": event.get("iteration", 1),
+        "max_iterations": event.get("max_iterations", 2),
+        "input_hash": event.get("input_hash"),
+        "proposal_ids": event.get("proposal_ids", []),
+        "errors": event.get("errors", []),
+        "stop_reason": event.get("stop_reason"),
+        "next_action": event.get("next_action"),
+        "resume_command": event.get("resume_command"),
+        "timestamp": _timestamp(),
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return payload
+
+
+def _journal_entries(root):
+    path = _journal_path(root)
+    if not path.exists():
+        return []
+    entries = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise DistillError("invalid_schema", f"malformed journal line {number}", False, "repair_tail_manually") from exc
+        if not isinstance(entry, dict) or not entry.get("run_id"):
+            raise DistillError("invalid_schema", f"malformed journal line {number}", False, "repair_tail_manually")
+        entries.append(entry)
+    return entries
+
+
+def resume_run(args):
+    root = _require_data_root(args.root)
+    rows = [entry for entry in _journal_entries(root) if entry["run_id"] == args.run_id]
+    if not rows:
+        raise DistillError("invalid_schema", "distill run not found", False, "check_run_id")
+    return rows[-1]
+
+
+def _records_by_id(root):
+    root, records, errors, _ = collect_validated_records(root)
     if errors:
-        messages = [f"ERROR {rel_path}: {message}" for rel_path, message in errors]
-        raise ValueError("\n".join(messages + ["Distillation aborted because validation failed."]))
-    return [item for item in records if item["record"].get("schema") == "recent/v1"]
+        raise ValueError("\n".join(f"ERROR {rel_path}: {message}" for rel_path, message in errors))
+    return root, {item["record"]["id"]: item for item in records}
 
 
-def _sha(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _audit_by_recent(conn):
-    return {
-        row[0]: dict(zip(memory.AUDIT_COLUMNS, row))
-        for row in conn.execute("SELECT " + ", ".join(memory.AUDIT_COLUMNS) + " FROM distillation_audit")
-    }
-
-
-def prepare(args):
-    root, state, db = _state(args.root, Path(args.state_dir))
-    today = _today(args.today)
-    tasks_dir = state / "distillation" / "tasks"
-    tasks = []
-    with _db_connect(db) as conn:
-        audit = _audit_by_recent(conn)
-    existing = [
-        {"relative_path": item["relative_path"], "record": item["record"]}
-        for item in memory.collect_validated_records(root)[1]
-        if item["record"].get("schema") != "recent/v1"
-    ]
-    for item in _recent_items(root):
-        record = item["record"]
-        retention = memory._real_date(record.get("retention_until"))
-        current_sha = _sha(item["path"])
-        audit_row = audit.get(record["id"])
-        if retention is None or retention > today:
-            continue
-        if str(record.get("protected", "false")).lower() == "true":
-            continue
-        if audit_row and audit_row.get("source_sha256") == current_sha and audit_row.get("status") in {"pending_delete", "deleted"}:
-            continue
-        task_id = f"distill-{record['id']}-{uuid.uuid4().hex[:8]}"
-        task_dir = tasks_dir / task_id
-        if not args.dry_run:
-            task_dir.mkdir(parents=True, exist_ok=True)
-            (task_dir / "source.md").write_text(item["path"].read_text(encoding="utf-8"), encoding="utf-8")
-            (task_dir / "existing_memories.json").write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
-            (task_dir / "result_schema.json").write_text(json.dumps({"schema": "distillation-result/v1"}, indent=2), encoding="utf-8")
-            (task_dir / "instructions.md").write_text(
-                "Return distillation_result.json only. Do not modify source memory or raw files.\n",
-                encoding="utf-8",
-            )
-            (task_dir / "task.json").write_text(
-                json.dumps(
-                    {
-                        "task_id": task_id,
-                        "source_id": record["id"],
-                        "source_sha256": current_sha,
-                        "relative_path": item["relative_path"],
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-        tasks.append({"task_id": task_id, "task_dir": str(task_dir), "source_id": record["id"], "source_sha256": current_sha})
-    return {"tasks": tasks, "count": len(tasks), "dry_run": args.dry_run}
-
-
-def _codex_command(codex_bin, task_dir, result_path):
-    if Path(codex_bin).name != "codex":
-        return [codex_bin]
-    task = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
-    example = {
-        "schema": "distillation-result/v1",
-        "source_id": task["source_id"],
-        "source_sha256": task["source_sha256"],
-        "candidates": [
-            {
-                "action": "create",
-                "type": "principle",
-                "title": "Concise durable memory title",
-                "subject": "user",
-                "predicate": "prefers",
-                "object": "minimal reusable code",
-                "content": "One durable memory distilled from source.md.",
-                "evidence": "Short quote or paraphrase from source.md.",
-                "relations": [],
-            }
-        ],
-        "unresolved_conflicts": [],
-    }
-    prompt = (
-        "Distill this temporary research-agent-memory task. "
-        "Use only the data below. Return only a raw JSON object; do not wrap it in Markdown.\n\n"
-        "Required top-level keys are exactly: schema, source_id, source_sha256, candidates, unresolved_conflicts. "
-        "Use the key \"candidates\" for distilled memories. Do not return a memories key. "
-        "Each candidate action must be one of create, merge, support, supersede, conflict, discard. "
-        "For this validation source, create one principle candidate if the source contains a durable preference.\n\n"
-        "Required JSON shape:\n"
-        + json.dumps(example, ensure_ascii=False, indent=2)
-        + "\n\n"
-        "task.json:\n"
-        + (task_dir / "task.json").read_text(encoding="utf-8")
-        + "\nsource.md:\n"
-        + (task_dir / "source.md").read_text(encoding="utf-8")
-        + "\nexisting_memories.json:\n"
-        + (task_dir / "existing_memories.json").read_text(encoding="utf-8")
-    )
-    return [
-        codex_bin,
-        "exec",
-        "--skip-git-repo-check",
-        "--ephemeral",
-        "--ignore-rules",
-        "--sandbox",
-        "workspace-write",
-        "--output-last-message",
-        str(result_path),
-        "-C",
-        str(task_dir),
-        prompt,
-    ]
-
-
-def _process_text(value):
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return str(value)
-
-
-def run_task(args):
-    task_dir = Path(args.task_dir).resolve(strict=True)
-    result_path = task_dir / "distillation_result.json"
-    command = _codex_command(args.codex_bin, task_dir, result_path)
-    try:
-        result = subprocess.run(
-            command,
-            cwd=task_dir,
-            text=True,
-            capture_output=True,
-            timeout=args.timeout,
-        )
-        timed_out = False
-    except subprocess.TimeoutExpired as exc:
-        result = exc
-        timed_out = True
-    stdout = _process_text(getattr(result, "stdout", None))
-    stderr = _process_text(getattr(result, "stderr", None))
-    code = getattr(result, "returncode", 124 if timed_out else 1)
-    (task_dir / "codex_stdout.log").write_text(stdout, encoding="utf-8")
-    (task_dir / "codex_stderr.log").write_text(stderr, encoding="utf-8")
-    (task_dir / "codex_exit_code.txt").write_text(str(code) + "\n", encoding="utf-8")
-    if timed_out:
-        raise ValueError("Codex distillation timed out.")
-    if code != 0:
-        raise ValueError("Codex distillation failed.")
-    if not result_path.exists():
-        raise ValueError("Codex distillation result is missing.")
-    try:
-        json.loads(result_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError("Codex distillation result is invalid JSON.") from exc
-    return {"task_dir": str(task_dir), "exit_code": code, "result": str(result_path)}
-
-
-def _load_task(task_dir):
-    task_dir = Path(task_dir).resolve(strict=True)
-    task = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
-    result = json.loads((task_dir / "distillation_result.json").read_text(encoding="utf-8"))
-    return task_dir, task, result
-
-
-def _validate_result(task, result):
-    if result.get("schema") != "distillation-result/v1":
-        raise ValueError("Invalid distillation result schema.")
-    if result.get("source_id") != task["source_id"]:
-        raise ValueError("Distillation source_id does not match task.")
-    if result.get("source_sha256") != task["source_sha256"]:
-        raise ValueError("Distillation source_sha256 does not match task.")
-    if not isinstance(result.get("candidates"), list):
-        raise ValueError("Distillation candidates must be a list.")
-    if not isinstance(result.get("unresolved_conflicts", []), list):
-        raise ValueError("Distillation unresolved_conflicts must be a list.")
-    for candidate in result["candidates"]:
-        if candidate.get("action") not in ACTION_CHOICES:
-            raise ValueError("Distillation candidate action is invalid.")
-        for relation in candidate.get("relations", []):
-            name, target = memory._relation_parts(relation)
-            if name not in memory.RELATION_CHOICES or not target:
-                raise ValueError("Distillation candidate relation is invalid.")
-
-
-def _new_memory_path(root, memory_type, title):
-    target_dir = root / memory.TYPE_DIRS[memory_type]
-    target_dir.mkdir(parents=True, exist_ok=True)
-    today = date.today().isoformat().replace("-", "")
+def _new_candidate_path(root, memory_type, title):
+    target_dir = root / TYPE_DIRS[memory_type]
+    day_id = _today().replace("-", "")
+    slug = safe_slug(title)
     while True:
-        memory_id = f"{memory_type}-{today}-{uuid.uuid4().hex[:8]}"
-        path = target_dir / f"{memory_id}-{memory.safe_slug(title)}.md"
+        candidate_id = f"{memory_type}-{day_id}-{uuid.uuid4().hex[:8]}"
+        path = target_dir / f"{candidate_id}-{slug}.md"
         if not path.exists():
-            return memory_id, path
+            return candidate_id, path
 
 
-def _candidate_record(root, source_record, candidate):
-    action = candidate["action"]
-    memory_type = candidate.get("type", "principle")
-    if memory_type not in memory.TYPE_DIRS:
-        raise ValueError("Distillation candidate type is invalid.")
-    title = candidate.get("title") or source_record["title"]
-    memory_id, path = _new_memory_path(root, memory_type, title)
-    today = date.today().isoformat()
-    status = "conflict" if action == "conflict" else "active"
-    relations = list(candidate.get("relations", []))
-    relations.append(f"derived_from:{source_record['id']}")
+def _list(value):
+    return value if isinstance(value, list) else []
+
+
+def _merge_unique(left, right):
+    result = list(left)
+    for value in right:
+        if value not in result:
+            result.append(value)
+    return result
+
+
+def _input_hash(args):
+    fields = {
+        name: getattr(args, name, None)
+        for name in (
+            "action", "type", "title", "scope", "workspace", "confidentiality",
+            "source", "confidence", "content", "target_id", "project", "context_id",
+            "source_id", "source_path", "source_sha256", "evidence", "source_refs",
+            "relations", "tags", "confirmed",
+        )
+    }
+    return hashlib.sha256(json.dumps(fields, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _normalized_action(requested, records, args):
+    action = ACTION_ALIASES.get(requested, requested)
+    if action not in CANONICAL_ACTIONS:
+        raise DistillError("invalid_schema", "invalid candidate action", False, "choose_valid_action")
+    for item in records.values():
+        record = item["record"]
+        if record.get("content") == args.content:
+            return "NOOP", record["id"]
+        if args.source_sha256 and record.get("source_sha256") == args.source_sha256:
+            return "NOOP", record["id"]
+    if action == "ADD" and any(item["record"].get("title") == args.title for item in records.values()):
+        return "REVIEW_REQUIRED", None
+    return action, None
+
+
+def _validate_proposal(root, records, args, action):
+    source_refs = _list(args.source_refs) + _list(args.evidence)
+    file_source = bool(args.source_path and args.source_sha256)
+    if not source_refs and args.source != "manual:user_confirmed" and not file_source:
+        raise DistillError("missing_source", "candidate requires source_refs or a hashed source file", True, "add_source")
+    if bool(args.source_path) != bool(args.source_sha256):
+        raise DistillError("missing_source", "source_path and source_sha256 must be provided together", True, "add_source_hash")
+    if file_source:
+        path = root / args.source_path
+        if not path.is_file():
+            raise DistillError("missing_source", "source file not found", True, "restore_source")
+        if hashlib.sha256(path.read_bytes()).hexdigest() != args.source_sha256:
+            raise DistillError("raw_integrity_violation", "source hash changed", False, "review_raw_source")
+    if args.scope == "project" and not args.project:
+        raise DistillError("invalid_schema", "project scope requires project", True, "add_project")
+    active_projects = {
+        item["record"].get("project") for item in records.values()
+        if item["record"].get("type") == "project" and item["record"].get("status") == "active"
+    }
+    if args.scope == "project" and args.type != "project" and args.project not in active_projects:
+        raise DistillError("invalid_schema", "project does not reference an active project", True, "select_project")
+    if args.confidentiality in {"internal", "restricted"} and args.workspace != "work":
+        raise DistillError("permission_denied", "confidentiality internal or restricted requires workspace work", False, "use_work_workspace")
+    if action in {"UPDATE", "DEPRECATE"} and not args.target_id:
+        raise DistillError("invalid_transition", "target-id is required for this action", True, "select_target")
+    if args.target_id and args.target_id not in records:
+        raise DistillError("invalid_transition", "target memory not found", True, "select_target")
+    if action in {"UPDATE", "DEPRECATE"} and records[args.target_id]["record"].get("status") != "active":
+        raise DistillError("invalid_transition", "only active memory may be replaced", False, "select_active_target")
+
+
+def _verify_index(root, state_dir, records):
+    db = Path(state_dir).expanduser() / "memory.sqlite"
+    inspect_database(db)
+    with closing(sqlite3.connect(db)) as conn:
+        for record, relative_path, digest in records:
+            row = conn.execute("SELECT status, sha256 FROM memories WHERE id=?", (record["id"],)).fetchone()
+            if row != (record["status"], digest):
+                raise DistillError("verify_failed", f"memory index hash mismatch: {record['id']}", True, "resume_verify")
+            if conn.execute("SELECT COUNT(*) FROM memory_fts WHERE id=?", (record["id"],)).fetchone()[0] != 1:
+                raise DistillError("verify_failed", f"memory FTS mismatch: {record['id']}", True, "resume_verify")
+            visible = record["status"] == "active" and record.get("confidentiality") != "restricted" and not record.get("project")
+            found = conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE id=? AND status='active' AND COALESCE(confidentiality,'')!='restricted' AND project IS NULL",
+                (record["id"],),
+            ).fetchone()[0] == 1
+            if found != visible:
+                raise DistillError("verify_failed", f"search policy mismatch: {record['id']}", True, "resume_verify")
+
+
+def _apply_files_and_index(root, state_dir, operations, expected_records):
+    previous = {path: path.read_text(encoding="utf-8") for path, _ in operations if path.exists()}
+    new_paths = [path for path, _ in operations if not path.exists()]
+    try:
+        _replace_transaction(operations, [])
+    except Exception as exc:
+        raise DistillError("apply_failed", str(exc), True, "resume_apply") from exc
+    stage = "index_failed"
+    try:
+        index_store(argparse.Namespace(root=str(root), state_dir=str(state_dir), dry_run=False))
+        stage = "verify_failed"
+        verified = []
+        for path, record in expected_records:
+            verified.append((record, path.relative_to(root).as_posix(), hashlib.sha256(path.read_bytes()).hexdigest()))
+        _verify_index(root, state_dir, verified)
+    except Exception as exc:
+        restore = [(path, content) for path, content in previous.items()]
+        if restore:
+            _replace_transaction(restore, [])
+        for path in new_paths:
+            path.unlink(missing_ok=True)
+        try:
+            index_store(argparse.Namespace(root=str(root), state_dir=str(state_dir), dry_run=False))
+        except Exception:
+            pass
+        if isinstance(exc, DistillError):
+            raise
+        raise DistillError(stage, str(exc), True, "resume") from exc
+
+
+def _apply_candidate_once(args):
+    root = _require_data_root(args.root)
+    _, records = _records_by_id(root)
+    action, duplicate_id = _normalized_action(args.action, records, args)
+    _validate_proposal(root, records, args, action)
+    if action == "NOOP":
+        return {
+            "candidate_id": duplicate_id, "path": None, "action": action,
+            "status": "no_change", "stop_reason": "no_change",
+        }
+    if args.dry_run:
+        return {"candidate_id": None, "path": None, "action": action, "status": "waiting_for_human"}
+
+    today = _today()
+    candidate_id, path = _new_candidate_path(root, args.type, args.title)
+    confidence = args.confidence
+    if args.source.lower().startswith("codex") and confidence == "confirmed":
+        confidence = "inferred"
     record = {
-        "schema": "memory/v2",
-        "id": memory_id,
-        "type": memory_type,
-        "title": title,
+        "id": candidate_id,
+        "type": args.type,
+        "title": args.title,
         "created": today,
         "updated": today,
-        "status": status,
-        "scope": candidate.get("scope", "global"),
-        "workspace": candidate.get("workspace", "personal"),
-        "confidentiality": candidate.get("confidentiality", "personal"),
-        "source": "codex_distillation",
-        "confidence": candidate.get("confidence", "inferred"),
-        "subject": candidate.get("subject", title),
-        "predicate": candidate.get("predicate", "states"),
-        "object": candidate.get("object", candidate.get("content", title)[:80] or title),
-        "relations": relations,
-        "source_refs": [source_record["id"]],
-        "tags": candidate.get("tags", []),
-        "content": candidate.get("content", source_record.get("content", "")),
+        "status": "candidate",
+        "audit_status": "awaiting_review",
+        "scope": args.scope,
+        "workspace": args.workspace,
+        "confidentiality": args.confidentiality,
+        "source": args.source,
+        "confidence": confidence,
+        "candidate_action": action,
+        "requested_action": args.action,
+        "content": args.content,
+        "tags": args.tags or [],
     }
-    if record["scope"] == "project" and candidate.get("project"):
-        record["project"] = candidate["project"]
-    return path, record
+    if args.confirmed:
+        record["confirmation"] = "explicit"
+    for field in ["target_id", "project", "context_id", "source_id", "source_path", "source_sha256"]:
+        value = getattr(args, field)
+        if value:
+            record[field] = value
+    if action in {"UPDATE", "DEPRECATE"}:
+        target_item = records[args.target_id]
+        record["expected_target_status"] = target_item["record"]["status"]
+        record["expected_target_sha256"] = hashlib.sha256(target_item["path"].read_bytes()).hexdigest()
+    for field in ["evidence", "source_refs", "relations"]:
+        value = getattr(args, field)
+        if value:
+            record[field] = value
+
+    validation_errors = validate_record(record, path, path.relative_to(root).as_posix(), args.type)
+    if validation_errors:
+        raise DistillError("invalid_schema", "; ".join(validation_errors), True, "fix_schema")
+
+    rendered = render_memory(record)
+    atomic_write_text(path, rendered)
+    status = "low_confidence" if args.confidence == "uncertain" else "waiting_for_human"
+    return {
+        "candidate_id": candidate_id, "path": path.relative_to(root).as_posix(),
+        "action": action, "status": status,
+        "stop_reason": "conflict_requires_review" if action == "REVIEW_REQUIRED" else status,
+    }
 
 
-def _find_recent(root, source_id):
-    for item in _recent_items(root):
-        if item["record"].get("id") == source_id:
-            return item
-    raise ValueError("Source recent memory is missing.")
-
-
-def _find_memory_item(root, memory_id):
-    for item in memory.collect_validated_records(root)[1]:
-        if item["record"].get("id") == memory_id:
-            return item
-    return None
-
-
-def _append_unique(record, field, values):
-    current = list(record.get(field, [])) if isinstance(record.get(field, []), list) else []
-    for value in values:
-        if value not in current:
-            current.append(value)
-    record[field] = current
-
-
-def _merge_existing(root, source_record, candidate, mode):
-    target_id = candidate.get("target_id")
-    if not target_id:
-        raise ValueError(f"Distillation {mode} candidate requires target_id.")
-    item = _find_memory_item(root, target_id)
-    if not item or item["record"].get("schema") == "recent/v1":
-        raise ValueError(f"Distillation {mode} target is missing.")
-    record = dict(item["record"])
-    _append_unique(record, "source_refs", [source_record["id"]])
-    relation = "supports" if mode == "support" else "derived_from"
-    _append_unique(record, "relations", [f"{relation}:{source_record['id']}"])
-    record["updated"] = date.today().isoformat()
-    return item["path"], record, item["path"].read_text(encoding="utf-8")
-
-
-def _supersede_existing(root, source_record, candidate):
-    target_id = candidate.get("target_id")
-    if not target_id:
-        raise ValueError("Distillation supersede candidate requires target_id.")
-    item = _find_memory_item(root, target_id)
-    if not item or item["record"].get("schema") == "recent/v1":
-        raise ValueError("Distillation supersede target is missing.")
-    new_path, new_record = _candidate_record(root, source_record, candidate)
-    _append_unique(new_record, "relations", [f"supersedes:{target_id}"])
-    old_record = dict(item["record"])
-    old_record["status"] = candidate.get("old_status", "historical")
-    old_record["updated"] = date.today().isoformat()
-    _append_unique(old_record, "source_refs", [source_record["id"]])
-    _append_unique(old_record, "superseded_by", [new_record["id"]])
-    _append_unique(old_record, "relations", [f"supports:{source_record['id']}", f"superseded_by:{new_record['id']}"])
-    return item["path"], old_record, item["path"].read_text(encoding="utf-8"), new_path, new_record
-
-
-def apply(args):
-    root, state, db = _state(args.root, Path(args.state_dir))
-    with memory.write_lock(root, state):
-        task_dir, task, result = _load_task(args.task_dir)
-        _validate_result(task, result)
-        recent_item = _find_recent(root, task["source_id"])
-        if _sha(recent_item["path"]) != task["source_sha256"]:
-            raise ValueError("Source recent memory changed after prepare.")
-        created = []
-        updated = []
-        has_conflict = bool(result.get("unresolved_conflicts"))
-        for candidate in result["candidates"]:
-            action = candidate["action"]
-            if action == "discard":
-                continue
-            if action in {"merge", "support"}:
-                updated.append(_merge_existing(root, recent_item["record"], candidate, action))
-                continue
-            if action == "supersede":
-                old_path, old_record, old_text, new_path, new_record = _supersede_existing(root, recent_item["record"], candidate)
-                updated.append((old_path, old_record, old_text))
-                created.append((new_path, new_record))
-                continue
-            if action == "conflict":
-                has_conflict = True
-            path, record = _candidate_record(root, recent_item["record"], candidate)
-            created.append((path, record))
+def apply_candidate(args):
+    root = _require_data_root(args.root)
+    run_id = uuid.uuid4().hex
+    input_hash = _input_hash(args)
+    max_iterations = args.max_iterations
+    if max_iterations < 1 or max_iterations > 2:
+        raise DistillError("invalid_schema", "max_iterations must be between 1 and 2", False, "set_max_iterations")
+    previous_code = None
+    for iteration in range(1, max_iterations + 1):
         try:
-            for path, record, _old_text in updated:
-                memory.atomic_write_text(path, memory.render_existing_memory(path, record))
-            for path, record in created:
-                memory.atomic_write_text(path, memory.render_memory(record))
-            count, errors = memory.validate_store(root)
-            if errors:
-                raise ValueError("Distillation apply produced invalid memory.")
-            memory.index_store(type("Args", (), {"root": str(root), "state_dir": str(state), "dry_run": False})())
-        except Exception:
-            for path, _ in created:
-                path.unlink(missing_ok=True)
-            for path, _record, old_text in updated:
-                memory.atomic_write_text(path, old_text)
-            try:
-                memory.index_store(type("Args", (), {"root": str(root), "state_dir": str(state), "dry_run": False})())
-            except Exception:
-                pass
-            raise
-        status = "conflict" if has_conflict else "pending_delete"
-        today = _today(args.today)
-        delete_after = None if has_conflict else (today + timedelta(days=memory.DELETION_GRACE_DAYS)).isoformat()
-        with _db_connect(db) as conn:
-            conn.execute(
-                """
-                INSERT INTO distillation_audit(recent_id, relative_path, source_sha256, status, result_json, distilled_at, delete_after, error)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(recent_id) DO UPDATE SET
-                  relative_path = excluded.relative_path,
-                  source_sha256 = excluded.source_sha256,
-                  status = excluded.status,
-                  result_json = excluded.result_json,
-                  distilled_at = excluded.distilled_at,
-                  delete_after = excluded.delete_after,
-                  deleted_at = NULL,
-                  error = excluded.error
-                """,
-                (
-                    task["source_id"],
-                    recent_item["relative_path"],
-                    task["source_sha256"],
-                    status,
-                    json.dumps(result, ensure_ascii=False, sort_keys=True),
-                    today.isoformat(),
-                    delete_after,
-                    None,
-                ),
+            result = _apply_candidate_once(args)
+            result["run_id"] = run_id
+            if args.dry_run:
+                return result
+            _append_journal(
+                root, run_id=run_id, status=result["status"], iteration=iteration,
+                max_iterations=max_iterations, input_hash=input_hash,
+                proposal_ids=[result["candidate_id"]] if result.get("candidate_id") else [],
+                stop_reason=result.get("stop_reason", result["status"]),
+                next_action="accept" if result["status"] == "waiting_for_human" else ("review" if result["status"] == "low_confidence" else None),
+                resume_command=f"memory_distill.py resume --root {root} --run-id {run_id}",
             )
-            conn.commit()
-        return {"applied": len(created), "status": status, "delete_after": delete_after}
-
-
-def _source_raw_matches(root, record):
-    source = record.get("source_path")
-    expected = record.get("source_sha256")
-    if not source or not expected:
-        return False
-    path = root / source
-    return path.is_file() and _sha(path) == expected
-
-
-def purge(args):
-    root, state, db = _state(args.root, Path(args.state_dir))
-    today = _today(args.today)
-    dry_run = getattr(args, "dry_run", False)
-    deleted = 0
-    skipped = 0
-    would_delete = 0
-    with memory.write_lock(root, state):
-        with _db_connect(db) as conn:
-            rows = [
-                dict(zip(memory.AUDIT_COLUMNS, row))
-                for row in conn.execute(
-                    "SELECT " + ", ".join(memory.AUDIT_COLUMNS) + " FROM distillation_audit WHERE status = 'pending_delete'"
+            return result
+        except DistillError as exc:
+            feedback = exc.feedback
+            _append_journal(
+                root, run_id=run_id, status=feedback["code"], iteration=iteration,
+                max_iterations=max_iterations, input_hash=input_hash, errors=[feedback],
+                stop_reason=feedback["code"] if not feedback["recoverable"] else None,
+                next_action=feedback["next_action"],
+                resume_command=f"memory_distill.py resume --root {root} --run-id {run_id}",
+            )
+            if not feedback["recoverable"]:
+                raise
+            if previous_code == feedback["code"]:
+                final = DistillError("repeated_failure", f"repeated_failure: {feedback['message']}", False, feedback["next_action"])
+                _append_journal(
+                    root, run_id=run_id, status="repeated_failure", iteration=iteration,
+                    max_iterations=max_iterations, input_hash=input_hash, errors=[feedback],
+                    stop_reason="repeated_failure", next_action=feedback["next_action"],
+                    resume_command=f"memory_distill.py resume --root {root} --run-id {run_id}",
                 )
-            ]
-        for row in rows:
-            delete_after = memory._real_date(row.get("delete_after"))
-            path = root / row["relative_path"]
-            if delete_after is None or delete_after > today or not path.exists():
-                skipped += 1
-                continue
-            record, _, errors = memory.parse_memory_document(path)
-            if errors or not record:
-                skipped += 1
-                continue
-            if str(record.get("protected", "false")).lower() == "true":
-                skipped += 1
-                continue
-            if _sha(path) != row["source_sha256"]:
-                with _db_connect(db) as conn:
-                    conn.execute("UPDATE distillation_audit SET status = ?, error = ? WHERE recent_id = ?", ("stale", "recent hash changed", row["recent_id"]))
-                    conn.commit()
-                skipped += 1
-                continue
-            if not _source_raw_matches(root, record):
-                skipped += 1
-                continue
-            if memory.validate_store(root)[1]:
-                skipped += 1
-                continue
-            result = json.loads(row.get("result_json") or "{}")
-            if result.get("unresolved_conflicts"):
-                skipped += 1
-                continue
-            if dry_run:
-                would_delete += 1
-                continue
-            path.unlink()
-            memory.index_store(type("Args", (), {"root": str(root), "state_dir": str(state), "dry_run": False})())
-            with _db_connect(db) as conn:
-                conn.execute(
-                    "UPDATE distillation_audit SET status = ?, deleted_at = ?, error = NULL WHERE recent_id = ?",
-                    ("deleted", today.isoformat(), row["recent_id"]),
-                )
-                conn.commit()
-            deleted += 1
-    return {"deleted": deleted, "skipped": skipped, "would_delete": would_delete, "dry_run": dry_run}
+                raise final
+            previous_code = feedback["code"]
+    final = DistillError("max_iterations_reached", "max_iterations_reached", False, "review")
+    _append_journal(
+        root, run_id=run_id, status="max_iterations_reached", iteration=max_iterations,
+        max_iterations=max_iterations, input_hash=input_hash, errors=[final.feedback],
+        stop_reason="max_iterations_reached", next_action="review",
+        resume_command=f"memory_distill.py resume --root {root} --run-id {run_id}",
+    )
+    raise final
 
 
-def status(args):
-    _, _, db = _state(args.root, Path(args.state_dir))
-    with _db_connect(db) as conn:
-        rows = conn.execute("SELECT status, COUNT(*) FROM distillation_audit GROUP BY status").fetchall()
-    return {"audit": dict(rows)}
+def _require_candidate(records, candidate_id):
+    item = records.get(candidate_id)
+    if item is None:
+        raise ValueError("candidate not found")
+    if item["record"].get("status") != "candidate":
+        raise ValueError("memory is not awaiting candidate review")
+    return item
 
 
-def daily(args):
-    prepared = prepare(args)
-    return {"prepared": prepared["count"], "purge": purge(args)}
+def _check_source(root, record):
+    source_path = record.get("source_path")
+    source_sha256 = record.get("source_sha256")
+    if not source_path or not source_sha256:
+        return
+    path = root / source_path
+    if not path.is_file():
+        raise DistillError("missing_source", "source file not found", True, "restore_source")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != source_sha256:
+        raise DistillError("raw_integrity_violation", "source hash changed", False, "review_raw_source")
+
+
+def _reviewed(record, status, audit_status, reason=None):
+    reviewed = dict(record)
+    reviewed["status"] = status
+    reviewed["audit_status"] = audit_status
+    reviewed["updated"] = _today()
+    reviewed["reviewed_at"] = _today()
+    if reason is not None:
+        reviewed["review_reason"] = reason
+    return reviewed
+
+
+def accept_candidate(args):
+    root, records = _records_by_id(args.root)
+    candidate_item = _require_candidate(records, args.id)
+    candidate = dict(candidate_item["record"])
+    action = candidate.get("candidate_action")
+    requested_action = candidate.get("requested_action", action)
+    target_id = candidate.get("target_id")
+    target_item = records.get(target_id) if target_id else None
+    run_id = next(
+        (
+            entry["run_id"] for entry in reversed(_journal_entries(root))
+            if candidate["id"] in entry.get("proposal_ids", [])
+        ),
+        uuid.uuid4().hex,
+    )
+    try:
+        _check_source(root, candidate)
+        if action in {"UPDATE", "DEPRECATE"}:
+            if target_item is None:
+                raise DistillError("stale_target", "target memory no longer exists", False, "regenerate_proposal")
+            expected_status = candidate.get("expected_target_status")
+            expected_sha256 = candidate.get("expected_target_sha256")
+            current_sha256 = hashlib.sha256(target_item["path"].read_bytes()).hexdigest()
+            if target_item["record"].get("status") != expected_status or current_sha256 != expected_sha256:
+                raise DistillError("stale_target", "target memory changed after proposal", False, "regenerate_proposal")
+
+        operations = []
+        expected = []
+        if requested_action == "context_transition":
+            try:
+                new_record = json.loads(candidate["new_record_json"])
+                new_path = root / TYPE_DIRS[new_record["type"]] / f"{new_record['id']}-{safe_slug(new_record['title'])}.md"
+                valid_until = (date.fromisoformat(candidate["effective_date"]) - timedelta(days=1)).isoformat()
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise DistillError("invalid_schema", "transition proposal is incomplete", False, "regenerate_proposal") from exc
+            if new_path.exists():
+                raise DistillError("stale_target", "planned context path already exists", False, "regenerate_proposal")
+            target = dict(target_item["record"])
+            target["status"] = "deprecated"
+            target["updated"] = _today()
+            target["valid_until"] = valid_until
+            target["superseded_by"] = _merge_unique(_list(target.get("superseded_by")), [new_record["id"]])
+            new_record["status"] = "active"
+            new_record["supersedes"] = _merge_unique(_list(new_record.get("supersedes")), [target["id"]])
+            final = _reviewed(candidate, "archived", "accepted")
+            operations.extend(
+                [
+                    (target_item["path"], render_existing_memory(target_item["path"], target)),
+                    (new_path, render_memory(new_record)),
+                    (candidate_item["path"], render_existing_memory(candidate_item["path"], final)),
+                ]
+            )
+            expected.extend([(target_item["path"], target), (new_path, new_record), (candidate_item["path"], final)])
+        elif action == "ADD":
+            final = _reviewed(candidate, "active", "accepted")
+            operations.append((candidate_item["path"], render_existing_memory(candidate_item["path"], final)))
+            expected.append((candidate_item["path"], final))
+        elif requested_action == "merge":
+            target = dict(target_item["record"])
+            for field in SAFE_MERGE_LISTS:
+                target[field] = _merge_unique(_list(target.get(field)), _list(candidate.get(field)))
+            target["updated"] = _today()
+            final = _reviewed(candidate, "archived", "accepted")
+            operations.extend(
+                [
+                    (target_item["path"], render_existing_memory(target_item["path"], target)),
+                    (candidate_item["path"], render_existing_memory(candidate_item["path"], final)),
+                ]
+            )
+            expected.extend([(target_item["path"], target), (candidate_item["path"], final)])
+        elif requested_action == "support":
+            target = dict(target_item["record"])
+            target["source_refs"] = _merge_unique(_list(target.get("source_refs")), _list(candidate.get("source_refs")) + _list(candidate.get("evidence")))
+            target["updated"] = _today()
+            final = _reviewed(candidate, "archived", "accepted")
+            operations.extend(
+                [
+                    (target_item["path"], render_existing_memory(target_item["path"], target)),
+                    (candidate_item["path"], render_existing_memory(candidate_item["path"], final)),
+                ]
+            )
+            expected.extend([(target_item["path"], target), (candidate_item["path"], final)])
+        elif action in {"UPDATE", "DEPRECATE"}:
+            target = dict(target_item["record"])
+            target["status"] = "deprecated"
+            target["updated"] = _today()
+            target["superseded_by"] = _merge_unique(_list(target.get("superseded_by")), [candidate["id"]])
+            final = _reviewed(candidate, "active", "accepted")
+            final["supersedes"] = _merge_unique(_list(final.get("supersedes")), [target["id"]])
+            operations.extend(
+                [
+                    (target_item["path"], render_existing_memory(target_item["path"], target)),
+                    (candidate_item["path"], render_existing_memory(candidate_item["path"], final)),
+                ]
+            )
+            expected.extend([(target_item["path"], target), (candidate_item["path"], final)])
+        elif action == "REVIEW_REQUIRED":
+            final = _reviewed(candidate, "conflict", "conflict")
+            operations.append((candidate_item["path"], render_existing_memory(candidate_item["path"], final)))
+            expected.append((candidate_item["path"], final))
+        else:
+            final = _reviewed(candidate, "archived", "rejected", "discarded by candidate action")
+            operations.append((candidate_item["path"], render_existing_memory(candidate_item["path"], final)))
+            expected.append((candidate_item["path"], final))
+
+        replacements = {path: record for path, record in expected}
+        hypothetical = [
+            {**item, "record": replacements.get(item["path"], item["record"])}
+            for item in records.values()
+        ]
+        existing_paths = {item["path"] for item in records.values()}
+        hypothetical.extend(
+            {"path": path, "relative_path": path.relative_to(root).as_posix(), "record": record}
+            for path, record in expected if path not in existing_paths
+        )
+        validation_errors = _validate_hypothetical_records(root, hypothetical)
+        if validation_errors:
+            message = "; ".join(f"{path}: {error}" for path, error in validation_errors)
+            raise DistillError("invalid_transition", message, False, "regenerate_proposal")
+
+        _apply_files_and_index(root, args.state_dir, operations, expected)
+    except DistillError as exc:
+        _append_journal(
+            root, run_id=run_id, status=exc.feedback["code"], iteration=1, max_iterations=2,
+            input_hash=hashlib.sha256(candidate["id"].encode()).hexdigest(),
+            proposal_ids=[candidate["id"]], errors=[exc.feedback], stop_reason=exc.feedback["code"],
+            next_action=exc.feedback["next_action"],
+            resume_command=f"memory_distill.py resume --root {root} --run-id {run_id}",
+        )
+        raise
+    _append_journal(
+        root, run_id=run_id, status="completed", iteration=1, max_iterations=2,
+        input_hash=hashlib.sha256(candidate["id"].encode()).hexdigest(),
+        proposal_ids=[candidate["id"]], stop_reason="completed", next_action=None,
+        resume_command=f"memory_distill.py resume --root {root} --run-id {run_id}",
+    )
+    return {"candidate_id": candidate["id"], "action": action, "run_id": run_id, "status": "completed"}
+
+
+def reject_candidate(args):
+    root, records = _records_by_id(args.root)
+    candidate_item = _require_candidate(records, args.id)
+    final = _reviewed(candidate_item["record"], "archived", "rejected", args.reason)
+    _replace_transaction([(candidate_item["path"], render_existing_memory(candidate_item["path"], final))], [])
+    return {"candidate_id": args.id, "status": "archived", "audit_status": "rejected"}
+
+
+def review_candidates(args):
+    root, records = _records_by_id(args.root)
+    rows = [
+        {
+            "id": item["record"]["id"],
+            "action": item["record"].get("candidate_action"),
+            "target_id": item["record"].get("target_id"),
+            "title": item["record"]["title"],
+            "relative_path": item["relative_path"],
+        }
+        for item in records.values()
+        if item["record"].get("status") == "candidate"
+    ]
+    rows.sort(key=lambda row: row["id"])
+    return rows
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Codex memory distillation lifecycle.")
-    sub = parser.add_subparsers(dest="command", required=True)
-    for name in ["prepare", "apply", "purge", "daily", "status"]:
-        item = sub.add_parser(name)
-        item.add_argument("--root", required=True)
-        item.add_argument("--state-dir", required=True)
-        item.add_argument("--today")
-        item.add_argument("--json", action="store_true", dest="json_output")
-        if name == "prepare":
-            item.add_argument("--dry-run", action="store_true")
-        if name == "purge":
-            item.add_argument("--dry-run", action="store_true")
-        if name == "apply":
-            item.add_argument("--task-dir", required=True)
-    run = sub.add_parser("run")
-    run.add_argument("--task-dir", required=True)
-    run.add_argument("--codex-bin", default="codex")
-    run.add_argument("--timeout", type=int, default=120)
-    run.add_argument("--json", action="store_true", dest="json_output")
+    parser = argparse.ArgumentParser(description="Review distilled candidate memories.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    apply_parser = subparsers.add_parser("apply", help="Write a candidate memory for review.")
+    apply_parser.add_argument("--root", required=True)
+    apply_parser.add_argument("--state-dir", default=str(default_state_dir()))
+    apply_parser.add_argument("--action", required=True, choices=sorted(REVIEW_ACTIONS))
+    apply_parser.add_argument("--confirmed", action="store_true")
+    apply_parser.add_argument("--dry-run", action="store_true")
+    apply_parser.add_argument("--max-iterations", type=int, default=2)
+    apply_parser.add_argument("--type", required=True, choices=TYPE_CHOICES)
+    apply_parser.add_argument("--title", required=True)
+    apply_parser.add_argument("--scope", required=True, choices=SCOPE_CHOICES)
+    apply_parser.add_argument("--workspace", required=True, choices=WORKSPACE_CHOICES)
+    apply_parser.add_argument("--confidentiality", required=True, choices=CONFIDENTIALITY_CHOICES)
+    apply_parser.add_argument("--source", required=True)
+    apply_parser.add_argument("--confidence", default="inferred", choices=CONFIDENCE_CHOICES)
+    apply_parser.add_argument("--content", required=True)
+    apply_parser.add_argument("--target-id")
+    apply_parser.add_argument("--project")
+    apply_parser.add_argument("--context-id")
+    apply_parser.add_argument("--source-id")
+    apply_parser.add_argument("--source-path")
+    apply_parser.add_argument("--source-sha256")
+    apply_parser.add_argument("--evidence", nargs="*")
+    apply_parser.add_argument("--source-refs", nargs="*")
+    apply_parser.add_argument("--relations", nargs="*")
+    apply_parser.add_argument("--tags", nargs="*")
+
+    review_parser = subparsers.add_parser("review", help="List candidate memories.")
+    review_parser.add_argument("--root", required=True)
+    review_parser.add_argument("--json", action="store_true")
+
+    accept_parser = subparsers.add_parser("accept", help="Accept a candidate memory.")
+    accept_parser.add_argument("--root", required=True)
+    accept_parser.add_argument("--state-dir", default=str(default_state_dir()))
+    accept_parser.add_argument("--id", required=True)
+
+    reject_parser = subparsers.add_parser("reject", help="Reject a candidate memory.")
+    reject_parser.add_argument("--root", required=True)
+    reject_parser.add_argument("--id", required=True)
+    reject_parser.add_argument("--reason", required=True)
+
+    resume_parser = subparsers.add_parser("resume", help="Read the durable state of a distill run.")
+    resume_parser.add_argument("--root", required=True)
+    resume_parser.add_argument("--run-id", required=True)
     return parser
 
 
 def main(argv=None):
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    args = build_parser().parse_args(argv)
     try:
-        if args.command == "prepare":
-            summary = prepare(args)
-        elif args.command == "run":
-            summary = run_task(args)
-        elif args.command == "apply":
-            summary = apply(args)
-        elif args.command == "purge":
-            summary = purge(args)
-        elif args.command == "daily":
-            summary = daily(args)
-        elif args.command == "status":
-            summary = status(args)
+        if args.command == "apply":
+            summary = apply_candidate(args)
+            if summary.get("candidate_id"):
+                print(f"candidate_id: {summary['candidate_id']}")
+            if summary.get("path"):
+                print(f"path: {summary['path']}")
+            print(f"Run: {summary['run_id']}")
+            print(f"Action: {summary['action']}")
+            print(f"Status: {summary['status']}")
+        elif args.command == "review":
+            rows = review_candidates(args)
+            if args.json:
+                print(json.dumps(rows, ensure_ascii=False, indent=2))
+            else:
+                for row in rows:
+                    print(f"{row['id']} {row['action']} {row['title']}")
+                print(f"Candidates: {len(rows)}")
+        elif args.command == "accept":
+            summary = accept_candidate(args)
+            print(f"Accepted: {summary['candidate_id']}")
+            print(f"Action: {summary['action']}")
+        elif args.command == "resume":
+            summary = resume_run(args)
+            print(f"Run: {summary['run_id']}")
+            print(f"Status: {summary['status']}")
         else:
-            parser.error("unknown command")
-            return 2
-        if getattr(args, "json_output", False):
-            print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
-        else:
-            for key, value in summary.items():
-                print(f"{key}: {value}")
+            summary = reject_candidate(args)
+            print(f"Rejected: {summary['candidate_id']}")
         return 0
-    except (OSError, ValueError, sqlite3.DatabaseError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+    except DistillError as exc:
+        print(json.dumps(exc.feedback, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+        return 1
+    except (OSError, ValueError, sqlite3.DatabaseError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 

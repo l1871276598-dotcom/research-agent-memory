@@ -1,3 +1,4 @@
+import argparse
 import json
 import hashlib
 import importlib.util
@@ -8,12 +9,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing, contextmanager
 from unittest import mock
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MEMORY_CLI = REPO_ROOT / "src" / "memory.py"
+DISTILL_CLI = REPO_ROOT / "src" / "memory_distill.py"
 CSV_HEADER = "id,doi,title,authors,journal,year,status,pdf_path,note_path,project,tags"
 
 
@@ -22,6 +25,28 @@ def load_memory_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def finish_add_fixture(root, result, status="active"):
+    if result.returncode != 0:
+        return result
+    memory_id = re.search(r"memory_id: (.+)", result.stdout).group(1)
+    if status == "candidate":
+        return result
+    if status != "active":
+        for path in (Path(root) / "memory").rglob("*.md"):
+            text = path.read_text(encoding="utf-8")
+            if f'id: "{memory_id}"' in text:
+                path.write_text(text.replace('status: "candidate"', f'status: "{status}"', 1), encoding="utf-8")
+                return result
+        raise AssertionError(f"missing fixture memory {memory_id}")
+    state = Path(root).parent / "state"
+    if not (state / "memory.sqlite").is_file():
+        return result
+    return subprocess.run(
+        [sys.executable, str(DISTILL_CLI), "accept", "--root", str(root), "--state-dir", str(state), "--id", memory_id],
+        capture_output=True, text=True, cwd=REPO_ROOT,
+    )
 
 EXPECTED_DIRS = [
     "memory/profile",
@@ -42,6 +67,13 @@ EXPECTED_DIRS = [
     "exports/database_snapshots",
     "backups",
 ]
+
+
+@contextmanager
+def sqlite_connection(path):
+    with closing(sqlite3.connect(path)) as conn:
+        with conn:
+            yield conn
 
 
 class InitCommandTests(unittest.TestCase):
@@ -122,6 +154,7 @@ class AddCommandTests(unittest.TestCase):
     def run_add(self, root, *extra):
         base = [
             "add",
+            "--confirmed",
             "--root",
             str(root),
             "--type",
@@ -175,6 +208,48 @@ class AddCommandTests(unittest.TestCase):
             self.assertIn("# 代码最少原则", text)
             self.assertIn("该记忆的结构化内容保存在 front matter 的 content 字段中。", text)
             self.assertIn(str(created.relative_to(root)), result.stdout)
+
+    def test_add_defaults_to_candidate_without_explicit_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            result = self.run_cli(
+                "add", "--root", str(root), "--type", "principle", "--title", "Candidate default",
+                "--scope", "global", "--workspace", "personal", "--confidentiality", "personal",
+                "--source", "codex", "--confidence", "inferred", "--content", "candidate content",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            text = self.memory_files(root)[0].read_text(encoding="utf-8")
+            self.assertIn('status: "candidate"', text)
+
+    def test_add_confirmed_remains_candidate_and_preserves_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            result = self.run_add(root)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            text = self.memory_files(root)[0].read_text(encoding="utf-8")
+            self.assertIn('status: "candidate"', text)
+            self.assertIn('source: "user"', text)
+            self.assertNotIn('source: "manual:user_confirmed"', text)
+            self.assertIn("Review/accept required", result.stdout)
+
+    def test_add_confirmed_codex_cannot_create_active_or_rewrite_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            result = self.run_cli(
+                "add", "--confirmed", "--root", str(root), "--type", "principle",
+                "--title", "Codex proposal", "--scope", "global", "--workspace", "personal",
+                "--confidentiality", "personal", "--source", "codex", "--confidence", "confirmed",
+                "--content", "proposal content", "--status", "active",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            text = self.memory_files(root)[0].read_text(encoding="utf-8")
+            self.assertIn('status: "candidate"', text)
+            self.assertIn('source: "codex"', text)
+            self.assertNotIn('status: "active"', text)
+            self.assertNotIn('source: "manual:user_confirmed"', text)
 
     def test_add_same_title_twice_creates_distinct_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -389,6 +464,7 @@ class ValidateCommandTests(unittest.TestCase):
     def run_add(self, root, memory_type="principle", title="代码最少原则", scope="global", **kwargs):
         args = [
             "add",
+            "--confirmed",
             "--root",
             str(root),
             "--type",
@@ -479,9 +555,8 @@ class ValidateCommandTests(unittest.TestCase):
             self.assertEqual(self.run_init(root).returncode, 0)
             self.assertEqual(self.run_add(root).returncode, 0)
             path = self.first_memory_file(root)
-            text = path.read_text(encoding="utf-8")
-            created_line = re.search(r'^created: "\d{4}-\d{2}-\d{2}"$', text, re.MULTILINE).group(0)
-            self.replace_in_file(path, created_line, 'created: "2026-02-30"')
+            line = re.search(r'^created: "\d{4}-\d{2}-\d{2}"\n', path.read_text(encoding="utf-8"), re.MULTILINE).group(0)
+            self.replace_in_file(path, line, 'created: "2026-02-30"\n')
 
             result = self.run_validate(root)
 
@@ -594,6 +669,8 @@ class ValidateCommandTests(unittest.TestCase):
             self.assertEqual(self.run_init(root).returncode, 0)
             self.assertEqual(self.run_add(root, "context", "一", "context", context_id="ctx-1").returncode, 0)
             self.assertEqual(self.run_add(root, "context", "二", "context", context_id="ctx-2").returncode, 0)
+            for path in self.memory_files(root):
+                self.replace_in_file(path, 'status: "candidate"', 'status: "active"')
 
             result = self.run_validate(root)
 
@@ -737,37 +814,19 @@ class ContextTransitionCommandTests(unittest.TestCase):
         return self.run_cli(*(base + list(extra)))
 
     def run_add_context(self, root, context_id, title="研究生阶段", workspace="personal", confidentiality="personal", status="active", valid_from="2023-09-01", content="当前处于研究生科研阶段。"):
-        args = [
-            "add",
-            "--root",
-            str(root),
-            "--type",
-            "context",
-            "--title",
-            title,
-            "--scope",
-            "context",
-            "--workspace",
-            workspace,
-            "--confidentiality",
-            confidentiality,
-            "--source",
-            "user",
-            "--confidence",
-            "confirmed",
-            "--content",
-            content,
-            "--context-id",
-            context_id,
-            "--valid-from",
-            valid_from,
-            "--tags",
-            "education",
-            "research",
-            "--status",
-            status,
-        ]
-        return self.run_cli(*args)
+        module = load_memory_module()
+        memory_id = f"context-fixture-{hashlib.sha256(context_id.encode()).hexdigest()[:8]}"
+        path = root / "memory/contexts" / f"{memory_id}-{module.safe_slug(title)}.md"
+        record = {
+            "id": memory_id, "type": "context", "title": title,
+            "created": "2026-06-27", "updated": "2026-06-27", "status": status,
+            "scope": "context", "workspace": workspace, "confidentiality": confidentiality,
+            "source": "test:fixture", "confidence": "confirmed", "content": content,
+            "context_id": context_id, "valid_from": valid_from,
+            "tags": ["education", "research"],
+        }
+        module.atomic_write_text(path, module.render_memory(record))
+        return subprocess.CompletedProcess([], 0, "", "")
 
     def records(self, root):
         module = load_memory_module()
@@ -799,7 +858,37 @@ class ContextTransitionCommandTests(unittest.TestCase):
     def all_names(self, root):
         return sorted(path.name for path in (root / "memory").rglob("*") if path.is_file())
 
-    def test_context_transition_same_workspace_updates_source_and_creates_records(self):
+    def test_context_transition_creates_one_candidate_without_changing_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data-root"
+            self.assertEqual(self.run_init(root).returncode, 0)
+            self.assertEqual(self.run_add_context(root, "university-student").returncode, 0)
+            source_path, source = self.record_by_context(root, "university-student")
+            source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+
+            result = self.run_transition(
+                root, "--source", "codex", "--confidence", "inferred",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(hashlib.sha256(source_path.read_bytes()).hexdigest(), source_hash)
+            self.assertEqual(self.record_by_context(root, "university-student")[1]["status"], "active")
+            self.assertEqual(len(self.records(root)), 2)
+            [(candidate_path, candidate)] = self.transition_records(root)
+            self.assertEqual(candidate["status"], "candidate")
+            self.assertEqual(candidate["audit_status"], "awaiting_review")
+            self.assertEqual(candidate["source"], "codex")
+            self.assertEqual(candidate["confidence"], "inferred")
+            self.assertEqual(candidate["target_id"], source["id"])
+            self.assertEqual(candidate["expected_target_status"], "active")
+            self.assertEqual(candidate["expected_target_sha256"], source_hash)
+            self.assertEqual(len(candidate["proposal_input_hash"]), 64)
+            new_record = json.loads(candidate["new_record_json"])
+            self.assertEqual(new_record["context_id"], "industry-engineer")
+            self.assertEqual(new_record["status"], "active")
+            self.assertIn(str(candidate_path.relative_to(root)), result.stdout)
+
+    def test_context_transition_same_workspace_leaves_source_active_and_creates_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "data-root"
             self.assertEqual(self.run_init(root).returncode, 0)
@@ -809,18 +898,15 @@ class ContextTransitionCommandTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             source_path, source = self.record_by_context(root, "university-student")
-            target_path, target = self.record_by_context(root, "industry-engineer")
             transitions = self.transition_records(root)
-            self.assertEqual(source["status"], "historical")
-            self.assertEqual(source["valid_until"], "2027-06-30")
-            self.assertEqual(target["status"], "active")
-            self.assertEqual(target_path.parent, root / "memory" / "contexts")
+            self.assertEqual(source["status"], "active")
+            self.assertNotIn("valid_until", source)
+            self.assertEqual([record for _, record in self.records(root) if record.get("context_id") == "industry-engineer"], [])
             self.assertEqual(len(transitions), 1)
-            self.assertIn(source["id"], target["supersedes"])
-            self.assertIn(target["id"], source["superseded_by"])
-            self.assertIn(f"Updated: {source_path.relative_to(root)}", result.stdout)
+            self.assertEqual(transitions[0][1]["status"], "candidate")
+            self.assertIn(f"Source unchanged: {source_path.relative_to(root)}", result.stdout)
 
-    def test_context_transition_cross_workspace_creates_work_context(self):
+    def test_context_transition_cross_workspace_records_planned_work_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "data-root"
             self.assertEqual(self.run_init(root).returncode, 0)
@@ -829,7 +915,8 @@ class ContextTransitionCommandTests(unittest.TestCase):
             result = self.run_transition(root)
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            _, target = self.record_by_context(root, "industry-engineer")
+            [( _, candidate)] = self.transition_records(root)
+            target = json.loads(candidate["new_record_json"])
             self.assertEqual(target["workspace"], "work")
             self.assertEqual(target["confidentiality"], "internal")
             self.assertEqual(self.run_validate(root).returncode, 0)
@@ -847,7 +934,7 @@ class ContextTransitionCommandTests(unittest.TestCase):
             after_body = source_path.read_text(encoding="utf-8").split("---", 2)[2]
             self.assertEqual(after_body, before_body)
 
-    def test_context_transition_sets_supersession_links(self):
+    def test_context_transition_candidate_records_planned_supersession(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "data-root"
             self.assertEqual(self.run_init(root).returncode, 0)
@@ -856,8 +943,9 @@ class ContextTransitionCommandTests(unittest.TestCase):
             self.assertEqual(self.run_transition(root).returncode, 0)
 
             _, source = self.record_by_context(root, "university-student")
-            _, target = self.record_by_context(root, "industry-engineer")
-            self.assertEqual(source["superseded_by"], [target["id"]])
+            [(_, candidate)] = self.transition_records(root)
+            target = json.loads(candidate["new_record_json"])
+            self.assertNotIn("superseded_by", source)
             self.assertEqual(target["supersedes"], [source["id"]])
 
     def test_context_transition_record_contains_required_fields(self):
@@ -1030,33 +1118,12 @@ class ContextTransitionCommandTests(unittest.TestCase):
 
             self.assertFalse([name for name in self.all_names(root) if name.startswith(".tmp-")])
 
-    def test_context_transition_rolls_back_when_create_fails_before_source_replace(self):
+    def test_context_transition_candidate_write_failure_keeps_source_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "data-root"
             module = load_memory_module()
             self.assertEqual(module.init_store(root)[0], root.resolve())
-            add_args = mock.Mock(
-                root=str(root),
-                type="context",
-                title="研究生阶段",
-                scope="context",
-                workspace="personal",
-                confidentiality="personal",
-                source="user",
-                confidence="confirmed",
-                content="当前处于研究生科研阶段。",
-                status="active",
-                context_id="university-student",
-                project=None,
-                valid_from="2023-09-01",
-                valid_until=None,
-                tags=["education", "research"],
-                from_context=None,
-                to_context=None,
-                effective_date=None,
-                reason=None,
-            )
-            module.add_memory(add_args)
+            self.assertEqual(self.run_add_context(root, "university-student").returncode, 0)
             before = self.hashes(root)
             transition_args = mock.Mock(
                 root=str(root),
@@ -1074,16 +1141,20 @@ class ContextTransitionCommandTests(unittest.TestCase):
                 dry_run=False,
             )
 
-            original_replace = Path.replace
-            calls = []
+            original_replace = module.os.replace
+            calls = 0
+            failed = False
 
-            def fail_second_replace(path, target):
-                calls.append(Path(target).name)
-                if len(calls) == 2:
+            def fail_first_replace(path, target):
+                nonlocal calls, failed
+                if Path(path).name.startswith(".tmp-"):
+                    calls += 1
+                if calls == 1 and not failed:
+                    failed = True
                     raise OSError("disk full")
                 return original_replace(path, target)
 
-            with mock.patch.object(Path, "replace", fail_second_replace):
+            with mock.patch.object(module.os, "replace", side_effect=fail_first_replace):
                 with self.assertRaises(OSError):
                     module.context_transition(transition_args)
 
@@ -1109,6 +1180,7 @@ class DbInitCommandTests(unittest.TestCase):
     def run_add(self, root):
         return self.run_cli(
             "add",
+            "--confirmed",
             "--root",
             str(root),
             "--type",
@@ -1133,19 +1205,22 @@ class DbInitCommandTests(unittest.TestCase):
         return state_dir / "memory.sqlite"
 
     def sqlite_objects(self, db):
-        with sqlite3.connect(db) as conn:
+        with sqlite_connection(db) as conn:
             return dict(
                 conn.execute(
                     """
                     SELECT name, type
                     FROM sqlite_master
-                    WHERE name IN ('memories', 'memory_fts', 'index_state')
+                    WHERE name IN (
+                        'memories', 'memory_fts', 'index_state',
+                        'documents', 'document_fts', 'document_index_state'
+                    )
                     """
                 ).fetchall()
             )
 
     def columns(self, db, table):
-        with sqlite3.connect(db) as conn:
+        with sqlite_connection(db) as conn:
             return [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
 
     def test_db_init_creates_database(self):
@@ -1168,7 +1243,7 @@ class DbInitCommandTests(unittest.TestCase):
             self.assertEqual(self.run_db_init(root, state_dir).returncode, 0)
             db = self.db_path(state_dir)
 
-            with sqlite3.connect(db) as conn:
+            with sqlite_connection(db) as conn:
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
                 mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
                 objects = self.sqlite_objects(db)
@@ -1181,30 +1256,33 @@ class DbInitCommandTests(unittest.TestCase):
                     ("代码*",),
                 ).fetchall()
 
-            self.assertEqual(version, 2)
+            self.assertEqual(version, 3)
             self.assertEqual(mode.lower(), "wal")
-            self.assertEqual(objects, {"memories": "table", "memory_fts": "table", "index_state": "table"})
+            self.assertEqual(
+                objects,
+                {
+                    "memories": "table",
+                    "memory_fts": "table",
+                    "index_state": "table",
+                    "documents": "table",
+                    "document_fts": "table",
+                    "document_index_state": "table",
+                },
+            )
             self.assertEqual(
                 self.columns(db, "memories"),
                 [
                     "id",
-                    "schema",
-                    "tier",
                     "type",
                     "title",
                     "content",
-                    "body",
                     "tags",
-                    "aliases",
                     "status",
                     "scope",
                     "workspace",
                     "confidentiality",
                     "source",
                     "confidence",
-                    "source_id",
-                    "source_path",
-                    "source_sha256",
                     "context_id",
                     "project",
                     "valid_from",
@@ -1213,11 +1291,32 @@ class DbInitCommandTests(unittest.TestCase):
                     "updated",
                     "relative_path",
                     "sha256",
-                    "metadata_json",
                 ],
             )
             self.assertEqual(
                 self.columns(db, "index_state"),
+                ["relative_path", "sha256", "mtime_ns", "indexed_at"],
+            )
+            self.assertEqual(
+                self.columns(db, "documents"),
+                [
+                    "id",
+                    "source_kind",
+                    "source_id",
+                    "title",
+                    "content",
+                    "workspace",
+                    "confidentiality",
+                    "project",
+                    "context_id",
+                    "updated",
+                    "relative_path",
+                    "sha256",
+                    "metadata_json",
+                ],
+            )
+            self.assertEqual(
+                self.columns(db, "document_index_state"),
                 ["relative_path", "sha256", "mtime_ns", "indexed_at"],
             )
             self.assertEqual(result, [("probe",)])
@@ -1374,7 +1473,7 @@ class DbInitCommandTests(unittest.TestCase):
             state_dir = Path(tmp) / "state"
             state_dir.mkdir()
             db = self.db_path(state_dir)
-            with sqlite3.connect(db) as conn:
+            with sqlite_connection(db) as conn:
                 conn.execute("PRAGMA user_version = 2")
             before = db.read_bytes()
             self.assertEqual(self.run_init(root).returncode, 0)
@@ -1405,7 +1504,7 @@ class DbInitCommandTests(unittest.TestCase):
             self.assertEqual(self.run_init(root).returncode, 0)
             self.assertEqual(self.run_db_init(root, state_dir).returncode, 0)
             db = self.db_path(state_dir)
-            with sqlite3.connect(db) as conn:
+            with sqlite_connection(db) as conn:
                 conn.execute(
                     """
                     INSERT INTO memories (
@@ -1436,7 +1535,7 @@ class DbInitCommandTests(unittest.TestCase):
             result = self.run_db_init(root, state_dir)
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            with sqlite3.connect(db) as conn:
+            with sqlite_connection(db) as conn:
                 rows = conn.execute("SELECT id FROM memories").fetchall()
             self.assertEqual(rows, [("m1",)])
 
@@ -1485,6 +1584,7 @@ class IndexCommandTests(unittest.TestCase):
     def run_add(self, root, **kwargs):
         args = [
             "add",
+            "--confirmed",
             "--root",
             str(root),
             "--type",
@@ -1524,7 +1624,7 @@ class IndexCommandTests(unittest.TestCase):
         return sorted(path for path in (root / "memory").rglob("*.md") if path.is_file())
 
     def counts(self, db):
-        with sqlite3.connect(db) as conn:
+        with sqlite_connection(db) as conn:
             return {
                 "memories": conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0],
                 "memory_fts": conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0],
@@ -1532,7 +1632,7 @@ class IndexCommandTests(unittest.TestCase):
             }
 
     def rows(self, db, sql, params=()):
-        with sqlite3.connect(db) as conn:
+        with sqlite_connection(db) as conn:
             return conn.execute(sql, params).fetchall()
 
     def db_hash(self, db):
@@ -1649,7 +1749,7 @@ class IndexCommandTests(unittest.TestCase):
             root, state_dir, db = self.setup_store(tmp)
             self.assertEqual(self.run_add(root).returncode, 0)
             self.assertEqual(self.run_index(root, state_dir).returncode, 0)
-            with sqlite3.connect(db) as conn:
+            with sqlite_connection(db) as conn:
                 conn.execute("DELETE FROM memory_fts")
 
             result = self.run_index(root, state_dir)
@@ -1662,7 +1762,7 @@ class IndexCommandTests(unittest.TestCase):
             root, state_dir, db = self.setup_store(tmp)
             self.assertEqual(self.run_add(root).returncode, 0)
             self.assertEqual(self.run_index(root, state_dir).returncode, 0)
-            with sqlite3.connect(db) as conn:
+            with sqlite_connection(db) as conn:
                 conn.execute("DELETE FROM memories")
 
             result = self.run_index(root, state_dir)
@@ -1810,7 +1910,7 @@ class IndexCommandTests(unittest.TestCase):
             self.assertEqual(sorted(path.name for path in state_dir.iterdir()), ["memory.sqlite"])
 
 
-class SearchCommandTests(unittest.TestCase):
+class UnifiedSearchCommandTests(unittest.TestCase):
     def run_cli(self, *args):
         return subprocess.run(
             [sys.executable, str(MEMORY_CLI), *args],
@@ -1825,15 +1925,32 @@ class SearchCommandTests(unittest.TestCase):
     def run_db_init(self, root, state_dir):
         return self.run_cli("db-init", "--root", str(root), "--state-dir", str(state_dir))
 
-    def run_index(self, root, state_dir):
-        return self.run_cli("index", "--root", str(root), "--state-dir", str(state_dir))
+    def run_db_rebuild(self, root, state_dir):
+        return self.run_cli("db-rebuild", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_index(self, root, state_dir, *extra):
+        return self.run_cli("index", "--root", str(root), "--state-dir", str(state_dir), *extra)
 
     def run_search(self, root, state_dir, query, *extra):
-        return self.run_cli("search", query, "--root", str(root), "--state-dir", str(state_dir), *extra)
+        return self.run_cli(
+            "search",
+            query,
+            "--root",
+            str(root),
+            "--state-dir",
+            str(state_dir),
+            "--json",
+            *extra,
+        )
+
+    def run_doctor(self, root, state_dir):
+        return self.run_cli("doctor", "--root", str(root), "--state-dir", str(state_dir), "--json")
 
     def run_add(self, root, **kwargs):
+        status = kwargs.pop("status", "active")
         args = [
             "add",
+            "--confirmed",
             "--root",
             str(root),
             "--type",
@@ -1852,8 +1969,6 @@ class SearchCommandTests(unittest.TestCase):
             "confirmed",
             "--content",
             kwargs.pop("content", "使用尽可能少的代码实现相同功能。"),
-            "--status",
-            kwargs.pop("status", "active"),
         ]
         for option, value in kwargs.items():
             flag = "--" + option.replace("_", "-")
@@ -1862,313 +1977,744 @@ class SearchCommandTests(unittest.TestCase):
                 args.extend(value)
             elif value is not None:
                 args.extend([flag, value])
-        return self.run_cli(*args)
+        return finish_add_fixture(root, self.run_cli(*args), status)
 
-    def setup_store(self, tmp, index=True):
+    def setup_store(self, tmp):
         root = Path(tmp) / "data"
         state_dir = Path(tmp) / "state"
         self.assertEqual(self.run_init(root).returncode, 0)
         self.assertEqual(self.run_db_init(root, state_dir).returncode, 0)
-        if index:
-            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
         return root, state_dir, state_dir / "memory.sqlite"
 
-    def setup_one_memory(self, tmp, **kwargs):
-        root, state_dir, db = self.setup_store(tmp, index=False)
-        self.assertEqual(self.run_add(root, **kwargs).returncode, 0)
-        self.assertEqual(self.run_index(root, state_dir).returncode, 0)
-        return root, state_dir, db
+    def rows(self, db, sql, params=()):
+        with sqlite_connection(db) as conn:
+            return conn.execute(sql, params).fetchall()
 
-    def memory_files(self, root):
-        return sorted(path for path in (root / "memory").rglob("*.md") if path.is_file())
+    def write_document(self, root, relative, body, front_matter=None):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if front_matter:
+            lines = ["---"]
+            for key, value in front_matter.items():
+                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+            lines.extend(["---", "", body])
+            path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        else:
+            path.write_text(body, encoding="utf-8")
+        return path
 
-    def db_hash(self, db):
-        return hashlib.sha256(db.read_bytes()).hexdigest()
-
-    def db_sidecars(self, db):
-        return [Path(str(db) + suffix) for suffix in ("-wal", "-shm")]
-
-    def source_hashes(self, root):
-        return {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in self.memory_files(root)}
-
-    def replace_in_file(self, path, old, new):
-        text = path.read_text(encoding="utf-8")
-        self.assertIn(old, text)
-        path.write_text(text.replace(old, new, 1), encoding="utf-8")
-
-    def json_search(self, root, state_dir, query, *extra):
-        result = self.run_search(root, state_dir, query, "--json", *extra)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        return json.loads(result.stdout), result.stdout
-
-    def test_search_finds_chinese_term(self):
+    def test_db_init_creates_schema_v3_document_tables(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_one_memory(tmp)
-            result = self.run_search(root, state_dir, "代码")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("Results: 1", result.stdout)
-            self.assertIn("代码最少原则", result.stdout)
+            root, _, db = self.setup_store(tmp)
 
-    def test_search_finds_long_chinese_query(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_one_memory(tmp)
-            result = self.run_search(root, state_dir, "代码最少原则")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("Results: 1", result.stdout)
+            [(version,)] = self.rows(db, "PRAGMA user_version")
+            tables = {name for (name,) in self.rows(db, "SELECT name FROM sqlite_master WHERE type IN ('table', 'virtual table')")}
 
-    def test_search_rejects_single_chinese_character(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, db = self.setup_one_memory(tmp)
-            before = self.db_hash(db)
-            result = self.run_search(root, state_dir, "代")
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Chinese search terms must contain at least 2 consecutive characters.", result.stderr)
-            self.assertEqual(self.db_hash(db), before)
+            self.assertEqual(version, 3)
+            self.assertIn("documents", tables)
+            self.assertIn("document_fts", tables)
+            self.assertIn("document_index_state", tables)
 
-    def test_search_finds_english_term(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_one_memory(tmp, title="Minimal Code Principle", content="Prefer simple code.")
-            result = self.run_search(root, state_dir, "simple")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("Minimal Code Principle", result.stdout)
-
-    def test_search_returns_zero_for_no_match(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_one_memory(tmp)
-            result = self.run_search(root, state_dir, "不存在")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(result.stdout.strip(), "Results: 0")
-
-    def test_search_default_workspace_is_personal(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_store(tmp, index=False)
-            self.assertEqual(self.run_add(root, title="个人代码原则").returncode, 0)
-            self.assertEqual(self.run_add(root, title="工作代码原则", workspace="work", confidentiality="internal").returncode, 0)
-            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
-            result = self.run_search(root, state_dir, "代码")
-            self.assertIn("个人代码原则", result.stdout)
-            self.assertNotIn("工作代码原则", result.stdout)
-
-    def test_search_work_workspace(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_one_memory(tmp, title="工作代码原则", workspace="work", confidentiality="internal")
-            result = self.run_search(root, state_dir, "代码", "--workspace", "work")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("工作代码原则", result.stdout)
-
-    def test_search_excludes_restricted_by_default(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_one_memory(tmp, title="受限代码原则", workspace="work", confidentiality="restricted")
-            result = self.run_search(root, state_dir, "代码", "--workspace", "work")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(result.stdout.strip(), "Results: 0")
-
-    def test_search_includes_restricted_when_explicit(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_one_memory(tmp, title="受限代码原则", workspace="work", confidentiality="restricted")
-            result = self.run_search(root, state_dir, "代码", "--workspace", "work", "--include-restricted")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("受限代码原则", result.stdout)
-
-    def test_search_rejects_restricted_in_personal_workspace(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_store(tmp)
-            result = self.run_search(root, state_dir, "代码", "--include-restricted")
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("--include-restricted requires --workspace work", result.stderr)
-
-    def test_search_filters_type(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_store(tmp, index=False)
-            self.assertEqual(self.run_add(root, title="原则代码", memory_type="principle").returncode, 0)
-            self.assertEqual(self.run_add(root, title="会话代码", memory_type="session", scope="project", project="demo").returncode, 0)
-            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
-            result = self.run_search(root, state_dir, "代码", "--type", "session")
-            self.assertIn("会话代码", result.stdout)
-            self.assertNotIn("原则代码", result.stdout)
-
-    def test_search_filters_project(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_store(tmp, index=False)
-            self.assertEqual(self.run_add(root, title="Alpha 代码", memory_type="session", scope="project", project="alpha").returncode, 0)
-            self.assertEqual(self.run_add(root, title="Beta 代码", memory_type="session", scope="project", project="beta").returncode, 0)
-            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
-            result = self.run_search(root, state_dir, "代码", "--project", "alpha")
-            self.assertIn("Alpha 代码", result.stdout)
-            self.assertNotIn("Beta 代码", result.stdout)
-
-    def test_search_filters_context_id(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_one_memory(tmp, title="情景代码", memory_type="context", scope="context", context_id="ctx-a")
-            result = self.run_search(root, state_dir, "代码", "--context-id", "ctx-a")
-            self.assertIn("情景代码", result.stdout)
-
-    def test_search_default_status_is_active(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_store(tmp, index=False)
-            self.assertEqual(self.run_add(root, title="Active 代码").returncode, 0)
-            self.assertEqual(self.run_add(root, title="Historical 代码", status="historical").returncode, 0)
-            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
-            result = self.run_search(root, state_dir, "代码")
-            self.assertIn("Active 代码", result.stdout)
-            self.assertNotIn("Historical 代码", result.stdout)
-
-    def test_search_include_historical(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_store(tmp, index=False)
-            self.assertEqual(self.run_add(root, title="Active 代码").returncode, 0)
-            self.assertEqual(self.run_add(root, title="Historical 代码", status="historical").returncode, 0)
-            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
-            result = self.run_search(root, state_dir, "代码", "--include-historical")
-            self.assertIn("Active 代码", result.stdout)
-            self.assertIn("Historical 代码", result.stdout)
-
-    def test_search_explicit_status(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_one_memory(tmp, title="Archived 代码", status="archived")
-            result = self.run_search(root, state_dir, "代码", "--status", "archived")
-            self.assertIn("Archived 代码", result.stdout)
-
-    def test_search_respects_limit(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_store(tmp, index=False)
-            for title in ["A 代码", "B 代码", "C 代码"]:
-                self.assertEqual(self.run_add(root, title=title).returncode, 0)
-            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
-            data, _ = self.json_search(root, state_dir, "代码", "--limit", "2")
-            self.assertEqual(data["count"], 2)
-            self.assertEqual([row["id"] for row in data["results"]], sorted(row["id"] for row in data["results"]))
-
-    def test_search_rejects_invalid_limit(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_store(tmp)
-            for value in ["0", "101", "not-int"]:
-                result = self.run_search(root, state_dir, "代码", "--limit", value)
-                self.assertNotEqual(result.returncode, 0)
-
-    def test_search_json_output(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_one_memory(tmp)
-            data, text = self.json_search(root, state_dir, "代码")
-            self.assertTrue(text.endswith("\n"))
-            self.assertEqual(data["query"], "代码")
-            self.assertEqual(data["workspace"], "personal")
-            self.assertEqual(data["count"], 1)
-            self.assertEqual(set(data["results"][0]), {"id", "title", "type", "status", "scope", "workspace", "confidentiality", "project", "context_id", "updated", "relative_path", "score", "excerpt"})
-            self.assertNotIn("content", data["results"][0])
-
-    def test_search_json_is_deterministic(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_one_memory(tmp)
-            first = self.run_search(root, state_dir, "代码", "--json")
-            second = self.run_search(root, state_dir, "代码", "--json")
-            self.assertEqual(first.stdout.encode("utf-8"), second.stdout.encode("utf-8"))
-
-    def test_search_excerpt_uses_original_content(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            content = "前缀" * 80 + "使用尽可能少的代码实现相同功能。" + "后缀" * 80
-            root, state_dir, _ = self.setup_one_memory(tmp, content=content)
-            data, _ = self.json_search(root, state_dir, "代码")
-            excerpt = data["results"][0]["excerpt"]
-            self.assertLessEqual(len(excerpt), 180)
-            self.assertNotIn("代 码", excerpt)
-            self.assertIn("代码", excerpt)
-
-    def test_search_ranks_title_match_above_content_match(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_store(tmp, index=False)
-            self.assertEqual(self.run_add(root, title="无关标题", content="内容包含代码关键词。").returncode, 0)
-            self.assertEqual(self.run_add(root, title="代码标题", content="普通内容。").returncode, 0)
-            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
-            data, _ = self.json_search(root, state_dir, "代码")
-            self.assertEqual(data["results"][0]["title"], "代码标题")
-
-    def test_search_rejects_stale_index_after_add(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_one_memory(tmp)
-            self.assertEqual(self.run_add(root, title="新增代码").returncode, 0)
-            result = self.run_search(root, state_dir, "代码")
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Search aborted because the index is stale. Run index first.", result.stderr)
-
-    def test_search_rejects_stale_index_after_edit(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_one_memory(tmp)
-            self.replace_in_file(self.memory_files(root)[0], "使用尽可能少的代码实现相同功能。", "内容已经变化。")
-            result = self.run_search(root, state_dir, "代码")
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Search aborted because the index is stale. Run index first.", result.stderr)
-
-    def test_search_rejects_stale_index_after_delete(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_one_memory(tmp)
-            self.memory_files(root)[0].unlink()
-            result = self.run_search(root, state_dir, "代码")
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Search aborted because the index is stale. Run index first.", result.stderr)
-
-    def test_search_rejects_missing_fts_row(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, db = self.setup_one_memory(tmp)
-            with sqlite3.connect(db) as conn:
-                conn.execute("DELETE FROM memory_fts")
-                conn.commit()
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            for sidecar in self.db_sidecars(db):
-                sidecar.unlink(missing_ok=True)
-            result = self.run_search(root, state_dir, "代码")
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Search aborted because the index is stale. Run index first.", result.stderr)
-
-    def test_search_requires_initialized_database(self):
+    def test_db_rebuild_creates_schema_v3_and_indexes_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "data"
             state_dir = Path(tmp) / "state"
             self.assertEqual(self.run_init(root).returncode, 0)
-            result = self.run_search(root, state_dir, "代码")
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Database is not initialized. Run db-init first.", result.stderr)
+            self.assertEqual(self.run_add(root, title="代码最少原则", content="使用尽可能少的代码实现相同功能。").returncode, 0)
+            self.write_document(root, "imports/chatgpt/conversations/2026/06/thread.md", "PDC raw conversation evidence")
 
-    def test_search_requires_indexed_database(self):
+            result = self.run_db_rebuild(root, state_dir)
+            db = state_dir / "memory.sqlite"
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Database rebuilt", result.stdout)
+            [(version,)] = self.rows(db, "PRAGMA user_version")
+            self.assertEqual(version, 3)
+            self.assertEqual(self.rows(db, "SELECT COUNT(*) FROM memories"), [(1,)])
+            self.assertEqual(self.rows(db, "SELECT COUNT(*) FROM documents"), [(1,)])
+
+    def test_index_adds_memory_and_documents(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_store(tmp, index=False)
+            root, state_dir, db = self.setup_store(tmp)
             self.assertEqual(self.run_add(root).returncode, 0)
-            result = self.run_search(root, state_dir, "代码")
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Search aborted because the index is stale. Run index first.", result.stderr)
+            self.write_document(root, "imports/chatgpt/conversations/2026/06/thread.md", "PDC raw conversation evidence")
+            self.write_document(root, "imports/manual/raw/note.txt", "Manual raw note about PDC review cadence")
+            self.write_document(root, "literature/notes/pdc-note.md", "PDC literature note for target journal", {"project": "ljq"})
+            self.write_document(root, "manuscripts/current/paper.md", "Manuscript sentence about impact angle", {"project": "ljq"})
 
-    def test_search_empty_store(self):
+            result = self.run_index(root, state_dir)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.rows(db, "SELECT COUNT(*) FROM memories"), [(1,)])
+            self.assertEqual(self.rows(db, "SELECT COUNT(*) FROM documents"), [(4,)])
+            self.assertIn("Documents added: 4", result.stdout)
+
+    def test_search_defaults_to_memory_and_documents(self):
         with tempfile.TemporaryDirectory() as tmp:
             root, state_dir, _ = self.setup_store(tmp)
-            result = self.run_search(root, state_dir, "code")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(result.stdout.strip(), "Results: 0")
+            self.assertEqual(self.run_add(root, title="PDC principle", content="PDC evidence must be traceable.").returncode, 0)
+            self.write_document(root, "manuscripts/current/pdc-paper.md", "PDC manuscript sentence with traceable evidence")
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
 
-    def test_search_does_not_modify_database(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, db = self.setup_one_memory(tmp)
-            before_hash = self.db_hash(db)
-            before_mtime = db.stat().st_mtime_ns
-            self.assertFalse(any(path.exists() for path in self.db_sidecars(db)))
-            result = self.run_search(root, state_dir, "代码")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(self.db_hash(db), before_hash)
-            self.assertEqual(db.stat().st_mtime_ns, before_mtime)
-            self.assertFalse(any(path.exists() for path in self.db_sidecars(db)))
+            result = self.run_search(root, state_dir, "PDC")
 
-    def test_search_does_not_modify_source_files(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_one_memory(tmp)
-            before = self.source_hashes(root)
-            self.assertEqual(self.run_search(root, state_dir, "代码").returncode, 0)
-            self.assertEqual(self.source_hashes(root), before)
-
-    def test_search_escapes_fts_syntax(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, state_dir, _ = self.setup_one_memory(tmp, title="OR NEAR star 代码", content="safe query text")
-            result = self.run_search(root, state_dir, '" OR (NEAR*) 代码')
-            self.assertNotIn("Traceback", result.stderr)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            rows = json.loads(result.stdout)["results"]
+            kinds = {row["kind"] for row in rows}
+            self.assertIn("memory", kinds)
+            self.assertIn("document", kinds)
+            self.assertTrue(all(row["confidentiality"] != "restricted" for row in rows))
+
+    def test_search_supports_kind_source_and_project_filters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            self.write_document(root, "literature/notes/pdc-note.md", "PDC literature note", {"project": "ljq"})
+            self.write_document(root, "manuscripts/current/pdc-paper.md", "PDC manuscript sentence", {"project": "other"})
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            result = self.run_search(root, state_dir, "PDC", "--kind", "document", "--source-kind", "literature", "--project", "ljq")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            rows = json.loads(result.stdout)["results"]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["kind"], "document")
+            self.assertEqual(rows[0]["source_kind"], "literature")
+            self.assertEqual(rows[0]["project"], "ljq")
+
+    def test_search_does_not_return_restricted_documents_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            self.write_document(root, "manuscripts/current/public.md", "PDC public manuscript", {"project": "ljq"})
+            self.write_document(
+                root,
+                "manuscripts/evidence/restricted.md",
+                "PDC restricted evidence",
+                {"workspace": "work", "confidentiality": "restricted", "project": "ljq"},
+            )
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            result = self.run_search(root, state_dir, "PDC", "--kind", "document", "--project", "ljq")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            rows = json.loads(result.stdout)["results"]
+            self.assertEqual([row["relative_path"] for row in rows], ["manuscripts/current/public.md"])
+
+    def test_search_enforces_inactive_restricted_and_project_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            common = {"content": "BoundarySafetyProbe durable evidence"}
+            projects = [
+                self.run_add(root, memory_type="project", title="PDC project", project="pdc", scope="project"),
+                self.run_add(root, memory_type="project", title="Other project", project="other", scope="project"),
+            ]
+            self.assertTrue(all(result.returncode == 0 for result in projects), [result.stderr for result in projects])
+            additions = [
+                self.run_add(root, title="global active", **common),
+                self.run_add(root, title="global restricted", confidentiality="restricted", workspace="work", **common),
+                self.run_add(root, title="global deprecated", status="deprecated", **common),
+                self.run_add(root, title="pdc active", project="pdc", scope="project", **common),
+                self.run_add(root, title="other active", project="other", scope="project", **common),
+            ]
+            self.assertTrue(all(result.returncode == 0 for result in additions), [result.stderr for result in additions])
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            default = self.run_search(root, state_dir, "BoundarySafetyProbe", "--kind", "memory")
+            self.assertEqual(default.returncode, 0, default.stdout + default.stderr)
+            self.assertEqual({row["title"] for row in json.loads(default.stdout)["results"]}, {"global active"})
+
+            project = self.run_search(root, state_dir, "BoundarySafetyProbe", "--kind", "memory", "--project", "pdc")
+            self.assertEqual(project.returncode, 0, project.stdout + project.stderr)
+            self.assertEqual({row["title"] for row in json.loads(project.stdout)["results"]}, {"global active", "pdc active"})
+
+            opted_in = self.run_search(
+                root, state_dir, "BoundarySafetyProbe", "--kind", "memory",
+                "--include-restricted", "--include-inactive",
+            )
+            self.assertEqual(opted_in.returncode, 0, opted_in.stdout + opted_in.stderr)
+            self.assertEqual(
+                {row["title"] for row in json.loads(opted_in.stdout)["results"]},
+                {"global active", "global restricted", "global deprecated"},
+            )
+
+    def test_search_supports_manual_text_chatgpt_literature_and_manuscript_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            self.write_document(
+                root,
+                "imports/chatgpt/conversations/2026/06/thread.md",
+                "PDC ChatGPT archive discussion",
+                {"conversation_id": "thread-1", "title": "Archive Thread"},
+            )
+            self.write_document(root, "imports/manual/text/note.md", "PDC manual text note")
+            self.write_document(root, "literature/notes/pdc-note.md", "PDC literature note")
+            self.write_document(root, "manuscripts/current/paper.md", "PDC manuscript sentence")
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            for source_kind, expected_path in [
+                ("chatgpt", "imports/chatgpt/conversations/2026/06/thread.md"),
+                ("manual", "imports/manual/text/note.md"),
+                ("literature", "literature/notes/pdc-note.md"),
+                ("manuscript", "manuscripts/current/paper.md"),
+            ]:
+                with self.subTest(source_kind=source_kind):
+                    result = self.run_search(root, state_dir, "PDC", "--kind", "document", "--source-kind", source_kind)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    rows = json.loads(result.stdout)["results"]
+                    self.assertEqual([row["relative_path"] for row in rows], [expected_path])
+
+    def test_manual_text_sidecar_wins_over_raw_and_binary_raw_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            self.write_document(root, "imports/manual/raw/2026/06/abcd-note.txt", "PDC duplicate raw")
+            self.write_document(
+                root,
+                "imports/manual/text/2026/06/abcd-note.md",
+                "PDC duplicate text",
+                {
+                    "source_path": "imports/manual/raw/2026/06/abcd-note.txt",
+                    "source_sha256": "0" * 64,
+                    "original_name": "note.txt",
+                    "media_type": "text/plain",
+                    "extractor": "utf-8",
+                    "imported_at": "2026-06-24T00:00:00+00:00",
+                },
+            )
+            binary = root / "imports/manual/raw/2026/06/file.pdf"
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_bytes(b"%PDF-\xff\x00PDC")
+
+            result = self.run_index(root, state_dir)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.rows(db, "SELECT relative_path FROM documents ORDER BY relative_path"), [("imports/manual/text/2026/06/abcd-note.md",)])
+            self.assertEqual(self.rows(db, "SELECT COUNT(*) FROM document_fts"), [(1,)])
+            metadata = json.loads(self.rows(db, "SELECT metadata_json FROM documents")[0][0])
+            self.assertEqual(metadata["source_path"], "imports/manual/raw/2026/06/abcd-note.txt")
+
+    def test_index_tracks_document_update_delete_and_avoids_duplicate_fts_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, db = self.setup_store(tmp)
+            note = self.write_document(root, "imports/manual/raw/note.txt", "PDC first version")
+
+            first = self.run_index(root, state_dir)
+            second = self.run_index(root, state_dir)
+
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertIn("Documents added: 1", first.stdout)
+            self.assertIn("Documents unchanged: 1", second.stdout)
+            self.assertEqual(self.rows(db, "SELECT COUNT(*) FROM document_fts"), [(1,)])
+
+            note.write_text("PDC second version", encoding="utf-8")
+            updated = self.run_index(root, state_dir)
+            self.assertEqual(updated.returncode, 0, updated.stdout + updated.stderr)
+            self.assertIn("Documents updated: 1", updated.stdout)
+            self.assertEqual(self.rows(db, "SELECT COUNT(*) FROM document_fts"), [(1,)])
+
+            note.unlink()
+            deleted = self.run_index(root, state_dir)
+            self.assertEqual(deleted.returncode, 0, deleted.stdout + deleted.stderr)
+            self.assertIn("Documents deleted: 1", deleted.stdout)
+            self.assertEqual(self.rows(db, "SELECT COUNT(*) FROM documents"), [(0,)])
+            self.assertEqual(self.rows(db, "SELECT COUNT(*) FROM document_fts"), [(0,)])
+
+    def test_search_supports_workspace_filter_and_rejects_stale_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            doc = self.write_document(root, "manuscripts/current/work.md", "PDC work manuscript", {"workspace": "work"})
+            self.write_document(root, "manuscripts/current/personal.md", "PDC personal manuscript", {"workspace": "personal"})
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            filtered = self.run_search(root, state_dir, "PDC", "--kind", "document", "--workspace", "work")
+
+            self.assertEqual(filtered.returncode, 0, filtered.stdout + filtered.stderr)
+            rows = json.loads(filtered.stdout)["results"]
+            self.assertEqual([row["relative_path"] for row in rows], ["manuscripts/current/work.md"])
+
+            doc.write_text("PDC changed work manuscript", encoding="utf-8")
+            stale = self.run_search(root, state_dir, "PDC", "--kind", "document")
+
+            self.assertNotEqual(stale.returncode, 0)
+            self.assertIn("Search aborted because the index is stale. Run index first.", stale.stderr)
+
+    def test_doctor_reports_stale_index_hash_mismatch_and_manual_orphans(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            doc = self.write_document(root, "imports/manual/raw/note.txt", "PDC raw note")
+            self.write_document(root, "imports/manual/text/orphan.md", "PDC orphan text")
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            doc.write_text("PDC changed raw note", encoding="utf-8")
+
+            result = self.run_doctor(root, state_dir)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            summary = json.loads(result.stdout)
+            self.assertTrue(summary["memory_index_fresh"])
+            self.assertFalse(summary["document_index_fresh"])
+            self.assertEqual(summary["manual_orphan_raw"], [])
+            self.assertEqual(summary["manual_orphan_text"], ["orphan"])
+            self.assertEqual(summary["raw_files"], 1)
+            self.assertEqual(summary["supported_documents"], 2)
+            self.assertEqual(summary["hash_mismatches"], [{"kind": "document", "relative_path": "imports/manual/raw/note.txt"}])
+
+
+class ProjectGovernanceCommandTests(unittest.TestCase):
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(MEMORY_CLI), *args],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+
+    def run_init(self, root):
+        return self.run_cli("init", "--root", str(root))
+
+    def run_db_init(self, root, state_dir):
+        return self.run_cli("db-init", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_index(self, root, state_dir):
+        return self.run_cli("index", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_add(self, root, memory_type="principle", title="记忆", scope="global", content="内容", **kwargs):
+        status = kwargs.pop("status", "active")
+        args = [
+            "add",
+            "--confirmed",
+            "--root",
+            str(root),
+            "--type",
+            memory_type,
+            "--title",
+            title,
+            "--scope",
+            scope,
+            "--workspace",
+            kwargs.pop("workspace", "personal"),
+            "--confidentiality",
+            kwargs.pop("confidentiality", "personal"),
+            "--source",
+            "user",
+            "--confidence",
+            kwargs.pop("confidence", "confirmed"),
+            "--content",
+            content,
+        ]
+        for option, value in kwargs.items():
+            if value is not None:
+                args.extend(["--" + option.replace("_", "-"), value])
+        return finish_add_fixture(root, self.run_cli(*args), status)
+
+    def setup_store(self, tmp):
+        root = Path(tmp) / "data"
+        state_dir = Path(tmp) / "state"
+        self.assertEqual(self.run_init(root).returncode, 0)
+        self.assertEqual(self.run_db_init(root, state_dir).returncode, 0)
+        return root, state_dir
+
+    def search(self, root, state_dir, query, *extra):
+        result = self.run_cli("search", query, "--root", str(root), "--state-dir", str(state_dir), "--json", *extra)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return json.loads(result.stdout)["results"]
+
+    def write_document(self, root, relative, text):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_project_scoped_memory_requires_registered_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self.setup_store(tmp)
+
+            missing = self.run_add(root, title="项目事实", scope="project", project="pdc")
+
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("project does not reference an active project", missing.stderr)
+
+            project = self.run_add(root, memory_type="project", title="PDC 项目", scope="project", project="pdc")
+            self.assertEqual(project.returncode, 0, project.stdout + project.stderr)
+            fact = self.run_add(root, title="项目事实", scope="project", project="pdc")
+            self.assertEqual(fact.returncode, 0, fact.stdout + fact.stderr)
+
+    def test_rejects_multiple_active_project_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root, memory_type="project", title="PDC 项目", scope="project", project="pdc").returncode, 0)
+
+            duplicate = self.run_add(root, memory_type="project", title="PDC 项目 2", scope="project", project="pdc")
+
+            self.assertNotEqual(duplicate.returncode, 0)
+            self.assertIn("multiple active project records", duplicate.stderr)
+
+    def test_document_metadata_controls_project_and_workspace_filters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.write_document(root, "imports/manual/raw/note.txt", "PDC metadata controlled document")
+            result = self.run_cli(
+                "document-meta",
+                "set",
+                "--root",
+                str(root),
+                "--path",
+                "imports/manual/raw/note.txt",
+                "--project",
+                "pdc",
+                "--workspace",
+                "work",
+                "--confidentiality",
+                "internal",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            personal = self.search(root, state_dir, "PDC", "--kind", "document", "--workspace", "personal")
+            work = self.search(root, state_dir, "PDC", "--kind", "document", "--workspace", "work", "--project", "pdc")
+
+            self.assertEqual(personal, [])
+            self.assertEqual([row["relative_path"] for row in work], ["imports/manual/raw/note.txt"])
+
+    def test_document_metadata_changes_are_reindexed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.write_document(root, "imports/manual/text/note.md", "PDC metadata reindex document")
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            self.assertEqual(
+                [row["relative_path"] for row in self.search(root, state_dir, "PDC", "--kind", "document", "--project", "pdc")],
+                ["imports/manual/text/note.md"],
+            )
+
+            result = self.run_cli(
+                "document-meta",
+                "set",
+                "--root",
+                str(root),
+                "--path",
+                "imports/manual/text/note.md",
+                "--project",
+                "pdc",
+                "--workspace",
+                "personal",
+                "--confidentiality",
+                "personal",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            self.assertEqual(
+                [row["relative_path"] for row in self.search(root, state_dir, "PDC", "--kind", "document", "--project", "pdc")],
+                ["imports/manual/text/note.md"],
+            )
+
+            result = self.run_cli("document-meta", "unset", "--root", str(root), "--path", "imports/manual/text/note.md")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            self.assertEqual(
+                [row["relative_path"] for row in self.search(root, state_dir, "PDC", "--kind", "document", "--project", "pdc")],
+                ["imports/manual/text/note.md"],
+            )
+
+    def test_search_as_of_context_and_project_isolation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root, memory_type="context", title="Context A", scope="context", context_id="ctx-a", content="ctx").returncode, 0)
+            self.assertEqual(self.run_add(root, memory_type="context", title="Context B", scope="context", context_id="ctx-b", content="ctx", status="historical").returncode, 0)
+            self.assertEqual(self.run_add(root, memory_type="project", title="PDC 项目", scope="project", project="pdc").returncode, 0)
+            self.assertEqual(self.run_add(root, memory_type="project", title="Other 项目", scope="project", project="other").returncode, 0)
+            self.assertEqual(self.run_add(root, title="Global principle", content="PDC shared principle").returncode, 0)
+            self.assertEqual(self.run_add(root, title="PDC current", scope="project", project="pdc", content="PDC scoped current", valid_from="2026-01-01", valid_until="2026-12-31").returncode, 0)
+            self.assertEqual(self.run_add(root, title="Other current", scope="project", project="other", content="PDC other project").returncode, 0)
+            self.assertEqual(self.run_add(root, title="Context A fact", scope="context", context_id="ctx-a", content="PDC context A").returncode, 0)
+            self.assertEqual(self.run_add(root, title="Context B fact", scope="context", context_id="ctx-b", content="PDC context B").returncode, 0)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            rows = self.search(root, state_dir, "PDC", "--project", "pdc", "--context-id", "ctx-a", "--as-of", "2026-06-01")
+            paths = {row["relative_path"] for row in rows}
+
+            self.assertTrue(any(row["temporal_status"] == "current" for row in rows))
+            self.assertTrue(any(row["scope"] == "global" for row in rows if row["kind"] == "memory"))
+            self.assertFalse(any("other" in (row["project"] or "") for row in rows))
+            self.assertFalse(any(row.get("context_id") == "ctx-b" for row in rows))
+            self.assertFalse(any("Other current" in row["title"] for row in rows))
+            self.assertFalse(any("Context B fact" in row["title"] for row in rows))
+
+            expired = self.search(root, state_dir, "PDC scoped current", "--project", "pdc", "--as-of", "2027-01-01")
+            self.assertEqual(expired, [])
+
+    def test_project_status_counts_project_health(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.assertEqual(self.run_add(root, memory_type="project", title="PDC 项目", scope="project", project="pdc").returncode, 0)
+            self.assertEqual(self.run_add(root, title="PDC fact", scope="project", project="pdc", content="PDC fact", valid_until="2025-01-01").returncode, 0)
+            self.write_document(root, "imports/manual/raw/pdc.txt", "PDC doc")
+            self.write_document(root, "imports/manual/raw/unassigned.txt", "Unassigned doc")
+            self.assertEqual(self.run_cli("document-meta", "set", "--root", str(root), "--path", "imports/manual/raw/pdc.txt", "--project", "pdc").returncode, 0)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            result = self.run_cli("project-status", "--root", str(root), "--state-dir", str(state_dir), "--project", "pdc", "--json")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            summary = json.loads(result.stdout)
+            self.assertEqual(summary["project"], "pdc")
+            self.assertEqual(summary["project_memories"], 2)
+            self.assertEqual(summary["documents"], 1)
+            self.assertEqual(summary["unassigned_documents"], 1)
+            self.assertEqual(summary["expired"], 1)
+
+
+class ContextPackCommandTests(unittest.TestCase):
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(MEMORY_CLI), *args],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+
+    def run_init(self, root):
+        return self.run_cli("init", "--root", str(root))
+
+    def run_db_init(self, root, state_dir):
+        return self.run_cli("db-init", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_index(self, root, state_dir):
+        return self.run_cli("index", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_add(self, root, memory_type="principle", title="记忆", scope="global", content="内容", **kwargs):
+        args = [
+            "add",
+            "--confirmed",
+            "--root",
+            str(root),
+            "--type",
+            memory_type,
+            "--title",
+            title,
+            "--scope",
+            scope,
+            "--workspace",
+            kwargs.pop("workspace", "personal"),
+            "--confidentiality",
+            kwargs.pop("confidentiality", "personal"),
+            "--source",
+            "user",
+            "--confidence",
+            kwargs.pop("confidence", "confirmed"),
+            "--content",
+            content,
+        ]
+        for option, value in kwargs.items():
+            if value is not None:
+                args.extend(["--" + option.replace("_", "-"), value])
+        result = self.run_cli(*args)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        accepted = finish_add_fixture(root, result)
+        self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+        return re.search(r"memory_id: (.+)", result.stdout).group(1)
+
+    def setup_store(self, tmp):
+        root = Path(tmp) / "data"
+        state_dir = Path(tmp) / "state"
+        self.assertEqual(self.run_init(root).returncode, 0)
+        self.assertEqual(self.run_db_init(root, state_dir).returncode, 0)
+        return root, state_dir
+
+    def write_document(self, root, relative, text, front_matter=None):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if front_matter:
+            lines = ["---"]
+            for key, value in front_matter.items():
+                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+            lines.extend(["---", "", text])
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        else:
+            path.write_text(text, encoding="utf-8")
+        return path
+
+    def context_pack(self, root, state_dir, query, *extra):
+        result = self.run_cli("context", query, "--root", str(root), "--state-dir", str(state_dir), "--format", "json", *extra)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return json.loads(result.stdout)
+
+    def test_context_pack_schema_order_and_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.run_add(root, memory_type="project", title="PDC 项目", scope="project", project="pdc", content="PDC project skeleton")
+            self.run_add(root, title="Global principle", content="PDC global principle")
+            self.run_add(root, memory_type="decision", title="Project decision", scope="project", project="pdc", content="PDC project decision")
+            self.write_document(root, "manuscripts/current/pdc.md", "PDC manuscript evidence", {"project": "pdc"})
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            pack = self.context_pack(root, state_dir, "PDC", "--project", "pdc", "--workspace", "personal")
+
+            self.assertEqual(list(pack)[:4], ["schema", "query", "generated_at", "workspace"])
+            self.assertEqual(pack["schema"], "context-pack/v1")
+            self.assertEqual(pack["project"], "pdc")
+            self.assertTrue(pack["project_memories"])
+            self.assertTrue(pack["query_memories"])
+            self.assertTrue(pack["evidence_documents"])
+            self.assertTrue(all("id" in source and "source_path" in source for source in pack["sources"]))
+
+    def test_context_pack_has_zero_project_and_restricted_leakage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.run_add(root, memory_type="project", title="PDC 项目", scope="project", project="pdc", content="PDC")
+            self.run_add(root, memory_type="project", title="Other 项目", scope="project", project="other", content="PDC")
+            self.run_add(root, title="PDC keep", scope="project", project="pdc", content="PDC keep")
+            self.run_add(root, title="PDC other", scope="project", project="other", content="PDC leak")
+            self.write_document(root, "manuscripts/current/pdc.md", "PDC visible evidence", {"project": "pdc"})
+            self.write_document(root, "manuscripts/evidence/restricted.md", "PDC restricted evidence", {"project": "pdc", "workspace": "work", "confidentiality": "restricted"})
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            pack = self.context_pack(root, state_dir, "PDC", "--project", "pdc", "--workspace", "personal")
+            text = json.dumps(pack, ensure_ascii=False)
+
+            self.assertNotIn("PDC leak", text)
+            self.assertNotIn("restricted evidence", text)
+
+    def test_context_pack_rejects_stale_index_and_respects_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.run_add(root, title="Budget", content="PDC " + "x" * 1000)
+            doc = self.write_document(root, "imports/manual/raw/note.txt", "PDC " + "y" * 1000)
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            small = self.run_cli("context", "PDC", "--root", str(root), "--state-dir", str(state_dir), "--format", "json", "--max-chars", "900")
+            self.assertEqual(small.returncode, 0, small.stdout + small.stderr)
+            self.assertLessEqual(len(small.stdout), 900)
+            self.assertTrue(json.loads(small.stdout)["truncated"])
+
+            doc.write_text("PDC changed", encoding="utf-8")
+            stale = self.run_cli("context", "PDC", "--root", str(root), "--state-dir", str(state_dir), "--format", "json")
+            self.assertNotEqual(stale.returncode, 0)
+            self.assertIn("index is stale", stale.stderr)
+
+    def test_context_pack_markdown_and_output_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.run_add(root, title="Markdown", content="PDC markdown memory")
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            output = Path(tmp) / "context.md"
+
+            result = self.run_cli("context", "PDC", "--root", str(root), "--state-dir", str(state_dir), "--format", "markdown", "--output", output)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, "")
+            text = output.read_text(encoding="utf-8")
+            self.assertIn("# Context Pack", text)
+            self.assertIn("PDC markdown memory", text)
+
+
+class RetrievalEvaluationCommandTests(unittest.TestCase):
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(MEMORY_CLI), *args],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+
+    def run_init(self, root):
+        return self.run_cli("init", "--root", str(root))
+
+    def run_db_init(self, root, state_dir):
+        return self.run_cli("db-init", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_index(self, root, state_dir):
+        return self.run_cli("index", "--root", str(root), "--state-dir", str(state_dir))
+
+    def run_add(self, root, title, content, **kwargs):
+        args = [
+            "add",
+            "--confirmed",
+            "--root",
+            str(root),
+            "--type",
+            kwargs.pop("memory_type", "principle"),
+            "--title",
+            title,
+            "--scope",
+            kwargs.pop("scope", "global"),
+            "--workspace",
+            kwargs.pop("workspace", "personal"),
+            "--confidentiality",
+            kwargs.pop("confidentiality", "personal"),
+            "--source",
+            "user",
+            "--confidence",
+            "confirmed",
+            "--content",
+            content,
+        ]
+        for option, value in kwargs.items():
+            if value is not None:
+                args.extend(["--" + option.replace("_", "-"), value])
+        result = self.run_cli(*args)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        accepted = finish_add_fixture(root, result)
+        self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+        return re.search(r"memory_id: (.+)", result.stdout).group(1)
+
+    def setup_store(self, tmp):
+        root = Path(tmp) / "data"
+        state_dir = Path(tmp) / "state"
+        self.assertEqual(self.run_init(root).returncode, 0)
+        self.assertEqual(self.run_db_init(root, state_dir).returncode, 0)
+        return root, state_dir
+
+    def test_evaluate_search_reports_metrics_and_zero_leakage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.run_add(root, "代码最少原则", "使用尽可能少的代码实现相同功能。")
+            self.run_add(root, "Work internal", "代码最少 internal", workspace="work", confidentiality="internal")
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+            cases = Path(tmp) / "cases.json"
+            cases.write_text(
+                json.dumps(
+                    {
+                        "cases": [
+                            {"query": "代码最少", "expected_ids": ["代码最少原则"], "workspace": "personal", "synonym": True},
+                            {"query": "missing phrase", "expected_ids": [], "workspace": "personal"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            result = self.run_cli("evaluate-search", "--root", str(root), "--state-dir", str(state_dir), "--cases", cases, "--mode", "lexical", "--json")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            metrics = json.loads(result.stdout)
+            self.assertEqual(metrics["mode"], "lexical")
+            self.assertEqual(metrics["case_count"], 2)
+            self.assertEqual(metrics["restricted_leak_rate"], 0)
+            self.assertEqual(metrics["project_leak_rate"], 0)
+            self.assertGreaterEqual(metrics["top5"], metrics["top1"])
+            self.assertIn("p95_latency_ms", metrics)
+
+    def test_search_hybrid_falls_back_to_lexical_without_embeddings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir = self.setup_store(tmp)
+            self.run_add(root, "Hybrid", "PDC hybrid fallback")
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            result = self.run_cli("search", "PDC", "--root", str(root), "--state-dir", str(state_dir), "--mode", "hybrid", "--json")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            rows = payload["results"]
+            self.assertTrue(rows)
+            self.assertEqual(payload["requested_mode"], "hybrid")
+            self.assertEqual(payload["effective_mode"], "lexical")
+            self.assertTrue(payload["warnings"])
+            self.assertIn("falling back to lexical", result.stderr)
+
+    def test_retrieval_eval_template_exists(self):
+        template = REPO_ROOT / "templates" / "retrieval_eval.json"
+        self.assertTrue(template.is_file())
+        data = json.loads(template.read_text(encoding="utf-8"))
+        self.assertIn("cases", data)
 
 
 class ExportCommandTests(unittest.TestCase):
@@ -2189,6 +2735,7 @@ class ExportCommandTests(unittest.TestCase):
     def run_add(self, root, memory_type="principle", title="代码最少原则", scope="global", **kwargs):
         args = [
             "add",
+            "--confirmed",
             "--root",
             str(root),
             "--type",
@@ -2237,7 +2784,15 @@ class ExportCommandTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((root / "exports" / "memory.jsonl").read_text(encoding="utf-8"), "")
-            self.assertEqual(self.load_manifest(root), {"format_version": 1, "records": []})
+            manifest = self.load_manifest(root)
+            self.assertEqual(manifest["format_version"], 1)
+            self.assertEqual(manifest["schema_version"], 3)
+            self.assertEqual(manifest["record_count"], 0)
+            self.assertEqual(manifest["records"], [])
+            self.assertEqual(manifest["source_root"], str(root.resolve()))
+            self.assertEqual(manifest["content_hash"], hashlib.sha256(b"").hexdigest())
+            self.assertIn("generated_at", manifest)
+            self.assertIn("database_hash", manifest)
             self.assertIn("Exported: 0 records", result.stdout)
 
     def test_export_valid_memory(self):
@@ -2261,7 +2816,7 @@ class ExportCommandTests(unittest.TestCase):
             manifest_row = self.load_manifest(root)["records"][0]
             self.assertEqual(manifest_row["id"], row["record"]["id"])
             self.assertEqual(manifest_row["type"], "principle")
-            self.assertEqual(manifest_row["status"], "active")
+            self.assertEqual(manifest_row["status"], "candidate")
             self.assertEqual(manifest_row["workspace"], "personal")
             self.assertEqual(manifest_row["confidentiality"], "personal")
             self.assertEqual(manifest_row["relative_path"], row["relative_path"])
@@ -2271,7 +2826,7 @@ class ExportCommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "data-root"
             self.assertEqual(self.run_init(root).returncode, 0)
-            self.assertEqual(self.run_add(root, "session", "会话", "project", project="p").returncode, 0)
+            self.assertEqual(self.run_add(root, "session", "会话", "global").returncode, 0)
             self.assertEqual(self.run_add(root, "principle", "原则", "global").returncode, 0)
             self.assertEqual(self.run_add(root, "profile", "档案", "global").returncode, 0)
 
@@ -2407,6 +2962,317 @@ class ExportCommandTests(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse((root / "exports" / "memory.jsonl").exists())
+
+
+class V070MigrationAndSafetyTests(unittest.TestCase):
+    def make_v2_database(self, base):
+        module = load_memory_module()
+        root = base / "data"
+        module.init_store(root)
+        record = {
+            "id": "principle-legacy-1",
+            "type": "principle",
+            "title": "Legacy principle",
+            "created": "2026-06-22",
+            "updated": "2026-06-22",
+            "status": "active",
+            "scope": "global",
+            "workspace": "personal",
+            "confidentiality": "personal",
+            "source": "user",
+            "confidence": "confirmed",
+            "content": "legacy migration probe",
+            "tags": [],
+        }
+        path = root / "memory/principles/principle-legacy-1-probe.md"
+        module.atomic_write_text(path, module.render_memory(record))
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        source = base / "legacy-v2.sqlite"
+        conn = sqlite3.connect(source)
+        try:
+            conn.executescript(
+                """
+                PRAGMA journal_mode = WAL;
+                CREATE TABLE memories (
+                    id TEXT PRIMARY KEY,
+                    schema TEXT NOT NULL DEFAULT 'memory/v1',
+                    tier TEXT NOT NULL DEFAULT 'long',
+                    type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    body TEXT NOT NULL DEFAULT '',
+                    tags TEXT NOT NULL DEFAULT '[]',
+                    aliases TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    workspace TEXT NOT NULL,
+                    confidentiality TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    confidence TEXT NOT NULL,
+                    source_id TEXT,
+                    source_path TEXT,
+                    source_sha256 TEXT,
+                    context_id TEXT,
+                    project TEXT,
+                    valid_from TEXT,
+                    valid_until TEXT,
+                    created TEXT NOT NULL,
+                    updated TEXT NOT NULL,
+                    relative_path TEXT NOT NULL UNIQUE,
+                    sha256 TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX idx_memories_type ON memories(type);
+                CREATE INDEX idx_memories_project ON memories(project);
+                CREATE INDEX idx_memories_context ON memories(context_id);
+                CREATE INDEX idx_memories_workspace_status ON memories(workspace, status);
+                CREATE VIRTUAL TABLE memory_fts USING fts5(
+                    id UNINDEXED, title, content, body, tags, aliases, tokenize='unicode61'
+                );
+                CREATE TABLE index_state (
+                    relative_path TEXT PRIMARY KEY, sha256 TEXT NOT NULL,
+                    mtime_ns INTEGER NOT NULL, indexed_at TEXT NOT NULL
+                );
+                CREATE TABLE links (
+                    source_id TEXT NOT NULL, target_id TEXT, target_ref TEXT NOT NULL,
+                    relation TEXT NOT NULL, source_kind TEXT NOT NULL,
+                    target_heading TEXT, target_block TEXT, context TEXT,
+                    resolved INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX idx_links_ref ON links(target_ref);
+                CREATE INDEX idx_links_source ON links(source_id);
+                CREATE INDEX idx_links_target ON links(target_id);
+                CREATE TABLE distillation_audit (
+                    recent_id TEXT PRIMARY KEY, relative_path TEXT NOT NULL,
+                    source_sha256 TEXT NOT NULL, status TEXT NOT NULL,
+                    result_json TEXT NOT NULL DEFAULT '{}', distilled_at TEXT,
+                    delete_after TEXT, deleted_at TEXT, error TEXT
+                );
+                PRAGMA user_version = 2;
+                """
+            )
+            conn.execute(
+                """INSERT INTO memories (
+                    id,type,title,content,status,scope,workspace,confidentiality,
+                    source,confidence,created,updated,relative_path,sha256
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    record["id"], record["type"], record["title"], record["content"],
+                    record["status"], record["scope"], record["workspace"],
+                    record["confidentiality"], record["source"], record["confidence"],
+                    record["created"], record["updated"], path.relative_to(root).as_posix(), digest,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO memory_fts(id,title,content,body,tags,aliases) VALUES (?,?,?,?,?,?)",
+                (record["id"], record["title"], record["content"], "", "", ""),
+            )
+            conn.execute(
+                "INSERT INTO index_state VALUES (?,?,?,?)",
+                (path.relative_to(root).as_posix(), digest, path.stat().st_mtime_ns, "2026-06-22T00:00:00+00:00"),
+            )
+            conn.execute(
+                "INSERT INTO links(source_id,target_ref,relation,source_kind,resolved) VALUES (?,?,?,?,?)",
+                (record["id"], "legacy-ref", "related_to", "body", 0),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return module, root, source, digest
+
+    def test_migrate_v2_preserves_legacy_schema_and_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            module, root, source, digest = self.make_v2_database(base)
+            before = hashlib.sha256(source.read_bytes()).hexdigest()
+            output = base / "candidate-v3.sqlite"
+
+            summary = module.migrate_database_v2_to_v3(source, output, root)
+
+            self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), before)
+            self.assertEqual(module.inspect_database(output), {"initialized": True, "version": 3})
+            conn = sqlite3.connect(output)
+            try:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(memories)")}
+                self.assertTrue({"schema", "tier", "body", "aliases", "source_id", "source_path", "source_sha256", "metadata_json"}.issubset(columns))
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM index_state").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM links").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT sha256 FROM memories").fetchone()[0], digest)
+            finally:
+                conn.close()
+            self.assertEqual(summary["memories"], 1)
+
+    def test_migrate_v2_is_repeatable_but_never_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            module, root, source, _ = self.make_v2_database(base)
+            first = base / "first.sqlite"
+            second = base / "second.sqlite"
+
+            module.migrate_database_v2_to_v3(source, first, root)
+            module.migrate_database_v2_to_v3(source, second, root)
+
+            self.assertEqual(module.inspect_database(first), module.inspect_database(second))
+            with self.assertRaisesRegex(ValueError, "must differ"):
+                module.migrate_database_v2_to_v3(source, source, root)
+
+    def test_migration_failure_removes_partial_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            module, root, source, _ = self.make_v2_database(base)
+            conn = sqlite3.connect(source)
+            try:
+                conn.execute("DROP TABLE index_state")
+                conn.commit()
+            finally:
+                conn.close()
+            output = base / "broken-output.sqlite"
+
+            with self.assertRaises(ValueError):
+                module.migrate_database_v2_to_v3(source, output, root)
+
+            self.assertFalse(output.exists())
+
+    def test_inspect_accepts_extra_columns_but_rejects_missing_or_wrong_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            module = load_memory_module()
+            compatible = base / "compatible.sqlite"
+            module.create_database(compatible)
+            conn = sqlite3.connect(compatible)
+            try:
+                conn.execute("ALTER TABLE memories ADD COLUMN legacy_note TEXT")
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(module.inspect_database(compatible)["initialized"])
+
+            equivalent = base / "equivalent-index.sqlite"
+            shutil.copy2(compatible, equivalent)
+            conn = sqlite3.connect(equivalent)
+            try:
+                conn.execute("DROP INDEX idx_memories_type")
+                conn.execute("CREATE INDEX legacy_custom_type_index ON memories(type)")
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(module.inspect_database(equivalent)["initialized"])
+
+            missing = base / "missing.sqlite"
+            shutil.copy2(compatible, missing)
+            conn = sqlite3.connect(missing)
+            try:
+                conn.execute("ALTER TABLE memories DROP COLUMN source")
+                conn.commit()
+            finally:
+                conn.close()
+            with self.assertRaisesRegex(ValueError, "columns"):
+                module.inspect_database(missing)
+
+            wrong = base / "wrong.sqlite"
+            shutil.copy2(compatible, wrong)
+            conn = sqlite3.connect(wrong)
+            try:
+                conn.execute("PRAGMA writable_schema = ON")
+                conn.execute("UPDATE sqlite_master SET sql=replace(sql, 'source TEXT NOT NULL', 'source BLOB NOT NULL') WHERE name='memories'")
+                conn.execute("PRAGMA writable_schema = OFF")
+                version = conn.execute("PRAGMA schema_version").fetchone()[0]
+                conn.execute(f"PRAGMA schema_version = {version + 1}")
+                conn.commit()
+            finally:
+                conn.close()
+            with self.assertRaisesRegex(ValueError, "column types"):
+                module.inspect_database(wrong)
+
+            broken_fts = base / "broken-fts.sqlite"
+            shutil.copy2(compatible, broken_fts)
+            conn = sqlite3.connect(broken_fts)
+            try:
+                conn.execute("DROP TABLE memory_fts")
+                conn.execute("CREATE TABLE memory_fts(id TEXT, title TEXT, content TEXT, body TEXT, tags TEXT, aliases TEXT)")
+                conn.commit()
+            finally:
+                conn.close()
+            with self.assertRaisesRegex(ValueError, "FTS5"):
+                module.inspect_database(broken_fts)
+
+    def test_migrated_legacy_recent_is_preserved_by_index_and_hidden_from_search(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            module, root, source, digest = self.make_v2_database(base)
+            old_path = next((root / "memory/principles").glob("*.md"))
+            recent_dir = root / "memory/recent"
+            recent_dir.mkdir(parents=True)
+            recent_path = recent_dir / old_path.name
+            old_path.replace(recent_path)
+            relative = recent_path.relative_to(root).as_posix()
+            conn = sqlite3.connect(source)
+            try:
+                conn.execute(
+                    "UPDATE memories SET tier='recent', relative_path=? WHERE id='principle-legacy-1'",
+                    (relative,),
+                )
+                conn.execute("DELETE FROM index_state")
+                conn.execute(
+                    "INSERT INTO index_state VALUES (?,?,?,?)",
+                    (relative, digest, recent_path.stat().st_mtime_ns, "2026-06-22T00:00:00+00:00"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            state = base / "state"
+            state.mkdir()
+            output = state / "memory.sqlite"
+            module.migrate_database_v2_to_v3(source, output, root)
+
+            result = module.index_store(argparse.Namespace(root=str(root), state_dir=str(state), dry_run=False))
+
+            self.assertEqual(result["deleted"], 0)
+            conn = sqlite3.connect(output)
+            try:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM index_state").fetchone()[0], 1)
+            finally:
+                conn.close()
+            rows = module.search_store(argparse.Namespace(
+                root=str(root), state_dir=str(state), query="Legacy migration probe",
+                kind="memory", source_kind=None, type=None, project=None, context_id=None,
+                workspace=None, status=None, as_of=None, include_unassigned=True,
+                include_restricted=False, include_inactive=False, limit=20,
+            ))
+            self.assertEqual(rows, [])
+
+    def test_replace_transaction_restores_all_existing_targets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_memory_module()
+            base = Path(tmp)
+            first = base / "first.md"
+            second = base / "second.md"
+            first.write_text("old first", encoding="utf-8")
+            second.write_text("old second", encoding="utf-8")
+            original_replace = module.os.replace
+            replacements = 0
+            failed = False
+
+            def fail_second(source, target):
+                nonlocal replacements, failed
+                if Path(target) in {first, second} and Path(source).name.startswith(".tmp-"):
+                    replacements += 1
+                    if replacements == 2 and not failed:
+                        failed = True
+                        raise OSError("injected failure")
+                return original_replace(source, target)
+
+            with mock.patch.object(module.os, "replace", side_effect=fail_second):
+                with self.assertRaisesRegex(OSError, "injected failure"):
+                    module._replace_transaction([(first, "new first"), (second, "new second")], [])
+
+            self.assertEqual(first.read_text(encoding="utf-8"), "old first")
+            self.assertEqual(second.read_text(encoding="utf-8"), "old second")
+            self.assertFalse([p for p in base.iterdir() if p.name.startswith((".tmp-", ".backup-"))])
 
 
 if __name__ == "__main__":

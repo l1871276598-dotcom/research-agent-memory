@@ -1,0 +1,14 @@
+{
+  "format_version": 1,
+  "cases": [
+    {
+      "query": "example query",
+      "expected_ids": [],
+      "project": null,
+      "workspace": "personal",
+      "context_id": null,
+      "as_of": null,
+      "synonym": false
+    }
+  ]
+}

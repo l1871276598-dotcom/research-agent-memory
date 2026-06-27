@@ -2,493 +2,498 @@ import argparse
 import hashlib
 import html
 import json
+import mimetypes
+import os
 import re
-import shutil
 import sqlite3
-import subprocess
 import sys
 import zipfile
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
-import chatgpt_export_sync
-import memory
+from memory import (
+    _require_data_root,
+    atomic_write_text,
+    check_state_dir,
+    default_state_dir,
+    safe_slug,
+    search_store,
+)
 
-
-TEXT_EXTENSIONS = {".md", ".txt", ".json", ".csv"}
-TEMP_SUFFIXES = {".tmp", ".part", ".download", ".crdownload"}
-
-
-def _query_tokens(text):
-    return memory.extract_search_terms(text)
-
-
-def _fts_query(text):
-    return memory.build_fts_query(text)
+IMPORTER_VERSION = 2
+TEXT_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".json", ".html", ".htm", ".rtf"}
+ARCHIVE_ONLY_SUFFIXES = {".pdf", ".docx"}
+MANUAL_SUFFIXES = TEXT_SUFFIXES | ARCHIVE_ONLY_SUFFIXES
 
 
 def search(args):
-    compat = argparse.Namespace(
-        query=args.query,
+    delegated = argparse.Namespace(
         root=args.root,
         state_dir=args.state_dir,
-        workspace=args.workspace or "personal",
-        type=args.type,
-        project=args.project,
-        context_id=getattr(args, "context_id", None),
-        status=[args.status] if getattr(args, "status", None) else None,
-        include_historical=False,
-        include_restricted=False,
+        query=args.query,
+        kind="memory",
+        source_kind=None,
+        type=getattr(args, "type", None),
+        project=getattr(args, "project", None),
+        context_id=None,
+        workspace=getattr(args, "workspace", None),
+        status=getattr(args, "status", None),
+        as_of=None,
+        include_unassigned=True,
+        include_restricted=getattr(args, "include_restricted", False),
+        include_inactive=getattr(args, "include_inactive", False),
         limit=args.limit,
     )
-    summary = memory.search_store(compat)
-    if getattr(args, "json", False):
-        print(json.dumps(summary["results"], ensure_ascii=False, indent=2))
+    rows = search_store(delegated)
+
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
     else:
-        for row in summary["results"]:
+        for row in rows:
             project = f" project={row['project']}" if row["project"] else ""
             print(f"{row['id']}  {row['title']}  type={row['type']}{project}")
             if row["excerpt"]:
                 print(f"  {row['excerpt']}")
             print(f"  {row['relative_path']}")
-        print(f"Results: {summary['count']}")
-    return summary["count"]
+        print(f"Results: {len(rows)}")
+    return len(rows)
+
+
+def _iso_time(value):
+    if not isinstance(value, (int, float)):
+        return None
+    return datetime.fromtimestamp(value, timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _message_text(message):
+    content = (message or {}).get("content") or {}
+    parts = content.get("parts") or []
+    output = []
+    for part in parts:
+        if isinstance(part, str):
+            output.append(part)
+        elif isinstance(part, dict):
+            text = part.get("text") or part.get("content")
+            if isinstance(text, str):
+                output.append(text)
+    return "\n\n".join(value.strip() for value in output if value and value.strip())
+
+
+def _active_messages(conversation):
+    mapping = conversation.get("mapping") or {}
+    node_id = conversation.get("current_node")
+    selected = []
+    seen = set()
+    while node_id and node_id not in seen:
+        seen.add(node_id)
+        node = mapping.get(node_id) or {}
+        message = node.get("message")
+        if message:
+            selected.append(message)
+        node_id = node.get("parent")
+    if selected:
+        return list(reversed(selected))
+    return sorted(
+        (node.get("message") for node in mapping.values() if node.get("message")),
+        key=lambda item: item.get("create_time") or 0,
+    )
+
+
+def _render_conversation(conversation):
+    title = (conversation.get("title") or "Untitled conversation").strip()
+    conversation_id = str(conversation.get("id") or conversation.get("conversation_id") or "unknown")
+    created = _iso_time(conversation.get("create_time"))
+    updated = _iso_time(conversation.get("update_time"))
+    lines = [
+        "---",
+        f"conversation_id: {json.dumps(conversation_id, ensure_ascii=False)}",
+        f"title: {json.dumps(title, ensure_ascii=False)}",
+        f"created: {json.dumps(created, ensure_ascii=False)}",
+        f"updated: {json.dumps(updated, ensure_ascii=False)}",
+        'source: "chatgpt_export"',
+        "---",
+        "",
+        f"# {title}",
+        "",
+    ]
+    count = 0
+    for message in _active_messages(conversation):
+        text = _message_text(message)
+        if not text:
+            continue
+        role = ((message.get("author") or {}).get("role") or "unknown").capitalize()
+        created_at = _iso_time(message.get("create_time"))
+        lines.extend([f"## {role}", ""])
+        if created_at:
+            lines.extend([f"_Time: {created_at}_", ""])
+        lines.extend([text, ""])
+        count += 1
+    return "\n".join(lines).rstrip() + "\n", count
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _zip_conversation_name(archive):
+    names = [name for name in archive.namelist() if Path(name).name.lower() == "conversations.json"]
+    if not names:
+        raise ValueError("conversations.json was not found in the export ZIP.")
+    if len(names) > 1:
+        raise ValueError("Multiple conversations.json files were found in the export ZIP.")
+    return names[0]
+
+
+def _valid_conversation(conversation):
+    if not isinstance(conversation, dict):
+        return False
+    if not (conversation.get("id") or conversation.get("conversation_id")):
+        return False
+    mapping = conversation.get("mapping")
+    return isinstance(mapping, dict) and bool(mapping)
+
+
+def preflight_chatgpt_export(zip_path):
+    zip_path = Path(zip_path).expanduser()
+    if not zip_path.exists():
+        raise ValueError("ChatGPT export ZIP does not exist.")
+    if zip_path.is_symlink():
+        raise ValueError("ChatGPT export ZIP must not be a symbolic link.")
+    report = {
+        "zip_path": str(zip_path),
+        "zip_sha256": _file_sha256(zip_path),
+        "zip_valid": False,
+        "conversation_count": 0,
+        "message_count": 0,
+        "invalid_conversations": 0,
+        "warnings": [],
+        "conversations": [],
+    }
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            bad = archive.testzip()
+            if bad:
+                raise ValueError(f"ZIP CRC check failed for {bad}.")
+            data = json.loads(archive.read(_zip_conversation_name(archive)).decode("utf-8"))
+    except (OSError, zipfile.BadZipFile, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Invalid ChatGPT export ZIP.") from exc
+    if not isinstance(data, list):
+        raise ValueError("conversations.json must contain a list.")
+    report["zip_valid"] = True
+    report["conversation_count"] = len(data)
+    valid = []
+    for index, conversation in enumerate(data):
+        if not _valid_conversation(conversation):
+            report["invalid_conversations"] += 1
+            report["warnings"].append(f"invalid conversation at index {index}")
+            continue
+        _, message_count = _render_conversation(conversation)
+        report["message_count"] += message_count
+        valid.append(conversation)
+    report["conversations"] = valid
+    return report
 
 
 def _load_conversations(zip_path):
-    return chatgpt_export_sync._load_conversations(zip_path)
+    return preflight_chatgpt_export(zip_path)["conversations"]
 
 
-def import_chatgpt(args):
-    state_dir = getattr(args, "state_dir", None) or memory.default_state_dir()
-    summary = chatgpt_export_sync.import_zip(
-        argparse.Namespace(root=args.root, state_dir=state_dir, zip=args.zip, dry_run=args.dry_run)
-    )
-    print(f"Conversations: {summary['imported'] + summary['updated'] + summary['unchanged']}")
-    print(f"Created: {summary['imported']}")
-    print(f"Updated: {summary['updated']}")
-    print(f"Unchanged: {summary['unchanged']}")
-    if args.dry_run:
-        print("Dry run: no files changed")
-    else:
-        print("Output: imports/chatgpt/conversations/YYYY/MM/*.md")
-        print("Recent: memory/recent/recent-chatgpt-*.md")
-    return summary
+def _write_import_report(root, kind, input_sha256, report):
+    stamp = datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y%m%dT%H%M%SZ")
+    relative = Path("exports/import_reports") / f"{stamp}-{kind}-{input_sha256[:16]}.json"
+    target = root / relative
+    safe_report = dict(report)
+    safe_report.pop("conversations", None)
+    safe_report["report_path"] = relative.as_posix()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(target, json.dumps(safe_report, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    return relative.as_posix()
 
 
-def _safe_name(name):
-    return memory.safe_slug(Path(name).name).strip("-") or "document"
+def _write_versioned_bytes(preferred, data, write=True):
+    preferred = Path(preferred)
+    digest = hashlib.sha256(data).hexdigest()
+    index = 0
+    while True:
+        if index == 0:
+            target = preferred
+        elif index == 1:
+            target = preferred.with_name(f"{preferred.stem}-{digest[:12]}{preferred.suffix}")
+        elif index == 2:
+            target = preferred.with_name(f"{preferred.stem}-{digest}{preferred.suffix}")
+        else:
+            target = preferred.with_name(f"{preferred.stem}-{digest}-{index - 2}{preferred.suffix}")
+
+        if not write:
+            if not target.exists() and not target.is_symlink():
+                return target, True
+            if not target.is_symlink() and target.is_file() and _file_sha256(target) == digest:
+                return target, False
+            index += 1
+            continue
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        created = False
+        try:
+            with target.open("xb") as handle:
+                created = True
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            descriptor = os.open(target.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            return target, True
+        except FileExistsError:
+            if not target.is_symlink() and target.is_file() and _file_sha256(target) == digest:
+                return target, False
+            index += 1
+        except Exception:
+            if created:
+                target.unlink(missing_ok=True)
+            raise
 
 
-def _read_manifest(path):
-    if not path.exists():
-        return {"format_version": 1, "imports": []}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {"format_version": 1, "imports": []}
-    if not isinstance(data.get("imports"), list):
-        data["imports"] = []
-    return data
-
-
-def _write_manifest(path, data, dry_run):
-    if dry_run:
-        return
-    memory.atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-
-
-def _is_candidate(path):
-    if not path.is_file() or path.is_symlink():
-        return False
-    if path.name.startswith(".") or path.name.endswith("~") or path.suffix.lower() in TEMP_SUFFIXES:
-        return False
-    return True
-
-
-def _is_stable(path):
-    try:
-        first = path.stat()
-        second = path.stat()
-    except OSError:
-        return False
-    return first.st_size == second.st_size and first.st_mtime_ns == second.st_mtime_ns
-
-
-def _html_text(raw):
-    text = re.sub(r"(?is)<(script|style).*?</\1>", " ", raw)
-    text = re.sub(r"(?s)<[^>]+>", " ", text)
-    return re.sub(r"\s+", " ", html.unescape(text)).strip()
-
-
-def _docx_text(path):
-    try:
-        with zipfile.ZipFile(path) as archive:
-            xml = archive.read("word/document.xml").decode("utf-8", errors="replace")
-    except (KeyError, OSError, zipfile.BadZipFile):
-        raise ValueError("cannot extract docx text")
-    parts = re.findall(r"<w:t[^>]*>(.*?)</w:t>", xml)
-    return html.unescape("".join(parts)).strip()
-
-
-def _external_text(command):
-    if shutil.which(command[0]) is None:
-        return None
-    result = subprocess.run(command, text=True, capture_output=True, timeout=30)
-    if result.returncode != 0:
-        raise ValueError(result.stderr.strip() or "text extraction failed")
-    return result.stdout.strip()
-
-
-def extract_text(path):
+def _manual_text(path):
     suffix = path.suffix.lower()
-    if suffix in TEXT_EXTENSIONS:
-        return path.read_text(encoding="utf-8"), suffix.lstrip(".")
-    if suffix == ".html":
-        return _html_text(path.read_text(encoding="utf-8")), "html"
-    if suffix == ".docx":
-        return _docx_text(path), "docx"
-    if suffix == ".rtf":
-        text = _external_text(["textutil", "-convert", "txt", "-stdout", str(path)])
-        return (text, "textutil") if text is not None else (None, None)
-    if suffix == ".pdf":
-        text = _external_text(["pdftotext", str(path), "-"])
-        return (text, "pdftotext") if text is not None else (None, None)
-    return None, None
-
-
-def _render_recent(record, body):
-    return memory.render_front_matter(record) + "\n\n" + body.rstrip() + "\n"
-
-
-def _archive_path(root, sha256, source):
-    today = date.today()
-    name = f"{sha256[:12]}-{_safe_name(source.name)}"
-    suffix = source.suffix.lower()
-    if suffix and not name.endswith(suffix):
-        name += suffix
-    return root / "imports" / "manual" / "raw" / f"{today:%Y}" / f"{today:%m}" / name
-
-
-def _recent_record(root, raw_path, source, sha256, text, extractor):
-    today = date.today()
-    recent_id = f"recent-manual-{sha256[:16]}"
-    return {
-        "schema": "recent/v1",
-        "id": recent_id,
-        "type": "session",
-        "tier": "recent",
-        "title": source.stem or source.name,
-        "created": today.isoformat(),
-        "updated": today.isoformat(),
-        "status": "active",
-        "source": "manual_import",
-        "source_id": sha256[:16],
-        "source_path": raw_path.relative_to(root).as_posix(),
-        "source_sha256": sha256,
-        "retention_until": (today + timedelta(days=memory.RECENT_BODY_DAYS)).isoformat(),
-        "distillation_status": "pending",
-        "protected": "false",
-        "original_name": source.name,
-        "media_type": source.suffix.lower().lstrip(".") or "unknown",
-        "extractor": extractor,
-        "imported_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
-        "content": text.strip(),
-    }
-
-
-def _process_file(root, state_dir, path, manifest, dry_run):
-    if not _is_candidate(path):
-        return "skipped"
-    if not _is_stable(path):
-        return "skipped"
+    if suffix not in MANUAL_SUFFIXES:
+        raise ValueError("Manual import supports PDF/DOCX/RTF/HTML/TXT/Markdown/CSV/JSON.")
+    if suffix in ARCHIVE_ONLY_SUFFIXES:
+        return None
     try:
-        raw = path.read_bytes()
-    except OSError:
-        if not dry_run:
-            quarantine = root / "imports" / "manual" / "quarantine" / path.name
-            quarantine.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, quarantine)
-        return "quarantined"
-    sha256 = hashlib.sha256(raw).hexdigest()
-    if any(row.get("sha256") == sha256 for row in manifest["imports"]):
-        return "duplicate"
-    raw_path = _archive_path(root, sha256, path)
-    text = None
-    extractor = None
-    try:
-        text, extractor = extract_text(path)
-    except Exception:
-        if not dry_run:
-            quarantine = root / "imports" / "manual" / "quarantine" / path.name
-            quarantine.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, quarantine)
-        return "quarantined"
-    status = "imported" if text else "archived_without_text"
-    if not dry_run:
-        raw_path.parent.mkdir(parents=True, exist_ok=True)
-        if not raw_path.exists():
-            tmp = raw_path.parent / f".tmp-{raw_path.name}"
-            tmp.write_bytes(raw)
-            tmp.replace(raw_path)
-        if text:
-            record = _recent_record(root, raw_path, path, sha256, text, extractor)
-            recent_path = root / "memory" / "recent" / f"{record['id']}.md"
-            if not recent_path.exists():
-                memory.atomic_write_text(recent_path, _render_recent(record, text))
-        manifest["imports"].append(
-            {
-                "sha256": sha256,
-                "original_name": path.name,
-                "raw_path": raw_path.relative_to(root).as_posix(),
-                "status": status,
-                "imported_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
-            }
-        )
-    return status
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return None
+    if suffix in {".html", ".htm"}:
+        text = html.unescape(re.sub(r"<[^>]+>", " ", text))
+    elif suffix == ".json":
+        try:
+            text = json.dumps(json.loads(text), ensure_ascii=False, indent=2)
+        except json.JSONDecodeError:
+            pass
+    return re.sub(r"\s+\n", "\n", text).strip()
 
 
 def import_manual(args):
-    root = memory._require_data_root(args.root)
-    state_dir = Path(args.state_dir) if args.state_dir else memory.default_state_dir()
-    manifest_path = root / "imports" / "manual" / "import_manifest.json"
-    manifest = _read_manifest(manifest_path)
-    candidates = []
-    if args.scan_inbox:
-        candidates.extend(sorted((root / "imports" / "manual" / "inbox").iterdir()))
-    if args.file:
-        candidates.append(Path(args.file).expanduser())
-    summary = {
-        "imported": 0,
-        "duplicates": 0,
-        "archived_without_text": 0,
-        "quarantined": 0,
-        "skipped": 0,
-        "dry_run": args.dry_run,
-    }
-    with memory.write_lock(root, state_dir):
-        for path in candidates:
-            status = _process_file(root, state_dir, path, manifest, args.dry_run)
-            key = {
-                "imported": "imported",
-                "duplicate": "duplicates",
-                "archived_without_text": "archived_without_text",
-                "quarantined": "quarantined",
-                "skipped": "skipped",
-            }[status]
-            summary[key] += 1
-        _write_manifest(manifest_path, manifest, args.dry_run)
-        if not args.dry_run and summary["imported"]:
-            memory.index_store(type("Args", (), {"root": str(root), "state_dir": str(state_dir), "dry_run": False})())
-    return summary
-
-
-def _db(root, state_dir):
-    _, db = memory.check_state_dir(memory._require_data_root(root), state_dir or memory.default_state_dir())
-    if not db.exists():
-        raise ValueError("Database is not initialized. Run db-init first.")
-    return db
-
-
-def _json_list(value):
-    try:
-        data = json.loads(value or "[]")
-    except json.JSONDecodeError:
-        return []
-    return data if isinstance(data, list) else []
-
-
-def _memory_row(row):
-    keys = ["id", "title", "type", "tier", "status", "workspace", "confidentiality", "relative_path", "aliases"]
-    data = dict(zip(keys, row))
-    data["aliases"] = _json_list(data["aliases"])
-    return data
-
-
-def recall(args):
-    root = memory._require_data_root(args.root)
-    db = _db(root, args.state_dir)
-    query = args.query
-    with sqlite3.connect(db) as conn:
-        rows = conn.execute(
-            """
-            SELECT id, title, type, tier, status, workspace, confidentiality, relative_path, aliases
-            FROM memories
-            WHERE workspace = ?
-              AND confidentiality IN ('public', 'personal')
-              AND status = 'active'
-            """,
-            (args.workspace,),
-        ).fetchall()
-        memories = [_memory_row(row) for row in rows]
-        exact = [
-            row
-            for row in memories
-            if row["id"] == query or row["title"] == query or query in row["aliases"]
-        ]
-        primary_ids = {row["id"] for row in exact}
-        related = []
-        if primary_ids:
-            marks = ", ".join("?" for _ in primary_ids)
-            related = [
-                dict(zip(["source_id", "target_id", "target_ref", "relation", "resolved"], row))
-                for row in conn.execute(
-                    f"SELECT source_id, target_id, target_ref, relation, resolved FROM links WHERE source_id IN ({marks}) OR target_id IN ({marks})",
-                    tuple(primary_ids) + tuple(primary_ids),
-                )
+    root = _require_data_root(args.root)
+    source = Path(args.path).expanduser()
+    if not source.exists():
+        raise ValueError("Manual import source does not exist.")
+    if source.is_symlink():
+        raise ValueError("Manual import source must not be a symbolic link.")
+    if not source.is_file():
+        raise ValueError("Manual import source must be a file.")
+    raw = source.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    text = _manual_text(source)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    relative_base = Path(f"{now.year:04d}/{now.month:02d}/{digest[:16]}-{safe_slug(source.stem)}")
+    preferred = root / "imports/manual/raw" / relative_base.with_suffix(source.suffix.lower())
+    raw_target, raw_created = _write_versioned_bytes(preferred, raw, write=not args.dry_run)
+    raw_relative = raw_target.relative_to(root)
+    raw_tail = raw_relative.relative_to("imports/manual/raw")
+    text_relative = Path("imports/manual/text") / raw_tail.with_suffix(".md")
+    written_paths = [raw_relative.as_posix()]
+    title = source.stem or source.name
+    markdown = None
+    if text is not None:
+        written_paths.append(text_relative.as_posix())
+        markdown = "\n".join(
+            [
+                "---",
+                f"title: {json.dumps(title, ensure_ascii=False)}",
+                f"source_path: {json.dumps(raw_relative.as_posix())}",
+                f"source_sha256: {json.dumps(digest)}",
+                f"original_name: {json.dumps(source.name, ensure_ascii=False)}",
+                f"media_type: {json.dumps(mimetypes.guess_type(source.name)[0] or 'application/octet-stream')}",
+                'extractor: "utf-8"',
+                f"imported_at: {json.dumps(now.isoformat())}",
+                'source: "manual_import"',
+                "---",
+                "",
+                f"# {title}",
+                "",
+                text,
+                "",
             ]
-        recent = [row for row in memories if row["tier"] == "recent" and query in (row["title"] + " " + " ".join(row["aliases"]))]
-    return {"primary": exact, "related": related, "recent_evidence": recent, "unresolved": []}
+        )
+    text_exists = (root / text_relative).exists() if text is not None else True
+    report = {
+        "format_version": 1,
+        "importer_version": IMPORTER_VERSION,
+        "kind": "manual",
+        "input_path": str(source),
+        "input_sha256": digest,
+        "imported_at": now.isoformat(),
+        "new": 1 if raw_created or not text_exists else 0,
+        "updated": 0,
+        "duplicate": 1 if not raw_created and text_exists else 0,
+        "failed": 0,
+        "archived_without_text": 1 if text is None else 0,
+        "written_paths": written_paths,
+        "index_result": "not_run",
+        "restore_suggestion": "Install or run a dedicated extractor, then import a text/Markdown sidecar." if text is None else "",
+    }
+    if not args.dry_run:
+        if markdown is not None and not (root / text_relative).exists():
+            (root / text_relative).parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(root / text_relative, markdown)
+        report["report_path"] = _write_import_report(root, "manual", digest, report)
+    print(f"Raw: {raw_relative.as_posix()}")
+    if text is None:
+        print("Text: archived_without_text")
+    else:
+        print(f"Text: {text_relative.as_posix()}")
+    if args.dry_run:
+        print("Dry run: no files changed")
+    else:
+        print(f"Report: {report['report_path']}")
+    return report
 
 
-def link_query(args, mode):
-    db = _db(args.root, args.state_dir)
-    with sqlite3.connect(db) as conn:
-        if mode == "outgoing":
-            rows = conn.execute("SELECT " + ", ".join(memory.LINK_COLUMNS) + " FROM links WHERE source_id = ? ORDER BY target_ref", (args.target_id,)).fetchall()
-        elif mode == "backlinks":
-            rows = conn.execute("SELECT " + ", ".join(memory.LINK_COLUMNS) + " FROM links WHERE target_id = ? OR target_ref = ? ORDER BY source_id", (args.target_id, args.target_id)).fetchall()
-        elif mode == "unresolved":
-            rows = conn.execute("SELECT " + ", ".join(memory.LINK_COLUMNS) + " FROM links WHERE resolved = 0 ORDER BY source_id, target_ref").fetchall()
+def import_chatgpt(args):
+    root = _require_data_root(args.root)
+    zip_path = Path(args.zip).expanduser()
+    preflight = preflight_chatgpt_export(zip_path)
+    conversations = preflight["conversations"]
+    output_root = root / "imports" / "chatgpt" / "conversations"
+    manifest_path = root / "imports" / "chatgpt" / "import_manifest.json"
+    records = []
+    created = updated = unchanged = 0
+
+    for conversation in conversations:
+        conversation_id = str(conversation.get("id") or conversation.get("conversation_id") or "unknown")
+        title = (conversation.get("title") or "Untitled conversation").strip()
+        stamp = datetime.fromtimestamp(conversation.get("create_time") or 0, timezone.utc)
+        relative = Path(f"{stamp.year:04d}/{stamp.month:02d}/{safe_slug(conversation_id)}.md")
+        content, message_count = _render_conversation(conversation)
+        encoded = content.encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        preferred = output_root / relative
+        preferred_exists = preferred.exists() or preferred.is_symlink()
+        target, wrote = _write_versioned_bytes(preferred, encoded, write=not args.dry_run)
+        relative = target.relative_to(output_root)
+        if wrote and preferred_exists:
+            updated += 1
+        elif wrote:
+            created += 1
         else:
-            rows = conn.execute("SELECT " + ", ".join(memory.LINK_COLUMNS) + " FROM links ORDER BY source_id, target_ref").fetchall()
-    links = [dict(zip(memory.LINK_COLUMNS, row)) for row in rows]
-    key = "unresolved" if mode == "unresolved" else "links"
-    return {key: links, "count": len(links)}
+            unchanged += 1
+        records.append(
+            {
+                "conversation_id": conversation_id,
+                "title": title,
+                "path": (Path("imports/chatgpt/conversations") / relative).as_posix(),
+                "sha256": digest,
+                "message_count": message_count,
+            }
+        )
 
+    raw_only = unchanged
+    report = {
+        "format_version": 1,
+        "importer_version": IMPORTER_VERSION,
+        "kind": "chatgpt",
+        "input_path": str(zip_path),
+        "input_sha256": preflight["zip_sha256"],
+        "imported_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "zip_path": preflight["zip_path"],
+        "zip_sha256": preflight["zip_sha256"],
+        "zip_valid": preflight["zip_valid"],
+        "conversation_count": preflight["conversation_count"],
+        "message_count": preflight["message_count"],
+        "invalid_conversations": preflight["invalid_conversations"],
+        "new": created,
+        "updated": updated,
+        "unchanged": unchanged,
+        "raw_only": raw_only,
+        "warnings": preflight["warnings"],
+        "failed": preflight["invalid_conversations"],
+        "written_paths": [record["path"] for record in records],
+        "index_result": "not_run",
+        "restore_suggestion": "No recent restore is performed by import-chatgpt in v0.7.0.",
+    }
+    previous_records = []
+    if manifest_path.is_file():
+        try:
+            previous_records = json.loads(manifest_path.read_text(encoding="utf-8")).get("conversations", [])
+        except (OSError, json.JSONDecodeError, AttributeError):
+            previous_records = []
+    merged_records = {
+        (record.get("path"), record.get("sha256")): record
+        for record in previous_records + records
+        if isinstance(record, dict) and record.get("path") and record.get("sha256")
+    }
+    manifest = {
+        "format_version": 1,
+        "source": Path(args.zip).name,
+        "conversations": sorted(merged_records.values(), key=lambda item: (item["conversation_id"], item["path"])),
+    }
+    if not args.dry_run:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+        report["report_path"] = _write_import_report(root, "chatgpt", preflight["zip_sha256"], report)
 
-def launchd_plist(args):
-    root = memory._require_data_root(args.root)
-    program = Path(__file__).resolve()
-    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>{html.escape(args.label)}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{html.escape(sys.executable)}</string>
-    <string>{html.escape(str(program))}</string>
-    <string>import-manual</string>
-    <string>--root</string>
-    <string>{html.escape(str(root))}</string>
-    <string>--state-dir</string>
-    <string>{html.escape(str(Path(args.state_dir).expanduser()))}</string>
-    <string>--scan-inbox</string>
-  </array>
-  <key>WatchPaths</key>
-  <array>
-    <string>{html.escape(str(root / "imports" / "manual" / "inbox"))}</string>
-  </array>
-  <key>StartInterval</key>
-  <integer>{args.interval}</integer>
-  <key>StandardOutPath</key>
-  <string>{html.escape(str(Path(args.state_dir).expanduser() / "manual-import.out.log"))}</string>
-  <key>StandardErrorPath</key>
-  <string>{html.escape(str(Path(args.state_dir).expanduser() / "manual-import.err.log"))}</string>
-</dict>
-</plist>
-"""
-    return {"plist": plist}
+    print(f"Conversations: {len(records)}")
+    print(f"Created: {created}")
+    print(f"Updated: {updated}")
+    print(f"Unchanged: {unchanged}")
+    print(f"Invalid conversations: {preflight['invalid_conversations']}")
+    print(f"Raw only: {raw_only}")
+    if args.dry_run:
+        print("Dry run: no files changed")
+    else:
+        print("Manifest: imports/chatgpt/import_manifest.json")
+        print(f"Report: {report['report_path']}")
+    return report
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Research memory helper tools.")
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser = argparse.ArgumentParser(description="Search memory and import local evidence files.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
-    search_parser = sub.add_parser("search", help="Search the local SQLite FTS5 index.")
+    search_parser = subparsers.add_parser("search", help="Search the local SQLite FTS5 index.")
     search_parser.add_argument("query")
     search_parser.add_argument("--root", required=True)
-    search_parser.add_argument("--state-dir", default=str(memory.default_state_dir()))
+    search_parser.add_argument("--state-dir", default=str(default_state_dir()))
     search_parser.add_argument("--type")
     search_parser.add_argument("--project")
     search_parser.add_argument("--workspace")
     search_parser.add_argument("--status")
+    search_parser.add_argument("--include-restricted", action="store_true")
+    search_parser.add_argument("--include-inactive", action="store_true")
     search_parser.add_argument("--limit", type=int, default=20)
     search_parser.add_argument("--json", action="store_true")
 
-    import_parser = sub.add_parser("import-chatgpt", help="Import an official ChatGPT export ZIP.")
+    import_parser = subparsers.add_parser("import-chatgpt", help="Archive conversations from an official export ZIP.")
     import_parser.add_argument("--zip", required=True)
     import_parser.add_argument("--root", required=True)
-    import_parser.add_argument("--state-dir", default=str(memory.default_state_dir()))
     import_parser.add_argument("--dry-run", action="store_true")
-    import_parser.add_argument("--json", action="store_true", dest="json_output")
 
-    imp = sub.add_parser("import-manual")
-    imp.add_argument("--root", required=True)
-    imp.add_argument("--state-dir", required=True)
-    imp.add_argument("--scan-inbox", action="store_true")
-    imp.add_argument("--file")
-    imp.add_argument("--dry-run", action="store_true")
-    imp.add_argument("--json", action="store_true", dest="json_output")
-
-    rec = sub.add_parser("recall")
-    rec.add_argument("query")
-    rec.add_argument("--root", required=True)
-    rec.add_argument("--state-dir", required=True)
-    rec.add_argument("--workspace", default="personal", choices=memory.WORKSPACE_CHOICES)
-    rec.add_argument("--json", action="store_true", dest="json_output")
-
-    for name in ["backlinks", "outgoing", "related"]:
-        item = sub.add_parser(name)
-        item.add_argument("target_id")
-        item.add_argument("--root", required=True)
-        item.add_argument("--state-dir", required=True)
-        item.add_argument("--depth", type=int, default=1)
-        item.add_argument("--json", action="store_true", dest="json_output")
-
-    unresolved = sub.add_parser("unresolved")
-    unresolved.add_argument("--root", required=True)
-    unresolved.add_argument("--state-dir", required=True)
-    unresolved.add_argument("--json", action="store_true", dest="json_output")
-
-    check = sub.add_parser("check-links")
-    check.add_argument("--root", required=True)
-    check.add_argument("--state-dir", required=True)
-    check.add_argument("--json", action="store_true", dest="json_output")
-
-    launchd = sub.add_parser("launchd-plist")
-    launchd.add_argument("--root", required=True)
-    launchd.add_argument("--state-dir", required=True)
-    launchd.add_argument("--label", default="local.research-agent-memory.manual-import")
-    launchd.add_argument("--interval", type=int, default=300)
-    launchd.add_argument("--json", action="store_true", dest="json_output")
+    manual_parser = subparsers.add_parser("import-manual", help="Import a local readable file as raw evidence plus text sidecar.")
+    manual_parser.add_argument("--path", required=True)
+    manual_parser.add_argument("--root", required=True)
+    manual_parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
 def main(argv=None):
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    args = build_parser().parse_args(argv)
     try:
         if args.command == "search":
             search(args)
-            return 0
-        if args.command == "import-chatgpt":
-            summary = import_chatgpt(args)
-            if getattr(args, "json_output", False):
-                print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
-            return 0
-        if args.command == "import-manual":
-            summary = import_manual(args)
-        elif args.command == "recall":
-            summary = recall(args)
-        elif args.command in {"backlinks", "outgoing", "related", "unresolved", "check-links"}:
-            summary = link_query(args, args.command)
-        elif args.command == "launchd-plist":
-            summary = launchd_plist(args)
+        elif args.command == "import-chatgpt":
+            import_chatgpt(args)
         else:
-            parser.error("unknown command")
-            return 2
-        if getattr(args, "json_output", False):
-            print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
-        elif args.command == "launchd-plist":
-            print(summary["plist"], end="")
-        else:
-            for key, value in summary.items():
-                print(f"{key}: {value}")
+            import_manual(args)
         return 0
-    except (OSError, ValueError, sqlite3.DatabaseError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, sqlite3.DatabaseError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 

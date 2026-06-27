@@ -1,14 +1,17 @@
 import argparse
-import contextlib
-import fcntl
 import hashlib
 import json
 import os
 import re
+import shutil
+import socket
 import sqlite3
+import subprocess
 import sys
+import time
 import uuid
-from datetime import date, datetime, timedelta, timezone
+from contextlib import closing
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 
@@ -21,11 +24,9 @@ DIRECTORIES = [
     "memory/decisions",
     "memory/procedures",
     "memory/sessions",
-    "memory/recent",
     "imports/chatgpt/conversations",
-    "imports/manual/inbox",
     "imports/manual/raw",
-    "imports/manual/quarantine",
+    "imports/manual/text",
     "literature/inbox",
     "literature/pdf",
     "literature/notes",
@@ -34,6 +35,7 @@ DIRECTORIES = [
     "manuscripts/evidence",
     "manuscripts/archive",
     "exports/database_snapshots",
+    "exports/import_reports",
     "backups",
 ]
 
@@ -47,11 +49,30 @@ TYPE_CHOICES = [
     "procedure",
     "session",
 ]
-STATUS_CHOICES = ["active", "historical", "deprecated", "candidate", "conflict", "archived"]
+STATUS_CHOICES = [
+    "active",
+    "historical",
+    "deprecated",
+    "candidate",
+    "conflict",
+    "archived",
+]
+AUDIT_STATUS_CHOICES = [
+    "prepared",
+    "awaiting_review",
+    "accepted",
+    "rejected",
+    "conflict",
+    "pending_delete",
+    "deleted",
+    "stale",
+    "failed",
+]
 SCOPE_CHOICES = ["global", "context", "project"]
 WORKSPACE_CHOICES = ["personal", "work"]
 CONFIDENTIALITY_CHOICES = ["public", "personal", "internal", "restricted"]
 CONFIDENCE_CHOICES = ["confirmed", "inferred", "uncertain"]
+TEXT_DOCUMENT_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".json", ".html", ".htm", ".rtf"}
 
 TYPE_DIRS = {
     "profile": "memory/profile",
@@ -90,8 +111,25 @@ ALLOWED_FIELDS = set(REQUIRED_FIELDS) | {
     "to_context",
     "effective_date",
     "reason",
+    "candidate_action",
+    "requested_action",
+    "audit_status",
+    "target_id",
+    "source_id",
+    "source_path",
+    "source_sha256",
+    "confirmation",
+    "expected_target_status",
+    "expected_target_sha256",
+    "proposal_input_hash",
+    "new_record_json",
+    "reviewed_at",
+    "review_reason",
+    "evidence",
+    "source_refs",
+    "relations",
 }
-LIST_FIELDS = {"tags", "supersedes", "superseded_by"}
+LIST_FIELDS = {"tags", "supersedes", "superseded_by", "evidence", "source_refs", "relations"}
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-]*$")
 
 FILES = {
@@ -107,8 +145,8 @@ FILES = {
         indent=2,
     )
     + "\n",
-    "imports/manual/import_manifest.json": json.dumps(
-        {"format_version": 1, "imports": []},
+    "imports/document_metadata.json": json.dumps(
+        {"format_version": 1, "documents": {}},
         ensure_ascii=False,
         indent=2,
     )
@@ -118,27 +156,20 @@ FILES = {
     ),
 }
 DB_NAME = "memory.sqlite"
-DB_SCHEMA_VERSION = 2
+DB_SCHEMA_VERSION = 3
 STATE_DIR_ERROR = "SQLite state directory must be local and outside iCloud and the code repository."
 MEMORIES_COLUMNS = [
     "id",
-    "schema",
-    "tier",
     "type",
     "title",
     "content",
-    "body",
     "tags",
-    "aliases",
     "status",
     "scope",
     "workspace",
     "confidentiality",
     "source",
     "confidence",
-    "source_id",
-    "source_path",
-    "source_sha256",
     "context_id",
     "project",
     "valid_from",
@@ -147,77 +178,67 @@ MEMORIES_COLUMNS = [
     "updated",
     "relative_path",
     "sha256",
-    "metadata_json",
 ]
 INDEX_STATE_COLUMNS = ["relative_path", "sha256", "mtime_ns", "indexed_at"]
-LINK_COLUMNS = [
-    "source_id",
-    "target_id",
-    "target_ref",
-    "relation",
+DOCUMENTS_COLUMNS = [
+    "id",
     "source_kind",
-    "target_heading",
-    "target_block",
-    "context",
-    "resolved",
-]
-AUDIT_COLUMNS = [
-    "recent_id",
+    "source_id",
+    "title",
+    "content",
+    "workspace",
+    "confidentiality",
+    "project",
+    "context_id",
+    "updated",
     "relative_path",
-    "source_sha256",
-    "status",
-    "result_json",
-    "distilled_at",
-    "delete_after",
-    "deleted_at",
-    "error",
+    "sha256",
+    "metadata_json",
 ]
+DOCUMENT_INDEX_STATE_COLUMNS = ["relative_path", "sha256", "mtime_ns", "indexed_at"]
+REQUIRED_COLUMN_TYPES = {
+    "memories": {
+        "id": "TEXT", "type": "TEXT", "title": "TEXT", "content": "TEXT",
+        "tags": "TEXT", "status": "TEXT", "scope": "TEXT", "workspace": "TEXT",
+        "confidentiality": "TEXT", "source": "TEXT", "confidence": "TEXT",
+        "context_id": "TEXT", "project": "TEXT", "valid_from": "TEXT",
+        "valid_until": "TEXT", "created": "TEXT", "updated": "TEXT",
+        "relative_path": "TEXT", "sha256": "TEXT",
+    },
+    "index_state": {
+        "relative_path": "TEXT", "sha256": "TEXT", "mtime_ns": "INTEGER", "indexed_at": "TEXT",
+    },
+    "documents": {
+        "id": "TEXT", "source_kind": "TEXT", "source_id": "TEXT", "title": "TEXT",
+        "content": "TEXT", "workspace": "TEXT", "confidentiality": "TEXT",
+        "project": "TEXT", "context_id": "TEXT", "updated": "TEXT",
+        "relative_path": "TEXT", "sha256": "TEXT", "metadata_json": "TEXT",
+    },
+    "document_index_state": {
+        "relative_path": "TEXT", "sha256": "TEXT", "mtime_ns": "INTEGER", "indexed_at": "TEXT",
+    },
+}
+REQUIRED_FTS_COLUMNS = {
+    "memory_fts": {"id", "title", "content", "tags"},
+    "document_fts": {"id", "title", "content", "source_kind", "project"},
+}
 REQUIRED_INDEXES = {
     "idx_memories_type",
     "idx_memories_project",
     "idx_memories_context",
     "idx_memories_workspace_status",
 }
+REQUIRED_DOCUMENT_INDEXES = {
+    "idx_documents_source_kind",
+    "idx_documents_project",
+    "idx_documents_workspace_confidentiality",
+}
+REQUIRED_INDEX_COLUMNS = {
+    "memories": [("type",), ("project",), ("context_id",), ("workspace", "status")],
+    "documents": [("source_kind",), ("project",), ("workspace", "confidentiality")],
+    "links": [("target_ref",), ("source_id",), ("target_id",)],
+}
 CJK_RUN = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF]+")
-LOCK_NAME = "memory-write.lock"
-_LOCK_STACK = []
-RECENT_DIR = "memory/recent"
-RECENT_BODY_DAYS = 30
-DELETION_GRACE_DAYS = 7
-RELATION_CHOICES = {
-    "belongs_to",
-    "applies_to",
-    "depends_on",
-    "derived_from",
-    "supports",
-    "contradicts",
-    "supersedes",
-    "superseded_by",
-    "related_to",
-}
-AGENT_FIELDS = {
-    "schema",
-    "tier",
-    "subject",
-    "predicate",
-    "object",
-    "aliases",
-    "relations",
-    "source_id",
-    "source_path",
-    "source_sha256",
-    "source_refs",
-    "retention_until",
-    "distillation_status",
-    "distilled_at",
-    "protected",
-    "original_name",
-    "media_type",
-    "extractor",
-    "imported_at",
-}
-ALLOWED_FIELDS = ALLOWED_FIELDS | AGENT_FIELDS
-LIST_FIELDS = LIST_FIELDS | {"aliases", "relations", "source_refs"}
 
 
 def _repository_root():
@@ -363,10 +384,8 @@ def _quoted(value):
 def render_front_matter(record):
     lines = ["---"]
     for field in [
-        "schema",
         "id",
         "type",
-        "tier",
         "title",
         "created",
         "updated",
@@ -384,25 +403,25 @@ def render_front_matter(record):
         "to_context",
         "effective_date",
         "reason",
-        "subject",
-        "predicate",
-        "object",
+        "candidate_action",
+        "requested_action",
+        "audit_status",
+        "target_id",
         "source_id",
         "source_path",
         "source_sha256",
-        "retention_until",
-        "distillation_status",
-        "distilled_at",
-        "protected",
-        "original_name",
-        "media_type",
-        "extractor",
-        "imported_at",
+        "confirmation",
+        "expected_target_status",
+        "expected_target_sha256",
+        "proposal_input_hash",
+        "new_record_json",
+        "reviewed_at",
+        "review_reason",
     ]:
         if field in record:
             lines.append(f"{field}: {_quoted(record[field])}")
 
-    for field in ["aliases", "relations", "source_refs", "supersedes", "superseded_by", "tags"]:
+    for field in ["supersedes", "superseded_by", "tags", "evidence", "source_refs", "relations"]:
         if field not in record:
             continue
         values = record.get(field, [])
@@ -412,11 +431,10 @@ def render_front_matter(record):
         if not values:
             lines[-1] = f"{field}: []"
 
-    if "content" in record:
-        lines.append("content: |-")
-        content_lines = record["content"].splitlines() or [""]
-        for line in content_lines:
-            lines.append(f"  {line}")
+    lines.append("content: |-")
+    content_lines = record["content"].splitlines() or [""]
+    for line in content_lines:
+        lines.append(f"  {line}")
     lines.append("---")
     return "\n".join(lines)
 
@@ -447,6 +465,18 @@ def render_existing_memory(path, record):
 def add_memory(args):
     validate_add_args(args)
     root = _require_data_root(args.root)
+    _, existing_records, existing_errors, _ = collect_validated_records(root)
+    if existing_errors:
+        messages = [f"ERROR {rel_path}: {message}" for rel_path, message in existing_errors]
+        raise ValueError("\n".join(messages + ["Add aborted because validation failed."]))
+    active_projects = [
+        item["record"].get("project")
+        for item in existing_records
+        if item["record"].get("type") == "project" and item["record"].get("status") == "active"
+    ]
+    status = "candidate"
+    if args.scope == "project" and args.type != "project" and args.project not in active_projects:
+        raise ValueError("project does not reference an active project")
     target_dir = root / TYPE_DIRS[args.type]
     target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -457,15 +487,20 @@ def add_memory(args):
         "title": args.title,
         "created": today,
         "updated": today,
-        "status": args.status,
+        "status": status,
         "scope": args.scope,
         "workspace": args.workspace,
         "confidentiality": args.confidentiality,
         "source": args.source,
         "confidence": args.confidence,
+        "candidate_action": "ADD",
+        "requested_action": "add",
+        "audit_status": "awaiting_review",
         "content": args.content,
         "tags": args.tags or [],
     }
+    if args.confirmed:
+        record["confirmation"] = "explicit"
     for field in [
         "context_id",
         "project",
@@ -499,7 +534,7 @@ def add_memory(args):
         tmp.unlink(missing_ok=True)
         raise
 
-    return memory_id, target.relative_to(root), args.type, args.status
+    return memory_id, target.relative_to(root), args.type, status
 
 
 def _parse_scalar(value):
@@ -606,25 +641,6 @@ def parse_front_matter(path):
     return record, errors
 
 
-def parse_memory_document(path):
-    try:
-        text = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return None, "", ["file is not valid UTF-8"]
-    except OSError as exc:
-        return None, "", [f"cannot read file: {exc}"]
-    lines = text.splitlines()
-    if not lines or lines[0] != "---":
-        return None, "", ["missing opening front matter delimiter"]
-    try:
-        end = lines.index("---", 1)
-    except ValueError:
-        return None, "", ["unclosed front matter"]
-    record, errors = parse_front_matter(path)
-    body = "\n".join(lines[end + 1 :]).strip()
-    return record, body, errors
-
-
 def _real_date(value):
     if not isinstance(value, str):
         return None
@@ -636,38 +652,9 @@ def _real_date(value):
         return None
 
 
-def _relation_parts(value):
-    if not isinstance(value, str) or ":" not in value:
-        return None, None
-    relation, target = value.split(":", 1)
-    return relation.strip(), target.strip()
-
-
 def validate_record(record, path, rel_path, expected_type):
     errors = []
-    schema = record.get("schema", "memory/v1")
-    is_recent = schema == "recent/v1" or expected_type == "recent"
-    required = [
-        "schema",
-        "id",
-        "type",
-        "tier",
-        "title",
-        "created",
-        "updated",
-        "status",
-        "source",
-        "source_id",
-        "source_path",
-        "source_sha256",
-        "retention_until",
-        "distillation_status",
-        "protected",
-        "content",
-    ] if is_recent else REQUIRED_FIELDS
-    if schema == "memory/v2":
-        required = list(dict.fromkeys(required + ["schema", "subject", "predicate", "object", "relations"]))
-    for field in required:
+    for field in REQUIRED_FIELDS:
         if field not in record:
             errors.append(f"missing required field: {field}")
     for field in record:
@@ -679,12 +666,13 @@ def validate_record(record, path, rel_path, expected_type):
         errors.append("id must be a string")
     elif not (3 <= len(memory_id) <= 128) or not ID_PATTERN.fullmatch(memory_id):
         errors.append("id does not match required pattern")
-    elif not (path.name.startswith(f"{memory_id}-") or path.name == f"{memory_id}.md"):
+    elif not path.name.startswith(f"{memory_id}-"):
         errors.append("filename must start with id-")
 
     for field, choices in [
         ("type", TYPE_CHOICES),
         ("status", STATUS_CHOICES),
+        ("audit_status", AUDIT_STATUS_CHOICES),
         ("scope", SCOPE_CHOICES),
         ("workspace", WORKSPACE_CHOICES),
         ("confidentiality", CONFIDENTIALITY_CHOICES),
@@ -692,21 +680,32 @@ def validate_record(record, path, rel_path, expected_type):
     ]:
         if field in record and record[field] not in choices:
             errors.append(f"{field} has invalid value")
-    if schema not in {"memory/v1", "memory/v2", "recent/v1"}:
-        errors.append("schema has invalid value")
-    if is_recent and record.get("tier") != "recent":
-        errors.append("recent memory requires tier recent")
-    if not is_recent and "tier" in record and record.get("tier") not in {"long", "recent"}:
-        errors.append("tier has invalid value")
 
-    for field in ("title", "source", "subject", "predicate", "object", "source_id", "source_path", "source_sha256"):
+    if "confirmation" in record and record["confirmation"] != "explicit":
+        errors.append("confirmation has invalid value")
+    if "expected_target_status" in record and record["expected_target_status"] not in STATUS_CHOICES:
+        errors.append("expected_target_status has invalid value")
+    for field in ("expected_target_sha256", "proposal_input_hash"):
+        if field in record and (
+            not isinstance(record[field], str) or not re.fullmatch(r"[a-f0-9]{64}", record[field])
+        ):
+            errors.append(f"{field} must be a lowercase SHA256")
+    if "new_record_json" in record:
+        try:
+            new_record = json.loads(record["new_record_json"])
+        except (TypeError, json.JSONDecodeError):
+            new_record = None
+        if not isinstance(new_record, dict):
+            errors.append("new_record_json must encode an object")
+
+    for field in ("title", "source"):
         if field in record and (not isinstance(record[field], str) or not record[field]):
             errors.append(f"{field} must be a non-empty string")
     if "content" in record and not isinstance(record["content"], str):
         errors.append("content must be a string")
 
     dates = {}
-    for field in ("created", "updated", "valid_from", "valid_until", "effective_date"):
+    for field in ("created", "updated", "valid_from", "valid_until", "effective_date", "reviewed_at"):
         if field in record:
             parsed = _real_date(record[field])
             if parsed is None:
@@ -731,19 +730,11 @@ def validate_record(record, path, rel_path, expected_type):
                     elif item in seen:
                         errors.append(f"{field} contains duplicate item: {item}")
                     seen.add(item)
-    for value in record.get("relations", []) if isinstance(record.get("relations"), list) else []:
-        relation, target = _relation_parts(value)
-        if not relation or not target:
-            errors.append("relation must use relation:target format")
-        elif relation not in RELATION_CHOICES:
-            errors.append("relation has invalid predicate")
 
     memory_type = record.get("type")
     scope = record.get("scope")
-    if not is_recent and memory_type != expected_type:
+    if memory_type != expected_type:
         errors.append("type does not match directory")
-    if is_recent:
-        return [(rel_path, message) for message in errors]
     if memory_type == "context":
         if scope != "context":
             errors.append("type context requires scope context")
@@ -772,7 +763,7 @@ def validate_record(record, path, rel_path, expected_type):
 
 def _memory_paths(root):
     paths = []
-    for relative_dir in list(TYPE_DIRS.values()) + [RECENT_DIR]:
+    for relative_dir in TYPE_DIRS.values():
         directory = root / relative_dir
         if not directory.exists():
             continue
@@ -804,15 +795,13 @@ def collect_validated_records(root):
             if rel_path == relative_dir or rel_path.startswith(relative_dir + "/"):
                 expected_type = memory_type
                 break
-        if expected_type is None and (rel_path == RECENT_DIR or rel_path.startswith(RECENT_DIR + "/")):
-            expected_type = "recent"
-        record, body, parse_errors = parse_memory_document(path)
+        record, parse_errors = parse_front_matter(path)
         for message in parse_errors:
             errors.append((rel_path, message))
         if record is None:
             continue
         errors.extend(validate_record(record, path, rel_path, expected_type))
-        records.append({"relative_path": rel_path, "record": record, "body": body, "path": path})
+        records.append({"relative_path": rel_path, "record": record, "path": path})
 
     errors.extend(_validate_cross_file([(item["relative_path"], item["record"]) for item in records]))
     return root, records, errors, len(paths)
@@ -828,6 +817,7 @@ def _validate_cross_file(records):
     ids = {}
     context_ids = set()
     active_contexts = {}
+    active_projects = {}
     for rel_path, record in records:
         memory_id = record.get("id")
         if isinstance(memory_id, str):
@@ -836,6 +826,8 @@ def _validate_cross_file(records):
             context_ids.add(record["context_id"])
             if record.get("status") == "active" and isinstance(record.get("workspace"), str):
                 active_contexts.setdefault(record["workspace"], []).append(rel_path)
+        if record.get("type") == "project" and record.get("status") == "active" and isinstance(record.get("project"), str):
+            active_projects.setdefault(record["project"], []).append(rel_path)
 
     for memory_id in sorted(ids):
         paths = ids[memory_id]
@@ -844,6 +836,13 @@ def _validate_cross_file(records):
                 errors.append((rel_path, f"duplicate id: {memory_id}"))
 
     for rel_path, record in records:
+        project = record.get("project")
+        if record.get("type") == "project":
+            if record.get("status") == "active" and isinstance(project, str) and len(active_projects.get(project, [])) > 1:
+                errors.append((rel_path, f"multiple active project records: {project}"))
+        elif record.get("scope") == "project" or (record.get("status") == "candidate" and project):
+            if project not in active_projects:
+                errors.append((rel_path, "project does not reference an active project"))
         if "context_id" in record and record.get("type") != "context" and record["context_id"] not in context_ids:
             errors.append((rel_path, "context_id does not reference an existing context"))
         if record.get("type") == "context_transition":
@@ -851,7 +850,13 @@ def _validate_cross_file(records):
             to_context = record.get("to_context")
             if from_context not in context_ids:
                 errors.append((rel_path, "from_context does not reference an existing context"))
-            if to_context not in context_ids:
+            planned_context = None
+            if record.get("status") == "candidate" and isinstance(record.get("new_record_json"), str):
+                try:
+                    planned_context = json.loads(record["new_record_json"]).get("context_id")
+                except (AttributeError, json.JSONDecodeError):
+                    pass
+            if to_context not in context_ids and planned_context != to_context:
                 errors.append((rel_path, "to_context does not reference an existing context"))
             if from_context and to_context and from_context == to_context:
                 errors.append((rel_path, "from_context and to_context must differ"))
@@ -887,7 +892,7 @@ def atomic_write_text(path, content):
         raise
 
 
-def export_store(root, include_internal=False):
+def export_store(root, include_internal=False, state_dir=None):
     root, records, errors, _ = collect_validated_records(root)
     if errors:
         return None, errors
@@ -916,8 +921,28 @@ def export_store(root, include_internal=False):
         json.dumps(row, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
         for row in exported
     )
+    content_hash = hashlib.sha256(jsonl.encode("utf-8")).hexdigest()
+    state = Path(state_dir).expanduser() if state_dir else default_state_dir()
+    database = state / DB_NAME
+    database_hash = hashlib.sha256(database.read_bytes()).hexdigest() if database.is_file() else None
+    manifest_path = root / "exports/index_manifest.json"
+    previous = {}
+    if manifest_path.is_file():
+        try:
+            previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            previous = {}
+    generated_at = previous.get("generated_at") if (
+        previous.get("content_hash") == content_hash and previous.get("database_hash") == database_hash
+    ) else datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     manifest = {
         "format_version": 1,
+        "generated_at": generated_at,
+        "schema_version": DB_SCHEMA_VERSION,
+        "database_hash": database_hash,
+        "record_count": len(exported),
+        "source_root": str(root),
+        "content_hash": content_hash,
         "records": [
             {
                 "id": row["record"]["id"],
@@ -935,7 +960,7 @@ def export_store(root, include_internal=False):
 
     exports = root / "exports"
     atomic_write_text(exports / "memory.jsonl", jsonl)
-    atomic_write_text(exports / "index_manifest.json", manifest_text)
+    atomic_write_text(manifest_path, manifest_text)
     return {
         "exported": len(exported),
         "skipped_internal": skipped_internal,
@@ -964,8 +989,6 @@ def _expected_type_for_path(root, path):
     for relative_dir, memory_type in DIR_TYPES.items():
         if rel_path == relative_dir or rel_path.startswith(relative_dir + "/"):
             return memory_type
-    if rel_path == RECENT_DIR or rel_path.startswith(RECENT_DIR + "/"):
-        return "recent"
     return None
 
 
@@ -996,17 +1019,49 @@ def _prepare_text(path, content):
 
 def _replace_transaction(operations, cleanup_paths):
     prepared = []
+    backups = []
+    replaced = []
+    directories = {path.parent for path, _ in operations}
+
+    def sync_directories():
+        for directory in directories:
+            descriptor = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
     try:
         for path, content in operations:
             prepared.append((_prepare_text(path, content), path))
+        for _, path in prepared:
+            if path.exists():
+                backup = path.parent / f".backup-{path.name}-{uuid.uuid4().hex}"
+                shutil.copy2(path, backup)
+                backups.append((backup, path))
         for tmp, path in prepared:
-            tmp.replace(path)
-    except OSError:
+            os.replace(tmp, path)
+            replaced.append(path)
+            sync_directories()
+    except Exception:
         for tmp, _ in prepared:
             tmp.unlink(missing_ok=True)
+        backed_up = {path: backup for backup, path in backups}
+        for path in reversed(replaced):
+            backup = backed_up.get(path)
+            if backup is not None:
+                os.replace(backup, path)
+            else:
+                path.unlink(missing_ok=True)
         for path in cleanup_paths:
             path.unlink(missing_ok=True)
+        for backup, _ in backups:
+            backup.unlink(missing_ok=True)
+        sync_directories()
         raise
+    for backup, _ in backups:
+        backup.unlink(missing_ok=True)
+    sync_directories()
 
 
 def context_transition(args):
@@ -1060,18 +1115,10 @@ def context_transition(args):
         for item in records
         if isinstance(item["record"].get("id"), str)
     }
-    source_record = dict(source_item["record"])
-    source_record["status"] = "historical"
-    source_record["updated"] = today
-    source_record["valid_until"] = (effective - timedelta(days=1)).isoformat()
-
+    source_record = source_item["record"]
     new_context_id, new_context_path = _new_memory_target(root, "context", args.to_title, used_ids)
     transition_title = f"从「{source_record['title']}」迁移到「{args.to_title}」"
     transition_id, transition_path = _new_memory_target(root, "context_transition", transition_title, used_ids)
-    superseded_by = list(source_record.get("superseded_by", []))
-    if new_context_id not in superseded_by:
-        superseded_by.append(new_context_id)
-    source_record["superseded_by"] = superseded_by
 
     content = args.content if args.content is not None else args.reason
     new_context_record = {
@@ -1092,13 +1139,27 @@ def context_transition(args):
         "tags": args.tags or [],
         "content": content,
     }
+    target_sha256 = hashlib.sha256(source_item["path"].read_bytes()).hexdigest()
+    new_record_json = json.dumps(new_context_record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    proposal_input = {
+        "from_context": args.from_context,
+        "to_context": args.to_context,
+        "effective_date": args.effective_date,
+        "reason": args.reason,
+        "source": args.source,
+        "confidence": args.confidence,
+        "target_id": source_record["id"],
+        "target_sha256": target_sha256,
+        "new_record": new_context_record,
+    }
     transition_record = {
         "id": transition_id,
         "type": "context_transition",
         "title": transition_title,
         "created": today,
         "updated": today,
-        "status": "active",
+        "status": "candidate",
+        "audit_status": "awaiting_review",
         "scope": "context",
         "workspace": args.workspace,
         "confidentiality": args.confidentiality,
@@ -1108,22 +1169,22 @@ def context_transition(args):
         "to_context": args.to_context,
         "effective_date": args.effective_date,
         "reason": args.reason,
+        "candidate_action": "UPDATE",
+        "requested_action": "context_transition",
+        "target_id": source_record["id"],
+        "expected_target_status": "active",
+        "expected_target_sha256": target_sha256,
+        "proposal_input_hash": hashlib.sha256(
+            json.dumps(proposal_input, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "new_record_json": new_record_json,
         "tags": args.tags or [],
         "content": content,
     }
 
-    final_records = []
-    for item in records:
-        if item is source_item:
-            final_records.append({**item, "record": source_record})
-        else:
-            final_records.append(item)
-    final_records.extend(
-        [
-            {"relative_path": new_context_path.relative_to(root).as_posix(), "record": new_context_record, "path": new_context_path},
-            {"relative_path": transition_path.relative_to(root).as_posix(), "record": transition_record, "path": transition_path},
-        ]
-    )
+    final_records = list(records) + [
+        {"relative_path": transition_path.relative_to(root).as_posix(), "record": transition_record, "path": transition_path},
+    ]
     final_errors = _validate_hypothetical_records(root, final_records)
     if final_errors:
         _transition_abort([f"ERROR {rel_path}: {message}" for rel_path, message in final_errors])
@@ -1141,21 +1202,14 @@ def context_transition(args):
         summary["dry_run"] = True
         return summary
 
-    _replace_transaction(
-        [
-            (new_context_path, render_memory(new_context_record)),
-            (transition_path, render_memory(transition_record)),
-            (source_path, render_existing_memory(source_path, source_record)),
-        ],
-        [new_context_path, transition_path],
-    )
+    _replace_transaction([(transition_path, render_memory(transition_record))], [transition_path])
     summary["dry_run"] = False
     return summary
 
 
 def check_fts5():
     try:
-        with sqlite3.connect(":memory:") as conn:
+        with closing(sqlite3.connect(":memory:")) as conn:
             conn.execute("CREATE VIRTUAL TABLE temp.fts5_probe USING fts5(content)")
     except sqlite3.DatabaseError as exc:
         raise ValueError("SQLite FTS5 is not available in this Python build.") from exc
@@ -1190,29 +1244,6 @@ def check_state_dir(root, state_dir):
     return state, db
 
 
-@contextlib.contextmanager
-def write_lock(root, state_dir):
-    state, _ = check_state_dir(_require_data_root(root), state_dir or default_state_dir())
-    state.mkdir(parents=True, exist_ok=True)
-    lock_path = state / LOCK_NAME
-    if lock_path in _LOCK_STACK:
-        _LOCK_STACK.append(lock_path)
-        try:
-            yield
-        finally:
-            _LOCK_STACK.pop()
-        return
-    with lock_path.open("w", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        _LOCK_STACK.append(lock_path)
-        try:
-            yield
-        finally:
-            _LOCK_STACK.pop()
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    lock_path.unlink(missing_ok=True)
-
-
 def _configure_sqlite(conn):
     conn.execute("PRAGMA foreign_keys = ON")
     mode = conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
@@ -1222,28 +1253,61 @@ def _configure_sqlite(conn):
     conn.execute("PRAGMA busy_timeout = 5000")
 
 
+def _create_document_schema(conn):
+    conn.executescript(
+        """
+        CREATE TABLE documents (
+            id TEXT PRIMARY KEY,
+            source_kind TEXT NOT NULL,
+            source_id TEXT,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            workspace TEXT NOT NULL,
+            confidentiality TEXT NOT NULL,
+            project TEXT,
+            context_id TEXT,
+            updated TEXT,
+            relative_path TEXT NOT NULL UNIQUE,
+            sha256 TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX idx_documents_source_kind ON documents(source_kind);
+        CREATE INDEX idx_documents_project ON documents(project);
+        CREATE INDEX idx_documents_workspace_confidentiality
+            ON documents(workspace, confidentiality);
+        CREATE VIRTUAL TABLE document_fts USING fts5(
+            id UNINDEXED,
+            title,
+            content,
+            source_kind,
+            project,
+            tokenize = 'unicode61'
+        );
+        CREATE TABLE document_index_state (
+            relative_path TEXT PRIMARY KEY,
+            sha256 TEXT NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            indexed_at TEXT NOT NULL
+        );
+        """
+    )
+
+
 def _create_schema(conn):
     conn.executescript(
         """
         CREATE TABLE memories (
             id TEXT PRIMARY KEY,
-            schema TEXT NOT NULL DEFAULT 'memory/v1',
-            tier TEXT NOT NULL DEFAULT 'long',
             type TEXT NOT NULL,
             title TEXT NOT NULL,
             content TEXT NOT NULL,
-            body TEXT NOT NULL DEFAULT '',
             tags TEXT NOT NULL DEFAULT '[]',
-            aliases TEXT NOT NULL DEFAULT '[]',
             status TEXT NOT NULL,
             scope TEXT NOT NULL,
             workspace TEXT NOT NULL,
             confidentiality TEXT NOT NULL,
             source TEXT NOT NULL,
             confidence TEXT NOT NULL,
-            source_id TEXT,
-            source_path TEXT,
-            source_sha256 TEXT,
             context_id TEXT,
             project TEXT,
             valid_from TEXT,
@@ -1251,8 +1315,7 @@ def _create_schema(conn):
             created TEXT NOT NULL,
             updated TEXT NOT NULL,
             relative_path TEXT NOT NULL UNIQUE,
-            sha256 TEXT NOT NULL,
-            metadata_json TEXT NOT NULL DEFAULT '{}'
+            sha256 TEXT NOT NULL
         );
         CREATE INDEX idx_memories_type ON memories(type);
         CREATE INDEX idx_memories_project ON memories(project);
@@ -1263,9 +1326,7 @@ def _create_schema(conn):
             id UNINDEXED,
             title,
             content,
-            body,
             tags,
-            aliases,
             tokenize = 'unicode61'
         );
         CREATE TABLE index_state (
@@ -1274,38 +1335,67 @@ def _create_schema(conn):
             mtime_ns INTEGER NOT NULL,
             indexed_at TEXT NOT NULL
         );
-        CREATE TABLE links (
-            source_id TEXT NOT NULL,
-            target_id TEXT,
-            target_ref TEXT NOT NULL,
-            relation TEXT NOT NULL,
-            source_kind TEXT NOT NULL,
-            target_heading TEXT,
-            target_block TEXT,
-            context TEXT,
-            resolved INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE INDEX idx_links_source ON links(source_id);
-        CREATE INDEX idx_links_target ON links(target_id);
-        CREATE INDEX idx_links_ref ON links(target_ref);
-        CREATE TABLE distillation_audit (
-            recent_id TEXT PRIMARY KEY,
-            relative_path TEXT NOT NULL,
-            source_sha256 TEXT NOT NULL,
-            status TEXT NOT NULL,
-            result_json TEXT NOT NULL DEFAULT '{}',
-            distilled_at TEXT,
-            delete_after TEXT,
-            deleted_at TEXT,
-            error TEXT
-        );
-        PRAGMA user_version = 2;
         """
     )
+    _create_document_schema(conn)
+    conn.execute(f"PRAGMA user_version = {DB_SCHEMA_VERSION}")
 
 
 def _table_columns(conn, table):
     return [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+
+
+def _column_affinity(declared_type):
+    value = (declared_type or "").upper()
+    if "INT" in value:
+        return "INTEGER"
+    if any(token in value for token in ("CHAR", "CLOB", "TEXT")):
+        return "TEXT"
+    if any(token in value for token in ("REAL", "FLOA", "DOUB")):
+        return "REAL"
+    if "BLOB" in value or not value:
+        return "BLOB"
+    return "NUMERIC"
+
+
+def _require_compatible_columns(conn, table, required):
+    actual = {row[1]: row[2] for row in conn.execute(f"PRAGMA table_info({table})")}
+    missing = sorted(set(required) - set(actual))
+    if missing:
+        raise ValueError(f"SQLite {table} columns are incomplete: {', '.join(missing)}")
+    wrong = sorted(
+        name for name, expected in required.items()
+        if _column_affinity(actual[name]) != _column_affinity(expected)
+    )
+    if wrong:
+        raise ValueError(f"SQLite {table} column types do not match: {', '.join(wrong)}")
+
+
+def _require_fts_columns(conn, table):
+    columns = set(_table_columns(conn, table))
+    missing = sorted(REQUIRED_FTS_COLUMNS[table] - columns)
+    if missing:
+        raise ValueError(f"SQLite {table} columns are incomplete: {', '.join(missing)}")
+
+
+def _require_fts5(conn, table, sql):
+    if "USING FTS5" not in " ".join(sql.upper().split()):
+        raise ValueError(f"SQLite {table} is not FTS5.")
+    _require_fts_columns(conn, table)
+    conn.execute(f"SELECT COUNT(*) FROM {table} WHERE {table} MATCH ?", ("__fts5_probe__",)).fetchone()
+
+
+def _require_index_columns(conn, table):
+    available = []
+    for row in conn.execute(f"PRAGMA index_list({table})"):
+        name = row[1]
+        available.append(tuple(item[2] for item in conn.execute(f"PRAGMA index_info({name})")))
+    missing = [
+        required for required in REQUIRED_INDEX_COLUMNS[table]
+        if not any(columns[: len(required)] == required for columns in available)
+    ]
+    if missing:
+        raise ValueError(f"SQLite {table} indexes are incomplete.")
 
 
 def _target_tables(conn):
@@ -1315,59 +1405,46 @@ def _target_tables(conn):
             """
             SELECT name, type, sql
             FROM sqlite_master
-            WHERE name IN ('memories', 'memory_fts', 'index_state', 'links', 'distillation_audit')
+            WHERE name IN (
+                'memories', 'memory_fts', 'index_state',
+                'documents', 'document_fts', 'document_index_state'
+            )
             """
         )
     }
 
 
-def _inspect_database_connection(conn, verify_wal=True):
-    version = conn.execute("PRAGMA user_version").fetchone()[0]
-    mode = conn.execute("PRAGMA journal_mode").fetchone()[0] if verify_wal else "wal"
-    tables = _target_tables(conn)
-    if version != DB_SCHEMA_VERSION:
-        if version == 0 and not tables:
-            return {"initialized": False, "version": version}
-        raise ValueError("Incompatible SQLite schema version.")
-    if str(mode).lower() != "wal":
-        raise ValueError("SQLite journal_mode WAL could not be verified.")
-    if set(tables) != {"memories", "memory_fts", "index_state", "links", "distillation_audit"}:
-        raise ValueError("SQLite schema is incomplete.")
-    if "CREATE VIRTUAL TABLE" not in tables["memory_fts"][1].upper():
-        raise ValueError("SQLite FTS5 table is missing.")
-    if _table_columns(conn, "memories") != MEMORIES_COLUMNS:
-        raise ValueError("SQLite memories table columns do not match.")
-    if _table_columns(conn, "index_state") != INDEX_STATE_COLUMNS:
-        raise ValueError("SQLite index_state table columns do not match.")
-    if _table_columns(conn, "links") != LINK_COLUMNS:
-        raise ValueError("SQLite links table columns do not match.")
-    if _table_columns(conn, "distillation_audit") != AUDIT_COLUMNS:
-        raise ValueError("SQLite distillation_audit table columns do not match.")
-    indexes = {
-        row[0]
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_memories_%'"
-        )
-    }
-    if not REQUIRED_INDEXES.issubset(indexes):
-        raise ValueError("SQLite memories indexes are incomplete.")
-    return {"initialized": True, "version": version}
-
-
 def inspect_database(db):
     try:
-        with sqlite3.connect(db) as conn:
-            return _inspect_database_connection(conn)
+        with closing(sqlite3.connect(db)) as conn:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            tables = _target_tables(conn)
+            if version != DB_SCHEMA_VERSION:
+                if version == 0 and not tables:
+                    return {"initialized": False, "version": version}
+                raise ValueError("Incompatible SQLite schema version.")
+            if str(mode).lower() != "wal":
+                raise ValueError("SQLite journal_mode WAL could not be verified.")
+            required_tables = {
+                "memories",
+                "memory_fts",
+                "index_state",
+                "documents",
+                "document_fts",
+                "document_index_state",
+            }
+            if set(tables) != required_tables:
+                raise ValueError("SQLite schema is incomplete.")
+            for table in ("memories", "index_state", "documents", "document_index_state"):
+                _require_compatible_columns(conn, table, REQUIRED_COLUMN_TYPES[table])
+            _require_fts5(conn, "memory_fts", tables["memory_fts"][1])
+            _require_fts5(conn, "document_fts", tables["document_fts"][1])
+            _require_index_columns(conn, "memories")
+            _require_index_columns(conn, "documents")
+            return {"initialized": True, "version": version}
     except sqlite3.DatabaseError as exc:
         raise ValueError("Invalid SQLite database.") from exc
-
-
-def database_has_wal_header(db):
-    try:
-        header = db.read_bytes()[:100]
-    except OSError as exc:
-        raise ValueError("Invalid SQLite database.") from exc
-    return len(header) >= 100 and header[18] == 2 and header[19] == 2
 
 
 def _checkpoint_and_close(conn):
@@ -1377,19 +1454,16 @@ def _checkpoint_and_close(conn):
         conn.close()
 
 
-def sqlite_sidecars(path):
-    return [Path(str(path) + suffix) for suffix in ("-wal", "-shm")]
-
-
 def _remove_sqlite_sidecars(path):
-    for sidecar in sqlite_sidecars(path):
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(path) + suffix)
         if sidecar.exists():
             sidecar.unlink()
 
 
 def checkpoint_database(db):
     try:
-        with sqlite3.connect(db) as conn:
+        with closing(sqlite3.connect(db)) as conn:
             conn.execute("PRAGMA busy_timeout = 5000")
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except sqlite3.DatabaseError as exc:
@@ -1457,8 +1531,192 @@ def db_init(args):
         "state_dir": state,
         "database": db,
         "version": DB_SCHEMA_VERSION,
-        "tables": ["memories", "memory_fts", "index_state", "links", "distillation_audit"],
+        "tables": ["memories", "memory_fts", "index_state", "documents", "document_fts", "document_index_state"],
     }
+
+
+def db_rebuild(args):
+    root, _, errors, _ = collect_validated_records(args.root)
+    if errors:
+        messages = [f"ERROR {rel_path}: {message}" for rel_path, message in errors]
+        raise ValueError("\n".join(messages + ["Database rebuild aborted because validation failed."]))
+
+    check_fts5()
+    state_dir = args.state_dir if args.state_dir else default_state_dir()
+    state, db = check_state_dir(root, state_dir)
+    state.mkdir(parents=True, exist_ok=True)
+    tmp_state = state / f".rebuild-{uuid.uuid4().hex}"
+    tmp_db = tmp_state / DB_NAME
+    try:
+        tmp_state.mkdir()
+        create_database(tmp_db)
+        index_summary = index_store(argparse.Namespace(root=str(root), state_dir=str(tmp_state), dry_run=False))
+        _remove_sqlite_sidecars(db)
+        tmp_db.replace(db)
+        _remove_sqlite_sidecars(tmp_db)
+        checkpoint_database(db)
+        return {
+            "database": db,
+            "version": DB_SCHEMA_VERSION,
+            "memories": index_summary["memories"],
+            "documents": index_summary["documents"],
+        }
+    finally:
+        shutil.rmtree(tmp_state, ignore_errors=True)
+
+
+def _read_only_connection(path):
+    return sqlite3.connect(Path(path).expanduser().resolve().as_uri() + "?mode=ro", uri=True)
+
+
+def inspect_v2_database(db):
+    required_tables = {"memories", "memory_fts", "index_state", "links", "distillation_audit"}
+    try:
+        with closing(_read_only_connection(db)) as conn:
+            conn.execute("PRAGMA query_only = ON")
+            if conn.execute("PRAGMA user_version").fetchone()[0] != 2:
+                raise ValueError("Migration source must use SQLite schema version 2.")
+            if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise ValueError("Migration source integrity_check failed.")
+            if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise ValueError("Migration source quick_check failed.")
+            objects = {
+                name: (object_type, sql or "")
+                for name, object_type, sql in conn.execute(
+                    "SELECT name, type, sql FROM sqlite_master WHERE name IN (?,?,?,?,?)",
+                    tuple(sorted(required_tables)),
+                )
+            }
+            if set(objects) != required_tables:
+                raise ValueError("Migration source v2 schema is incomplete.")
+            _require_compatible_columns(conn, "memories", REQUIRED_COLUMN_TYPES["memories"])
+            _require_compatible_columns(conn, "index_state", REQUIRED_COLUMN_TYPES["index_state"])
+            _require_fts5(conn, "memory_fts", objects["memory_fts"][1])
+            _require_index_columns(conn, "memories")
+            _require_index_columns(conn, "links")
+            return {
+                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in required_tables
+            }
+    except sqlite3.DatabaseError as exc:
+        raise ValueError("Invalid SQLite v2 migration source.") from exc
+
+
+def _verify_database_memory_files(conn, root):
+    columns = set(_table_columns(conn, "memories"))
+    source_columns = {"source_path", "source_sha256"}.issubset(columns)
+    selected = "relative_path, sha256" + (", source_path, source_sha256" if source_columns else "")
+    verified_sources = 0
+    for row in conn.execute(f"SELECT {selected} FROM memories"):
+        relative_path, expected = row[0], row[1]
+        path = (root / relative_path).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"Indexed memory path escapes data root: {relative_path}") from exc
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            raise ValueError(f"Indexed memory file hash mismatch: {relative_path}")
+        if source_columns and row[2] and row[3]:
+            source_path = (root / row[2]).resolve()
+            try:
+                source_path.relative_to(root)
+            except ValueError as exc:
+                raise ValueError(f"Source path escapes data root: {row[2]}") from exc
+            if not source_path.is_file() or hashlib.sha256(source_path.read_bytes()).hexdigest() != row[3]:
+                raise ValueError(f"Source file hash mismatch: {row[2]}")
+            verified_sources += 1
+    return verified_sources
+
+
+def _sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def migrate_database_v2_to_v3(source, output, data_root):
+    source = Path(source).expanduser().resolve()
+    output = Path(output).expanduser().resolve(strict=False)
+    root = _require_data_root(data_root).resolve()
+    if source == output:
+        raise ValueError("Migration source and output must differ.")
+    if not source.is_file():
+        raise ValueError("Migration source database does not exist.")
+    if output.exists():
+        raise ValueError("Migration output already exists.")
+
+    source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+    before = inspect_v2_database(source)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.parent / f".tmp-{output.name}-{uuid.uuid4().hex}"
+    document_items, skipped = collect_document_items_with_skips(root)
+    source_conn = destination_conn = None
+    try:
+        source_conn = _read_only_connection(source)
+        destination_conn = sqlite3.connect(temporary)
+        source_conn.backup(destination_conn)
+        destination_conn.close()
+        destination_conn = None
+        source_conn.close()
+        source_conn = None
+
+        with closing(sqlite3.connect(temporary)) as conn:
+            _create_document_schema(conn)
+            conn.execute(f"PRAGMA user_version = {DB_SCHEMA_VERSION}")
+            conn.commit()
+            try:
+                conn.execute("BEGIN")
+                document_plan = plan_document_changes(conn, document_items)
+                apply_document_changes(conn, document_plan, len(document_items))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            after = {
+                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in before
+            }
+            if after != before:
+                raise ValueError("Migration changed legacy table counts.")
+            check_index_consistency(conn, before["memories"])
+            verified_sources = _verify_database_memory_files(conn, root)
+            if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise ValueError("Migrated database integrity_check failed.")
+            if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise ValueError("Migrated database quick_check failed.")
+
+        checkpoint_database(temporary)
+        inspect_database(temporary)
+        if hashlib.sha256(source.read_bytes()).hexdigest() != source_sha256:
+            raise ValueError("Migration source database changed unexpectedly.")
+        os.replace(temporary, output)
+        _sync_directory(output.parent)
+        return {
+            "source": source,
+            "output": output,
+            "memories": before["memories"],
+            "memory_fts": before["memory_fts"],
+            "index_state": before["index_state"],
+            "links": before["links"],
+            "distillation_audit": before["distillation_audit"],
+            "documents": len(document_items),
+            "verified_sources": verified_sources,
+            "skipped_documents": sum(skipped.values()),
+            "skip_reasons": skipped,
+            "source_sha256": source_sha256,
+        }
+    except Exception:
+        if destination_conn is not None:
+            destination_conn.close()
+        if source_conn is not None:
+            source_conn.close()
+        temporary.unlink(missing_ok=True)
+        _remove_sqlite_sidecars(temporary)
+        output.unlink(missing_ok=True)
+        _remove_sqlite_sidecars(output)
+        raise
 
 
 def normalize_fts_text(value):
@@ -1484,69 +1742,20 @@ def _record_tags(record):
     return tags if isinstance(tags, list) else []
 
 
-def _record_aliases(record):
-    aliases = record.get("aliases", [])
-    return aliases if isinstance(aliases, list) else []
-
-
-def _record_schema(record):
-    return record.get("schema", "memory/v1")
-
-
-def _record_tier(record):
-    if _record_schema(record) == "recent/v1":
-        return "recent"
-    return record.get("tier", "long")
-
-
-def _metadata_json(record):
-    structured = {
-        key: value
-        for key, value in record.items()
-        if key
-        in {
-            "subject",
-            "predicate",
-            "object",
-            "relations",
-            "source_id",
-            "source_path",
-            "source_sha256",
-            "source_refs",
-            "retention_until",
-            "distillation_status",
-            "distilled_at",
-            "protected",
-            "original_name",
-            "media_type",
-            "extractor",
-            "imported_at",
-        }
-    }
-    return json.dumps(structured, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
 def _record_to_db_values(item):
     record = item["record"]
     return {
         "id": record["id"],
-        "schema": _record_schema(record),
-        "tier": _record_tier(record),
         "type": record["type"],
         "title": record["title"],
         "content": record["content"],
-        "body": item.get("body", ""),
         "tags": json.dumps(_record_tags(record), ensure_ascii=False, separators=(",", ":")),
-        "aliases": json.dumps(_record_aliases(record), ensure_ascii=False, separators=(",", ":")),
         "status": record["status"],
-        "scope": record.get("scope", "global"),
-        "workspace": record.get("workspace", "personal"),
-        "confidentiality": record.get("confidentiality", "personal"),
+        "scope": record["scope"],
+        "workspace": record["workspace"],
+        "confidentiality": record["confidentiality"],
         "source": record["source"],
-        "confidence": record.get("confidence", "inferred"),
-        "source_id": record.get("source_id"),
-        "source_path": record.get("source_path"),
-        "source_sha256": record.get("source_sha256"),
+        "confidence": record["confidence"],
         "context_id": record.get("context_id"),
         "project": record.get("project"),
         "valid_from": record.get("valid_from"),
@@ -1555,7 +1764,6 @@ def _record_to_db_values(item):
         "updated": record["updated"],
         "relative_path": item["relative_path"],
         "sha256": item["sha256"],
-        "metadata_json": _metadata_json(record),
     }
 
 
@@ -1565,60 +1773,8 @@ def _fts_values(item):
         record["id"],
         normalize_fts_text(record["title"]),
         normalize_fts_text(record["content"]),
-        normalize_fts_text(item.get("body", "")),
         normalize_fts_text(" ".join(_record_tags(record))),
-        normalize_fts_text(" ".join(_record_aliases(record))),
     )
-
-
-WIKILINK_PATTERN = re.compile(r"!?\[\[([^\]|#\^]+)(?:#([^\]|\^]+))?(?:\^([^\]|]+))?(?:\|[^\]]*)?\]\]")
-
-
-def _identity_maps(items):
-    ids = {}
-    aliases = {}
-    for item in items:
-        record = item["record"]
-        memory_id = record.get("id")
-        if isinstance(memory_id, str):
-            ids[memory_id] = memory_id
-        for alias in _record_aliases(record):
-            aliases.setdefault(alias, memory_id)
-    return ids, aliases
-
-
-def _resolve_ref(target_ref, ids, aliases):
-    if target_ref in ids:
-        return ids[target_ref], 1
-    if target_ref in aliases:
-        return aliases[target_ref], 1
-    return None, 0
-
-
-def _links_for_item(item, ids, aliases):
-    record = item["record"]
-    source_id = record["id"]
-    links = []
-    seen = set()
-    for value in record.get("relations", []) if isinstance(record.get("relations"), list) else []:
-        relation, target_ref = _relation_parts(value)
-        if relation not in RELATION_CHOICES or not target_ref:
-            continue
-        target_id, resolved = _resolve_ref(target_ref, ids, aliases)
-        key = (source_id, target_ref, relation, "frontmatter", None, None)
-        if key not in seen:
-            links.append((source_id, target_id, target_ref, relation, "frontmatter", None, None, value, resolved))
-            seen.add(key)
-    for match in WIKILINK_PATTERN.finditer(item.get("body", "")):
-        target_ref = match.group(1).strip()
-        heading = (match.group(2) or "").strip() or None
-        block = (match.group(3) or "").strip() or None
-        target_id, resolved = _resolve_ref(target_ref, ids, aliases)
-        key = (source_id, target_ref, "related_to", "body", heading, block)
-        if key not in seen:
-            links.append((source_id, target_id, target_ref, "related_to", "body", heading, block, match.group(0), resolved))
-            seen.add(key)
-    return links
 
 
 def _current_index_items(root, records):
@@ -1630,7 +1786,6 @@ def _current_index_items(root, records):
             {
                 "relative_path": item["relative_path"],
                 "record": item["record"],
-                "body": item.get("body", ""),
                 "path": path,
                 "sha256": hashlib.sha256(raw).hexdigest(),
                 "mtime_ns": path.stat().st_mtime_ns,
@@ -1639,22 +1794,281 @@ def _current_index_items(root, records):
     return sorted(items, key=lambda value: value["relative_path"])
 
 
+def document_source_kind(relative_path):
+    if relative_path.startswith("imports/chatgpt/conversations/"):
+        return "chatgpt"
+    if relative_path.startswith("imports/manual/raw/"):
+        return "manual"
+    if relative_path.startswith("imports/manual/text/"):
+        return "manual"
+    if relative_path.startswith("literature/notes/"):
+        return "literature"
+    if relative_path.startswith("literature/journals/"):
+        return "journal"
+    if (
+        relative_path.startswith("manuscripts/current/")
+        or relative_path.startswith("manuscripts/evidence/")
+        or relative_path.startswith("manuscripts/archive/")
+    ):
+        return "manuscript"
+    return None
+
+
+def _manual_document_key(relative_path):
+    path = Path(relative_path)
+    for prefix in ("imports/manual/raw", "imports/manual/text"):
+        try:
+            return path.relative_to(prefix).with_suffix("").as_posix()
+        except ValueError:
+            continue
+    return None
+
+
+def parse_document_frontmatter(text):
+    metadata = {
+        "workspace": "personal",
+        "confidentiality": "personal",
+        "project": None,
+        "context_id": None,
+    }
+    body = text
+    if text.startswith("---\n"):
+        lines = text.splitlines()
+        try:
+            end = lines.index("---", 1)
+        except ValueError:
+            return metadata, text
+        for line in lines[1:end]:
+            if ":" not in line or line.startswith(" "):
+                continue
+            key, raw = line.split(":", 1)
+            key = key.strip()
+            raw = raw.strip()
+            if key not in {
+                "title",
+                "conversation_id",
+                "archive_id",
+                "workspace",
+                "confidentiality",
+                "project",
+                "context_id",
+                "updated",
+                "source_path",
+                "source_sha256",
+                "original_name",
+                "media_type",
+                "extractor",
+                "imported_at",
+            }:
+                continue
+            try:
+                value = json.loads(raw) if raw.startswith('"') else raw
+            except json.JSONDecodeError:
+                value = raw
+            if value == "null":
+                value = None
+            metadata[key] = value
+        body = "\n".join(lines[end + 1 :]).strip()
+    return metadata, body
+
+
+def _sha16(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def document_id_for_path(relative_path, source_kind, source_id, sha256):
+    if source_kind == "chatgpt" and source_id:
+        return f"doc:chatgpt:{source_id}"
+    if source_kind == "manual":
+        return f"doc:manual:{sha256[:16]}"
+    return f"doc:file:{_sha16(relative_path)}"
+
+
+def _document_title(path, metadata):
+    title = metadata.get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    return path.stem or path.name
+
+
+def load_document_metadata(root):
+    path = _require_data_root(root) / "imports" / "document_metadata.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("Invalid document metadata file.") from exc
+    if data.get("format_version") != 1 or not isinstance(data.get("documents"), dict):
+        raise ValueError("Invalid document metadata file.")
+    return data["documents"]
+
+
+def save_document_metadata(root, documents):
+    path = _require_data_root(root) / "imports" / "document_metadata.json"
+    content = json.dumps({"format_version": 1, "documents": documents}, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    atomic_write_text(path, content)
+
+
+def document_meta_set(args):
+    root = _require_data_root(args.root)
+    relative_path = args.path.strip("/")
+    if document_source_kind(relative_path) is None:
+        raise ValueError("document metadata path is not an indexed document source.")
+    metadata = load_document_metadata(root)
+    current = dict(metadata.get(relative_path, {}))
+    for field in ["project", "workspace", "confidentiality", "context_id"]:
+        value = getattr(args, field)
+        if value is not None:
+            current[field] = value
+    if current.get("confidentiality") in {"internal", "restricted"} and current.get("workspace", "personal") != "work":
+        raise ValueError("internal or restricted document metadata requires workspace work.")
+    metadata[relative_path] = {key: value for key, value in current.items() if value not in {"", None}}
+    save_document_metadata(root, metadata)
+    return {"path": relative_path, "metadata": metadata[relative_path]}
+
+
+def document_meta_unset(args):
+    root = _require_data_root(args.root)
+    relative_path = args.path.strip("/")
+    metadata = load_document_metadata(root)
+    removed = metadata.pop(relative_path, None) is not None
+    save_document_metadata(root, metadata)
+    return {"path": relative_path, "removed": removed}
+
+
+def collect_document_items_with_skips(root):
+    root = _require_data_root(root)
+    document_metadata = load_document_metadata(root)
+    manual_text_keys = {
+        _manual_document_key(path.relative_to(root).as_posix())
+        for path in (root / "imports" / "manual" / "text").rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+    items = []
+    skipped = {}
+
+    def skip(reason):
+        skipped[reason] = skipped.get(reason, 0) + 1
+
+    for base in [
+        root / "imports" / "chatgpt" / "conversations",
+        root / "imports" / "manual" / "raw",
+        root / "imports" / "manual" / "text",
+        root / "literature" / "notes",
+        root / "literature" / "journals",
+        root / "manuscripts" / "current",
+        root / "manuscripts" / "evidence",
+        root / "manuscripts" / "archive",
+    ]:
+        if not base.exists():
+            continue
+        for path in sorted(base.rglob("*")):
+            if not path.is_file():
+                continue
+            if path.is_symlink():
+                skip("symlink")
+                continue
+            rel_path = path.relative_to(root).as_posix()
+            source_kind = document_source_kind(rel_path)
+            if source_kind is None:
+                skip("unsupported_source")
+                continue
+            if rel_path.startswith("imports/manual/raw/"):
+                if _manual_document_key(rel_path) in manual_text_keys:
+                    skip("text_sidecar_preferred")
+                    continue
+                if path.suffix.lower() not in TEXT_DOCUMENT_SUFFIXES:
+                    skip("unsupported_suffix")
+                    continue
+            try:
+                raw = path.read_bytes()
+                text = raw.decode("utf-8")
+            except OSError:
+                skip("read_error")
+                continue
+            except UnicodeDecodeError:
+                skip("not_utf8")
+                continue
+            metadata, body = parse_document_frontmatter(text)
+            metadata.update(document_metadata.get(rel_path, {}))
+            if not body.strip():
+                skip("empty_text")
+                continue
+            source_id = metadata.get("conversation_id") or metadata.get("archive_id")
+            sha256 = hashlib.sha256(raw).hexdigest()
+            metadata_json = json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            item = {
+                "id": document_id_for_path(rel_path, source_kind, source_id, sha256),
+                "source_kind": source_kind,
+                "source_id": source_id,
+                "title": _document_title(path, metadata),
+                "content": body.strip(),
+                "workspace": metadata.get("workspace") or "personal",
+                "confidentiality": metadata.get("confidentiality") or "personal",
+                "project": metadata.get("project"),
+                "context_id": metadata.get("context_id"),
+                "updated": metadata.get("updated"),
+                "relative_path": rel_path,
+                "sha256": sha256,
+                "index_sha256": hashlib.sha256((sha256 + "\n" + metadata_json).encode("utf-8")).hexdigest(),
+                "mtime_ns": path.stat().st_mtime_ns,
+                "metadata_json": metadata_json,
+            }
+            items.append(item)
+    return sorted(items, key=lambda value: value["relative_path"]), dict(sorted(skipped.items()))
+
+
+def collect_document_items(root):
+    return collect_document_items_with_skips(root)[0]
+
+
 def _database_index_state(conn):
+    has_tier = "tier" in _table_columns(conn, "memories")
+    selected = ", ".join(MEMORIES_COLUMNS) + (", tier" if has_tier else "")
+    rows = list(conn.execute("SELECT " + selected + " FROM memories"))
+    recent_paths = {row[MEMORIES_COLUMNS.index("relative_path")] for row in rows if has_tier and row[-1] == "recent"}
+    recent_ids = {row[MEMORIES_COLUMNS.index("id")] for row in rows if has_tier and row[-1] == "recent"}
     memories = [
         dict(zip(MEMORIES_COLUMNS, row))
-        for row in conn.execute("SELECT " + ", ".join(MEMORIES_COLUMNS) + " FROM memories")
+        for row in rows
+        if not has_tier or row[-1] != "recent"
     ]
     index_state = {
         row[0]: {"sha256": row[1], "mtime_ns": row[2], "indexed_at": row[3]}
         for row in conn.execute("SELECT relative_path, sha256, mtime_ns, indexed_at FROM index_state")
+        if row[0] not in recent_paths
     }
     fts_counts = {
         row[0]: row[1]
         for row in conn.execute("SELECT id, COUNT(*) FROM memory_fts GROUP BY id")
+        if row[0] not in recent_ids
     }
     return {
         "memories_by_id": {row["id"]: row for row in memories},
         "memories_by_path": {row["relative_path"]: row for row in memories},
+        "index_state": index_state,
+        "fts_counts": fts_counts,
+        "preserved_legacy": len(recent_ids),
+    }
+
+
+def _database_document_state(conn):
+    documents = [
+        dict(zip(DOCUMENTS_COLUMNS, row))
+        for row in conn.execute("SELECT " + ", ".join(DOCUMENTS_COLUMNS) + " FROM documents")
+    ]
+    index_state = {
+        row[0]: {"sha256": row[1], "mtime_ns": row[2], "indexed_at": row[3]}
+        for row in conn.execute("SELECT relative_path, sha256, mtime_ns, indexed_at FROM document_index_state")
+    }
+    fts_counts = {
+        row[0]: row[1]
+        for row in conn.execute("SELECT id, COUNT(*) FROM document_fts GROUP BY id")
+    }
+    return {
+        "documents_by_id": {row["id"]: row for row in documents},
+        "documents_by_path": {row["relative_path"]: row for row in documents},
         "index_state": index_state,
         "fts_counts": fts_counts,
     }
@@ -1707,6 +2121,52 @@ def plan_index_changes(conn, items):
     }
 
 
+def plan_document_changes(conn, items):
+    state = _database_document_state(conn)
+    current_paths = {item["relative_path"] for item in items}
+    current_ids = {item["id"] for item in items}
+    added = []
+    updated = []
+    unchanged = []
+    deleted = []
+
+    for relative_path in sorted(set(state["index_state"]) - current_paths):
+        old = state["documents_by_path"].get(relative_path)
+        if old and old["id"] in current_ids:
+            continue
+        deleted.append({"relative_path": relative_path, "id": old["id"] if old else None})
+
+    for item in items:
+        document_id = item["id"]
+        relative_path = item["relative_path"]
+        state_row = state["index_state"].get(relative_path)
+        document_row = state["documents_by_id"].get(document_id)
+        path_row = state["documents_by_path"].get(relative_path)
+        fts_count = state["fts_counts"].get(document_id, 0)
+        if (
+            state_row
+            and state_row["sha256"] == item["index_sha256"]
+            and document_row
+            and document_row["relative_path"] == relative_path
+            and path_row
+            and path_row["id"] == document_id
+            and fts_count == 1
+        ):
+            unchanged.append(item)
+        elif not state_row and document_id not in state["documents_by_id"] and not path_row:
+            added.append(item)
+        else:
+            updated.append(item)
+
+    return {
+        "added": added,
+        "updated": updated,
+        "deleted": deleted,
+        "unchanged": unchanged,
+        "state": state,
+    }
+
+
 def _upsert_memory(conn, item, indexed_at):
     values = _record_to_db_values(item)
     columns = MEMORIES_COLUMNS
@@ -1721,7 +2181,7 @@ def _upsert_memory(conn, item, indexed_at):
         tuple(values[column] for column in columns),
     )
     conn.execute(
-        "INSERT INTO memory_fts(id, title, content, body, tags, aliases) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO memory_fts(id, title, content, tags) VALUES (?, ?, ?, ?)",
         _fts_values(item),
     )
     conn.execute(
@@ -1737,17 +2197,43 @@ def _upsert_memory(conn, item, indexed_at):
     )
 
 
-def rebuild_links(conn, items):
-    ids, aliases = _identity_maps(items)
-    conn.execute("DELETE FROM links")
-    for item in items:
-        conn.executemany(
-            """
-            INSERT INTO links(source_id, target_id, target_ref, relation, source_kind, target_heading, target_block, context, resolved)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            _links_for_item(item, ids, aliases),
-        )
+def _document_fts_values(item):
+    return (
+        item["id"],
+        normalize_fts_text(item["title"]),
+        normalize_fts_text(item["content"]),
+        normalize_fts_text(item["source_kind"]),
+        normalize_fts_text(item.get("project") or ""),
+    )
+
+
+def _upsert_document(conn, item, indexed_at):
+    columns = DOCUMENTS_COLUMNS
+    placeholders = ", ".join("?" for _ in columns)
+    updates = ", ".join(f"{column} = excluded.{column}" for column in columns if column != "id")
+    conn.execute(
+        f"""
+        INSERT INTO documents ({", ".join(columns)})
+        VALUES ({placeholders})
+        ON CONFLICT(id) DO UPDATE SET {updates}
+        """,
+        tuple(item[column] for column in columns),
+    )
+    conn.execute(
+        "INSERT INTO document_fts(id, title, content, source_kind, project) VALUES (?, ?, ?, ?, ?)",
+        _document_fts_values(item),
+    )
+    conn.execute(
+        """
+        INSERT INTO document_index_state(relative_path, sha256, mtime_ns, indexed_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(relative_path) DO UPDATE SET
+            sha256 = excluded.sha256,
+            mtime_ns = excluded.mtime_ns,
+            indexed_at = excluded.indexed_at
+        """,
+        (item["relative_path"], item["index_sha256"], item["mtime_ns"], indexed_at),
+    )
 
 
 def check_index_consistency(conn, expected_count):
@@ -1789,7 +2275,46 @@ def check_index_consistency(conn, expected_count):
         raise ValueError("SQLite index consistency check failed.")
 
 
-def apply_index_changes(conn, plan, items, expected_count):
+def check_document_index_consistency(conn, expected_count):
+    counts = {
+        "documents": conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0],
+        "document_index_state": conn.execute("SELECT COUNT(*) FROM document_index_state").fetchone()[0],
+        "fts_distinct": conn.execute("SELECT COUNT(DISTINCT id) FROM document_fts").fetchone()[0],
+    }
+    if any(value != expected_count for value in counts.values()):
+        raise ValueError("SQLite document index consistency check failed.")
+    if conn.execute("SELECT id FROM document_fts GROUP BY id HAVING COUNT(*) > 1").fetchone():
+        raise ValueError("SQLite document index consistency check failed.")
+    if conn.execute(
+        """
+        SELECT documents.relative_path
+        FROM documents
+        LEFT JOIN document_index_state USING(relative_path)
+        WHERE document_index_state.relative_path IS NULL
+        """
+    ).fetchone():
+        raise ValueError("SQLite document index consistency check failed.")
+    if conn.execute(
+        """
+        SELECT document_index_state.relative_path
+        FROM document_index_state
+        LEFT JOIN documents USING(relative_path)
+        WHERE documents.relative_path IS NULL
+        """
+    ).fetchone():
+        raise ValueError("SQLite document index consistency check failed.")
+    if conn.execute(
+        """
+        SELECT documents.id
+        FROM documents
+        LEFT JOIN document_fts ON document_fts.id = documents.id
+        WHERE document_fts.id IS NULL
+        """
+    ).fetchone():
+        raise ValueError("SQLite document index consistency check failed.")
+
+
+def apply_index_changes(conn, plan, expected_count):
     indexed_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     for item in plan["deleted"]:
         if item["id"]:
@@ -1813,8 +2338,34 @@ def apply_index_changes(conn, plan, items, expected_count):
         conn.execute("DELETE FROM memory_fts WHERE id = ?", (memory_id,))
         _upsert_memory(conn, item, indexed_at)
 
-    rebuild_links(conn, items)
     check_index_consistency(conn, expected_count)
+
+
+def apply_document_changes(conn, plan, expected_count):
+    indexed_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    for item in plan["deleted"]:
+        if item["id"]:
+            conn.execute("DELETE FROM document_fts WHERE id = ?", (item["id"],))
+            conn.execute("DELETE FROM documents WHERE id = ?", (item["id"],))
+        conn.execute("DELETE FROM documents WHERE relative_path = ?", (item["relative_path"],))
+        conn.execute("DELETE FROM document_index_state WHERE relative_path = ?", (item["relative_path"],))
+
+    for item in plan["added"] + plan["updated"]:
+        document_id = item["id"]
+        old = plan["state"]["documents_by_id"].get(document_id)
+        if old and old["relative_path"] != item["relative_path"]:
+            conn.execute("DELETE FROM document_index_state WHERE relative_path = ?", (old["relative_path"],))
+        conflicts = conn.execute(
+            "SELECT id FROM documents WHERE relative_path = ? AND id != ?",
+            (item["relative_path"], document_id),
+        ).fetchall()
+        for (conflict_id,) in conflicts:
+            conn.execute("DELETE FROM document_fts WHERE id = ?", (conflict_id,))
+            conn.execute("DELETE FROM documents WHERE id = ?", (conflict_id,))
+        conn.execute("DELETE FROM document_fts WHERE id = ?", (document_id,))
+        _upsert_document(conn, item, indexed_at)
+
+    check_document_index_consistency(conn, expected_count)
 
 
 def index_store(args):
@@ -1827,321 +2378,721 @@ def index_store(args):
     state, db = check_state_dir(root, state_dir)
     if not db.exists():
         raise ValueError("Database is not initialized. Run db-init first.")
-    with write_lock(root, state):
-        summary = inspect_database(db)
-        if not summary["initialized"]:
-            raise ValueError("Database is not initialized. Run db-init first.")
+    summary = inspect_database(db)
+    if not summary["initialized"]:
+        raise ValueError("Database is not initialized. Run db-init first.")
 
-        items = _current_index_items(root, records)
-        with sqlite3.connect(db) as conn:
-            conn.execute("PRAGMA busy_timeout = 5000")
-            plan = plan_index_changes(conn, items)
-            result = {
+    items = _current_index_items(root, records)
+    document_items = collect_document_items(root)
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        plan = plan_index_changes(conn, items)
+        document_plan = plan_document_changes(conn, document_items)
+        result = {
+            "added": len(plan["added"]),
+            "updated": len(plan["updated"]),
+            "deleted": len(plan["deleted"]),
+            "unchanged": len(plan["unchanged"]),
+            "memories": {
                 "added": len(plan["added"]),
                 "updated": len(plan["updated"]),
                 "deleted": len(plan["deleted"]),
                 "unchanged": len(plan["unchanged"]),
-                "database": db,
-                "dry_run": args.dry_run,
-            }
-            if args.dry_run:
-                return result
-            try:
-                conn.execute("BEGIN")
-                apply_index_changes(conn, plan, items, len(items))
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-
-        checkpoint_database(db)
-        return result
-
-
-def db_rebuild(args):
-    root, records, errors, _ = collect_validated_records(args.root)
-    if errors:
-        messages = [f"ERROR {rel_path}: {message}" for rel_path, message in errors]
-        raise ValueError("\n".join(messages + ["Database rebuild aborted because validation failed."]))
-    check_fts5()
-    state_dir = args.state_dir if args.state_dir else default_state_dir()
-    state, db = check_state_dir(root, state_dir)
-    state.mkdir(parents=True, exist_ok=True)
-    with write_lock(root, state):
-        tmp = state / f".tmp-{DB_NAME}-{uuid.uuid4().hex}"
+            },
+            "documents": {
+                "added": len(document_plan["added"]),
+                "updated": len(document_plan["updated"]),
+                "deleted": len(document_plan["deleted"]),
+                "unchanged": len(document_plan["unchanged"]),
+            },
+            "database": db,
+            "dry_run": args.dry_run,
+        }
+        if args.dry_run:
+            return result
         try:
-            conn = sqlite3.connect(tmp)
-            _configure_sqlite(conn)
-            _create_schema(conn)
-            items = _current_index_items(root, records)
-            try:
-                conn.execute("BEGIN")
-                plan = plan_index_changes(conn, items)
-                apply_index_changes(conn, plan, items, len(items))
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                _checkpoint_and_close(conn)
-            inspect_database(tmp)
-            tmp.replace(db)
-            _remove_sqlite_sidecars(tmp)
-            checkpoint_database(db)
+            conn.execute("BEGIN")
+            apply_index_changes(conn, plan, len(items) + plan["state"]["preserved_legacy"])
+            apply_document_changes(conn, document_plan, len(document_items))
+            conn.commit()
         except Exception:
-            tmp.unlink(missing_ok=True)
-            _remove_sqlite_sidecars(tmp)
+            conn.rollback()
             raise
-    return {"database": db, "records": len(records), "version": DB_SCHEMA_VERSION}
+
+    checkpoint_database(db)
+    return result
 
 
-def extract_search_terms(query):
-    cjk_matches = list(CJK_RUN.finditer(query))
-    if any(len(match.group(0)) == 1 for match in cjk_matches):
-        raise ValueError("Chinese search terms must contain at least 2 consecutive characters.")
-    terms = []
-    for match in cjk_matches:
+def _query_tokens(text):
+    parts = []
+    last = 0
+    for match in CJK_RUN.finditer(text):
+        parts.extend(text[last : match.start()].split())
         run = match.group(0)
-        if len(run) == 2:
-            terms.append(run)
-        else:
-            terms.extend(run[index : index + 2] for index in range(len(run) - 1))
-    without_cjk = CJK_RUN.sub(" ", query)
-    terms.extend(re.findall(r"[A-Za-z0-9_-]+", without_cjk))
-    return terms
+        parts.extend(run[index : index + 2] for index in range(max(1, len(run) - 1)))
+        last = match.end()
+    parts.extend(text[last:].split())
+    return [part for part in parts if part]
 
 
-def build_fts_query(query):
-    terms = extract_search_terms(query)
-    if not terms:
-        raise ValueError("Search query has no valid terms.")
-    return " AND ".join(f'"{term.replace(chr(34), chr(34) + chr(34))}"' for term in terms)
+def _fts_query(text):
+    tokens = _query_tokens(text)
+    if not tokens:
+        raise ValueError("Search query must not be empty.")
+    return " AND ".join('"' + token.replace('"', '""') + '"' for token in tokens)
 
 
-def _readonly_connection(db):
-    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
-    conn.execute("PRAGMA query_only = ON")
-    conn.execute("PRAGMA busy_timeout = 5000")
-    return conn
+def temporal_status(row, as_of):
+    status = row.get("status")
+    if status and status != "active":
+        return "historical" if status == "historical" else status
+    valid_from = row.get("valid_from")
+    valid_until = row.get("valid_until")
+    if valid_from and valid_from > as_of:
+        return "future"
+    if valid_until and valid_until < as_of:
+        return "expired"
+    return "current"
 
 
-def check_search_freshness(conn, items):
-    expected = len(items)
-    state = _database_index_state(conn)
-    current_paths = {item["relative_path"] for item in items}
-    current_ids = {item["record"]["id"] for item in items}
-
-    counts = {
-        "memories": conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0],
-        "index_state": conn.execute("SELECT COUNT(*) FROM index_state").fetchone()[0],
-        "fts_distinct": conn.execute("SELECT COUNT(DISTINCT id) FROM memory_fts").fetchone()[0],
-    }
-    if any(value != expected for value in counts.values()):
-        raise ValueError("Search aborted because the index is stale. Run index first.")
-    if conn.execute("SELECT id FROM memory_fts GROUP BY id HAVING COUNT(*) != 1").fetchone():
-        raise ValueError("Search aborted because the index is stale. Run index first.")
-    if set(state["index_state"]) != current_paths:
-        raise ValueError("Search aborted because the index is stale. Run index first.")
-    if set(state["memories_by_id"]) != current_ids:
-        raise ValueError("Search aborted because the index is stale. Run index first.")
-
-    for item in items:
-        state_row = state["index_state"].get(item["relative_path"])
-        memory_row = state["memories_by_id"].get(item["record"]["id"])
-        if not state_row or state_row["sha256"] != item["sha256"]:
-            raise ValueError("Search aborted because the index is stale. Run index first.")
-        if not memory_row or memory_row["relative_path"] != item["relative_path"]:
-            raise ValueError("Search aborted because the index is stale. Run index first.")
-        if state["fts_counts"].get(item["record"]["id"]) != 1:
-            raise ValueError("Search aborted because the index is stale. Run index first.")
+def _index_fresh(conn, memory_items, document_items):
+    memory_state = _database_index_state(conn)
+    document_state = _database_document_state(conn)
+    current_memory = {item["relative_path"]: item["sha256"] for item in memory_items}
+    current_documents = {item["relative_path"]: item["index_sha256"] for item in document_items}
+    indexed_memory = {key: value["sha256"] for key, value in memory_state["index_state"].items()}
+    indexed_documents = {key: value["sha256"] for key, value in document_state["index_state"].items()}
+    return current_memory == indexed_memory and current_documents == indexed_documents
 
 
-def _search_statuses(args):
-    statuses = list(args.status or ["active"])
-    if args.include_historical and "historical" not in statuses:
-        statuses.append("historical")
-    return statuses
-
-
-def _allowed_confidentiality(args):
-    if args.include_restricted and args.workspace != "work":
-        raise ValueError("--include-restricted requires --workspace work.")
-    if args.workspace == "personal":
-        return ["public", "personal"]
-    values = ["public", "personal", "internal"]
-    if args.include_restricted:
-        values.append("restricted")
-    return values
-
-
-def _validate_search_args(args):
-    if not (1 <= args.limit <= 100):
-        raise ValueError("--limit must be between 1 and 100.")
-    _allowed_confidentiality(args)
-
-
-def make_excerpt(content, query):
-    text = re.sub(r"\s+", " ", content or "").strip()
-    if len(text) <= 180:
-        return text
-    fragments = re.findall(r"[\u3400-\u4DBF\u4E00-\u9FFF]{2,}|[A-Za-z0-9_-]+", query)
-    center = -1
-    for fragment in fragments:
-        center = text.lower().find(fragment.lower())
-        if center >= 0:
-            break
-    if center < 0:
-        start = 0
+def _search_memory(conn, args, query):
+    conditions = ["memory_fts MATCH ?"]
+    values = [query]
+    if "tier" in _table_columns(conn, "memories"):
+        conditions.append("m.tier != 'recent'")
+    if not getattr(args, "include_restricted", False):
+        conditions.append("COALESCE(m.confidentiality, '') != 'restricted'")
+    if not getattr(args, "include_inactive", False):
+        conditions.append("m.status = 'active'")
+    if args.project:
+        conditions.append("(m.project = ? OR m.project IS NULL)")
+        values.append(args.project)
     else:
-        start = max(0, center - 80)
-    end = min(len(text), start + 180)
-    start = max(0, end - 180)
-    excerpt = text[start:end]
-    if start > 0:
-        excerpt = "…" + excerpt[1:]
-    if end < len(text):
-        excerpt = excerpt[:-1] + "…"
-    return excerpt
+        conditions.append("m.project IS NULL")
+    if getattr(args, "type", None):
+        conditions.append("m.type = ?")
+        values.append(args.type)
+    if args.context_id:
+        conditions.append("(m.context_id = ? OR m.context_id IS NULL)")
+        values.append(args.context_id)
+    if args.workspace:
+        conditions.append("m.workspace = ?")
+        values.append(args.workspace)
+    if args.status:
+        conditions.append("m.status = ?")
+        values.append(args.status)
+    as_of = args.as_of or date.today().isoformat()
+    conditions.append("(m.valid_from IS NULL OR m.valid_from <= ?)")
+    conditions.append("(m.valid_until IS NULL OR m.valid_until >= ?)")
+    values.extend([as_of, as_of])
+    values.append(args.limit)
+    sql = f"""
+        SELECT m.id, m.title, m.type, m.status, m.scope, m.workspace, m.confidentiality,
+               m.project, m.context_id, m.valid_from, m.valid_until, m.updated, m.relative_path,
+               snippet(memory_fts, 2, '[', ']', '…', 20) AS excerpt,
+               bm25(memory_fts) AS rank
+        FROM memory_fts
+        JOIN memories AS m ON m.id = memory_fts.id
+        WHERE {' AND '.join(conditions)}
+        ORDER BY rank, m.updated DESC, m.id
+        LIMIT ?
+    """
+    rows = []
+    for index, row in enumerate(conn.execute(sql, values), start=1):
+        data = dict(row)
+        data.update({"kind": "memory", "source_kind": "memory", "score": 1.20 / (60 + index), "temporal_status": temporal_status(data, as_of)})
+        rows.append(data)
+    return rows
 
 
-def _row_to_result(row, query):
-    keys = [
-        "id",
-        "title",
-        "type",
-        "status",
-        "scope",
-        "workspace",
-        "confidentiality",
-        "project",
-        "context_id",
-        "updated",
-        "relative_path",
-        "score",
-        "content",
-    ]
-    data = dict(zip(keys, row))
-    return {
-        "id": data["id"],
-        "title": data["title"],
-        "type": data["type"],
-        "status": data["status"],
-        "scope": data["scope"],
-        "workspace": data["workspace"],
-        "confidentiality": data["confidentiality"],
-        "project": data["project"],
-        "context_id": data["context_id"],
-        "updated": data["updated"],
-        "relative_path": data["relative_path"],
-        "score": round(float(data["score"]), 6),
-        "excerpt": make_excerpt(data["content"], query),
-    }
+def _search_documents(conn, args, query):
+    conditions = ["document_fts MATCH ?"]
+    values = [query]
+    if not getattr(args, "include_restricted", False):
+        conditions.append("COALESCE(d.confidentiality, '') != 'restricted'")
+    if args.source_kind:
+        conditions.append("d.source_kind = ?")
+        values.append(args.source_kind)
+    if args.project:
+        conditions.append("(d.project = ? OR d.project IS NULL)")
+        values.append(args.project)
+    else:
+        conditions.append("d.project IS NULL")
+    if args.context_id:
+        conditions.append("(d.context_id = ? OR d.context_id IS NULL)")
+        values.append(args.context_id)
+    if args.workspace:
+        conditions.append("d.workspace = ?")
+        values.append(args.workspace)
+    values.append(args.limit)
+    sql = f"""
+        SELECT d.id, d.source_kind, d.title, NULL AS type, NULL AS status, NULL AS scope,
+               d.workspace, d.confidentiality, d.project, d.context_id,
+               NULL AS valid_from, NULL AS valid_until, d.updated, d.relative_path,
+               snippet(document_fts, 2, '[', ']', '…', 20) AS excerpt,
+               bm25(document_fts) AS rank
+        FROM document_fts
+        JOIN documents AS d ON d.id = document_fts.id
+        WHERE {' AND '.join(conditions)}
+        ORDER BY rank, d.updated DESC, d.id
+        LIMIT ?
+    """
+    rows = []
+    for index, row in enumerate(conn.execute(sql, values), start=1):
+        data = dict(row)
+        data.update({"kind": "document", "score": 1.00 / (60 + index), "temporal_status": "current"})
+        rows.append(data)
+    return rows
 
 
 def search_store(args):
-    _validate_search_args(args)
-    root, records, errors, _ = collect_validated_records(args.root)
-    if errors:
-        messages = [f"ERROR {rel_path}: {message}" for rel_path, message in errors]
-        raise ValueError("\n".join(messages + ["Search aborted because validation failed."]))
-
-    fts_query = build_fts_query(args.query)
+    root = _require_data_root(args.root)
     state_dir = args.state_dir if args.state_dir else default_state_dir()
     _, db = check_state_dir(root, state_dir)
     if not db.exists():
-        raise ValueError("Database is not initialized. Run db-init first.")
-    if any(sidecar.exists() for sidecar in sqlite_sidecars(db)):
-        raise ValueError("Search aborted because the index is stale. Run index first.")
-    if not database_has_wal_header(db):
-        raise ValueError("SQLite journal_mode WAL could not be verified.")
+        raise ValueError("Database is not initialized. Run db-init and index first.")
+    summary = inspect_database(db)
+    if not summary["initialized"]:
+        raise ValueError("Database is not initialized. Run db-init and index first.")
 
-    items = _current_index_items(root, records)
-    try:
-        with _readonly_connection(db) as conn:
-            summary = _inspect_database_connection(conn, verify_wal=False)
-            if not summary["initialized"]:
-                raise ValueError("Database is not initialized. Run db-init first.")
-            check_search_freshness(conn, items)
+    query = _fts_query(args.query)
+    root, records, errors, _ = collect_validated_records(root)
+    if errors:
+        messages = [f"ERROR {rel_path}: {message}" for rel_path, message in errors]
+        raise ValueError("\n".join(messages + ["Search aborted because validation failed."]))
+    memory_items = _current_index_items(root, records)
+    document_items = collect_document_items(root)
+    with closing(sqlite3.connect(db)) as conn:
+        conn.row_factory = sqlite3.Row
+        if not _index_fresh(conn, memory_items, document_items):
+            raise ValueError("Search aborted because the index is stale. Run index first.")
+        rows = []
+        if args.kind in {"all", "memory"} and not args.source_kind:
+            rows.extend(_search_memory(conn, args, query))
+        if args.kind in {"all", "document"}:
+            rows.extend(_search_documents(conn, args, query))
+    rows.sort(key=lambda row: (-row["score"], row["kind"], row["id"]))
+    return rows[: args.limit]
 
-            where = ["memory_fts MATCH ?", "memories.workspace = ?"]
-            params = [fts_query, args.workspace]
-            confidentialities = _allowed_confidentiality(args)
-            where.append("memories.confidentiality IN (" + ", ".join("?" for _ in confidentialities) + ")")
-            params.extend(confidentialities)
-            statuses = _search_statuses(args)
-            where.append("memories.status IN (" + ", ".join("?" for _ in statuses) + ")")
-            params.extend(statuses)
-            for column, value in [("type", args.type), ("project", args.project), ("context_id", args.context_id)]:
-                if value is not None:
-                    where.append(f"memories.{column} = ?")
-                    params.append(value)
-            params.append(args.limit)
-            rows = conn.execute(
-                f"""
-                SELECT
-                    memories.id,
-                    memories.title,
-                    memories.type,
-                    memories.status,
-                    memories.scope,
-                    memories.workspace,
-                    memories.confidentiality,
-                    memories.project,
-                    memories.context_id,
-                    memories.updated,
-                    memories.relative_path,
-                    bm25(memory_fts, 0.0, 5.0, 1.0, 1.0, 2.0, 4.0) AS score,
-                    memories.content
-                FROM memory_fts
-                JOIN memories ON memories.id = memory_fts.id
-                WHERE {" AND ".join(where)}
-                ORDER BY score ASC, memories.updated DESC, memories.id ASC
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
-    except sqlite3.DatabaseError as exc:
-        raise ValueError(f"Search failed: {exc}") from exc
 
-    results = [_row_to_result(row, args.query) for row in rows]
+def search_mode_summary(requested_mode):
+    warnings = []
+    effective_mode = requested_mode
+    if requested_mode in {"semantic", "hybrid"}:
+        warnings.append(f"{requested_mode} search unavailable; falling back to lexical")
+        effective_mode = "lexical"
+    return effective_mode, warnings
+
+
+def _state_sha_map(state):
+    return {key: value["sha256"] for key, value in state["index_state"].items()}
+
+
+def _freshness_details(conn, memory_items, document_items):
+    memory_state = _database_index_state(conn)
+    document_state = _database_document_state(conn)
+    current_memory = {item["relative_path"]: item["sha256"] for item in memory_items}
+    current_documents = {item["relative_path"]: item["index_sha256"] for item in document_items}
+    indexed_memory = _state_sha_map(memory_state)
+    indexed_documents = _state_sha_map(document_state)
     return {
-        "query": args.query,
-        "workspace": args.workspace,
-        "filters": {
-            "type": args.type,
-            "project": args.project,
-            "context_id": args.context_id,
-            "statuses": statuses,
-            "include_restricted": args.include_restricted,
-        },
-        "count": len(results),
-        "results": results,
+        "memory_index_fresh": current_memory == indexed_memory,
+        "document_index_fresh": current_documents == indexed_documents,
+        "hash_mismatches": [
+            {"kind": kind, "relative_path": path}
+            for kind, current, indexed in [
+                ("memory", current_memory, indexed_memory),
+                ("document", current_documents, indexed_documents),
+            ]
+            for path in sorted(set(current) & set(indexed))
+            if current[path] != indexed[path]
+        ],
     }
 
 
-def render_search_text(summary):
-    if not summary["results"]:
-        return "Results: 0\n"
-    lines = [f"Results: {summary['count']}", ""]
-    for index, row in enumerate(summary["results"], start=1):
-        lines.extend(
-            [
-                f"{index}. {row['title']}",
-                f"   ID: {row['id']}",
-                f"   Type: {row['type']}",
-                f"   Status: {row['status']}",
-                f"   Workspace: {row['workspace']}",
-                f"   Confidentiality: {row['confidentiality']}",
-                f"   Project: {row['project'] or '-'}",
-                f"   Context: {row['context_id'] or '-'}",
-                f"   Updated: {row['updated']}",
-                f"   Path: {row['relative_path']}",
-                f"   Score: {row['score']:.6f}",
-                f"   Excerpt: {row['excerpt']}",
-                "",
-            ]
+def _relative_stems(root, relative_dir):
+    base = root / relative_dir
+    if not base.exists():
+        return set()
+    return {
+        path.relative_to(base).with_suffix("").as_posix()
+        for path in base.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+
+
+def _old_network_residuals():
+    repo = Path(__file__).resolve().parents[1]
+    files = [
+        repo / "src" / "memory_tools.py",
+        repo / "README.md",
+    ]
+    docs = repo / "docs"
+    if docs.exists():
+        files.extend(path for path in docs.rglob("*") if path.is_file())
+    patterns = [
+        "serve-" + "chatgpt",
+        "Bear" + "er",
+        "Threading" + "HTTPServer",
+        "BaseHTTP" + "RequestHandler",
+        "G" + "mail",
+        "approve-" + "host",
+        "Launch" + "Agent",
+        "Tail" + "scale " + "Fun" + "nel",
+    ]
+    residuals = []
+    for path in sorted(files):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        for pattern in patterns:
+            if pattern in text:
+                residuals.append({"path": path.relative_to(repo).as_posix(), "pattern": pattern})
+    return residuals
+
+
+def doctor_store(args):
+    root = _require_data_root(args.root)
+    state_dir = args.state_dir if args.state_dir else default_state_dir()
+    result = {
+        "data_root": str(root),
+        "data_root_ok": True,
+        "schema_version": None,
+        "sqlite_initialized": False,
+        "wal": False,
+        "memory_index_fresh": None,
+        "document_index_fresh": None,
+        "hash_mismatches": [],
+        "manual_orphan_raw": [],
+        "manual_orphan_text": [],
+        "raw_files": 0,
+        "quarantine_files": 0,
+        "hidden_files": 0,
+        "supported_documents": 0,
+        "skipped_documents": {},
+        "legacy_provenance": 0,
+        "missing_source": 0,
+        "unresolved_links": 0,
+        "incomplete_distill_runs": [],
+        "malformed_distill_journal": False,
+        "export_stale": None,
+        "launch_agent_active": False,
+        "port_8765_listening": False,
+        "restricted_default_hidden": True,
+        "deprecated_default_hidden": True,
+        "old_network_residuals": [],
+        "errors": [],
+    }
+    result["old_network_residuals"] = _old_network_residuals()
+    raw_stems = _relative_stems(root, "imports/manual/raw")
+    text_stems = _relative_stems(root, "imports/manual/text")
+    result["manual_orphan_raw"] = []
+    result["manual_orphan_text"] = sorted(text_stems - raw_stems)
+    result["raw_files"] = sum(1 for path in (root / "imports/manual/raw").rglob("*") if path.is_file())
+    quarantine_roots = [
+        root / "quarantine",
+        root / "memory/quarantine",
+        root / "imports/manual/quarantine",
+    ]
+    result["quarantine_files"] = sum(
+        1 for quarantine in quarantine_roots if quarantine.exists()
+        for path in quarantine.rglob("*") if path.is_file()
+    )
+    result["hidden_files"] = sum(1 for path in root.rglob("*") if path.is_file() and any(part.startswith(".") for part in path.relative_to(root).parts))
+    document_items, skipped = collect_document_items_with_skips(root)
+    result["supported_documents"] = len(document_items)
+    result["skipped_documents"] = skipped
+    try:
+        launch = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/com.researchagent.chatgpt-archive"],
+            capture_output=True, text=True, timeout=2,
         )
+        result["launch_agent_active"] = launch.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        pass
+    with closing(socket.socket()) as probe:
+        probe.settimeout(0.2)
+        result["port_8765_listening"] = probe.connect_ex(("127.0.0.1", 8765)) == 0
+    journal = root / "state/distill_runs.jsonl"
+    if journal.is_file():
+        last = {}
+        for line in journal.read_text(encoding="utf-8").splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                result["malformed_distill_journal"] = True
+                break
+            if isinstance(event, dict) and event.get("run_id"):
+                last[event["run_id"]] = event
+        result["incomplete_distill_runs"] = sorted(
+            run_id for run_id, event in last.items()
+            if event.get("status") not in {"completed", "no_change"}
+        )
+
+    try:
+        _, db = check_state_dir(root, state_dir)
+        if not db.exists():
+            result["errors"].append("database missing")
+            return result
+        summary = inspect_database(db)
+        result["schema_version"] = summary["version"]
+        result["sqlite_initialized"] = summary["initialized"]
+        if not summary["initialized"]:
+            result["errors"].append("database not initialized")
+            return result
+        records_root, records, errors, _ = collect_validated_records(root)
+        if errors:
+            result["errors"].extend(f"{rel_path}: {message}" for rel_path, message in errors)
+            return result
+        memory_items = _current_index_items(records_root, records)
+        with closing(sqlite3.connect(db)) as conn:
+            result["wal"] = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal"
+            result.update(_freshness_details(conn, memory_items, document_items))
+            columns = set(_table_columns(conn, "memories"))
+            if "tier" in columns:
+                result["legacy_provenance"] += conn.execute("SELECT COUNT(*) FROM memories WHERE tier='recent'").fetchone()[0]
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='links'").fetchone():
+                result["unresolved_links"] = conn.execute("SELECT COUNT(*) FROM links WHERE resolved=0").fetchone()[0]
+        for item in records:
+            record = item["record"]
+            has_source = bool(record.get("source_refs")) or record.get("source") == "manual:user_confirmed" or bool(record.get("source_path") and record.get("source_sha256"))
+            if record.get("status") == "active" and not has_source:
+                result["legacy_provenance"] += 1
+        manifest_path = root / "exports/index_manifest.json"
+        export_path = root / "exports/memory.jsonl"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            current_content_hash = hashlib.sha256(export_path.read_bytes()).hexdigest() if export_path.is_file() else None
+            current_database_hash = hashlib.sha256(db.read_bytes()).hexdigest()
+            result["export_stale"] = (
+                manifest.get("content_hash") != current_content_hash
+                or manifest.get("database_hash") != current_database_hash
+                or manifest.get("record_count") != len(manifest.get("records", []))
+            )
+        except (OSError, json.JSONDecodeError, AttributeError):
+            result["export_stale"] = True
+    except (OSError, ValueError, sqlite3.DatabaseError) as exc:
+        result["errors"].append(str(exc))
+    return result
+
+
+def project_status(args):
+    root, records, errors, _ = collect_validated_records(args.root)
+    if errors:
+        messages = [f"ERROR {rel_path}: {message}" for rel_path, message in errors]
+        raise ValueError("\n".join(messages + ["Project status aborted because validation failed."]))
+    as_of = args.as_of or date.today().isoformat()
+    project_records = [item for item in records if item["record"].get("type") == "project" and item["record"].get("project") == args.project and item["record"].get("status") == "active"]
+    project_memories = [item for item in records if item["record"].get("project") == args.project]
+    candidates = [item for item in project_memories if item["record"].get("status") == "candidate"]
+    conflicts = [item for item in project_memories if item["record"].get("status") == "conflict"]
+    expired = [item for item in project_memories if temporal_status(item["record"], as_of) == "expired"]
+    known_ids = {item["record"]["id"] for item in records}
+    unresolved = 0
+    for item in project_memories:
+        for field in ("supersedes", "superseded_by"):
+            unresolved += sum(1 for value in item["record"].get(field, []) if value not in known_ids)
+
+    state_dir = args.state_dir if args.state_dir else default_state_dir()
+    _, db = check_state_dir(root, state_dir)
+    documents = unassigned_documents = 0
+    if db.exists() and inspect_database(db).get("initialized"):
+        with closing(sqlite3.connect(db)) as conn:
+            documents = conn.execute("SELECT COUNT(*) FROM documents WHERE project = ?", (args.project,)).fetchone()[0]
+            unassigned_documents = conn.execute("SELECT COUNT(*) FROM documents WHERE project IS NULL").fetchone()[0]
+    return {
+        "project": args.project,
+        "status": "active" if project_records else "missing",
+        "project_memories": len(project_memories),
+        "documents": documents,
+        "unassigned_documents": unassigned_documents,
+        "candidates": len(candidates),
+        "conflicts": len(conflicts),
+        "expired": len(expired),
+        "unresolved_relations": unresolved,
+    }
+
+
+def _memory_context_entry(item, as_of):
+    record = item["record"]
+    return {
+        "id": record["id"],
+        "title": record["title"],
+        "kind": "memory",
+        "type": record["type"],
+        "status": record["status"],
+        "confidence": record["confidence"],
+        "source": record["source"],
+        "source_path": item["relative_path"],
+        "source_sha256": hashlib.sha256(item["path"].read_bytes()).hexdigest(),
+        "updated": record["updated"],
+        "project": record.get("project"),
+        "context_id": record.get("context_id"),
+        "temporal_status": temporal_status(record, as_of),
+        "content": record["content"],
+    }
+
+
+def _search_context_entry(row):
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "kind": row["kind"],
+        "type": row.get("type"),
+        "status": row.get("status"),
+        "confidence": None,
+        "source": row.get("source_kind"),
+        "source_path": row["relative_path"],
+        "source_sha256": None,
+        "updated": row.get("updated"),
+        "project": row.get("project"),
+        "context_id": row.get("context_id"),
+        "temporal_status": row.get("temporal_status"),
+        "excerpt": row.get("excerpt") or "",
+    }
+
+
+def _visible_memory(record, project, workspace, as_of, include_conflict=False):
+    if record.get("workspace") != workspace:
+        return False
+    if record.get("confidentiality") not in {"public", "personal"}:
+        return False
+    if include_conflict:
+        if record.get("status") != "conflict":
+            return False
+    elif record.get("status") != "active":
+        return False
+    if temporal_status(record, as_of) != "current" and not include_conflict:
+        return False
+    if project and record.get("scope") != "global" and record.get("project") != project:
+        return False
+    return True
+
+
+def _context_sources(pack):
+    seen = set()
+    sources = []
+    for section in ["constraints", "project_memories", "query_memories", "evidence_documents", "recent_evidence", "related_memories", "conflicts"]:
+        for item in pack[section]:
+            key = (item.get("id"), item.get("source_path"))
+            if key in seen:
+                continue
+            seen.add(key)
+            sources.append(
+                {
+                    "id": item.get("id"),
+                    "title": item.get("title"),
+                    "kind": item.get("kind"),
+                    "source_path": item.get("source_path"),
+                    "source_sha256": item.get("source_sha256"),
+                    "updated": item.get("updated"),
+                }
+            )
+    return sources
+
+
+def _pack_json(pack):
+    return json.dumps(pack, ensure_ascii=False, indent=2) + "\n"
+
+
+def _fit_context_pack(pack, max_chars):
+    if len(_pack_json(pack)) <= max_chars:
+        return pack
+    pack["truncated"] = True
+    for section in ["evidence_documents", "query_memories", "related_memories", "project_memories"]:
+        while pack[section] and len(_pack_json(pack)) > max_chars:
+            pack[section].pop()
+    for section in ["constraints", "project_memories", "query_memories", "evidence_documents"]:
+        for item in pack[section]:
+            for field in ["content", "excerpt"]:
+                if field in item and isinstance(item[field], str) and len(_pack_json(pack)) > max_chars:
+                    item[field] = item[field][:40] + "..."
+    for section in ["constraints", "project_memories", "query_memories", "evidence_documents", "related_memories", "recent_evidence"]:
+        while pack[section] and len(_pack_json(pack)) > max_chars:
+            pack[section].pop()
+    pack["sources"] = _context_sources(pack)
+    return pack
+
+
+def context_pack(args):
+    root, records, errors, _ = collect_validated_records(args.root)
+    if errors:
+        messages = [f"ERROR {rel_path}: {message}" for rel_path, message in errors]
+        raise ValueError("\n".join(messages + ["Context pack aborted because validation failed."]))
+    as_of = args.as_of or date.today().isoformat()
+    search_args = argparse.Namespace(
+        root=str(root),
+        state_dir=args.state_dir,
+        query=args.query,
+        kind="all",
+        source_kind=None,
+        project=args.project,
+        context_id=None,
+        workspace=args.workspace,
+        status=None,
+        as_of=as_of,
+        include_unassigned=False,
+        limit=20,
+        json=True,
+    )
+    rows = search_store(search_args)
+    constraints = []
+    project_memories = []
+    conflicts = []
+    for item in records:
+        record = item["record"]
+        if _visible_memory(record, args.project, args.workspace, as_of):
+            entry = _memory_context_entry(item, as_of)
+            if record["type"] in {"profile", "principle", "context"}:
+                constraints.append(entry)
+            elif record["type"] in {"project", "decision", "procedure"}:
+                project_memories.append(entry)
+        elif _visible_memory(record, args.project, args.workspace, as_of, include_conflict=True):
+            conflicts.append(_memory_context_entry(item, as_of))
+    query_memories = [_search_context_entry(row) for row in rows if row["kind"] == "memory"]
+    evidence_documents = [_search_context_entry(row) for row in rows if row["kind"] == "document"]
+    pack = {
+        "schema": "context-pack/v1",
+        "query": args.query,
+        "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "workspace": args.workspace,
+        "project": args.project,
+        "context_id": None,
+        "as_of": as_of,
+        "constraints": constraints,
+        "project_memories": project_memories,
+        "query_memories": query_memories,
+        "evidence_documents": evidence_documents,
+        "recent_evidence": [],
+        "related_memories": [],
+        "conflicts": conflicts,
+        "warnings": [],
+        "sources": [],
+        "truncated": False,
+    }
+    pack["sources"] = _context_sources(pack)
+    return _fit_context_pack(pack, args.max_chars)
+
+
+def render_context_markdown(pack):
+    lines = [
+        "# Context Pack",
+        "",
+        f"Query: {pack['query']}",
+        f"Workspace: {pack['workspace']}",
+        f"Project: {pack['project'] or ''}",
+        f"As of: {pack['as_of']}",
+        "",
+    ]
+    for title, key in [
+        ("Constraints", "constraints"),
+        ("Project Memories", "project_memories"),
+        ("Query Memories", "query_memories"),
+        ("Evidence Documents", "evidence_documents"),
+        ("Conflicts", "conflicts"),
+    ]:
+        lines.extend([f"## {title}", ""])
+        for item in pack[key]:
+            text = item.get("content") or item.get("excerpt") or ""
+            lines.extend([f"- {item['title']} ({item['source_path']})", f"  {text}", ""])
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _load_eval_cases(path):
+    try:
+        data = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("Invalid retrieval evaluation cases file.") from exc
+    cases = data.get("cases")
+    if not isinstance(cases, list):
+        raise ValueError("Retrieval evaluation cases must contain a cases list.")
+    return cases
+
+
+def _expected_hit(row, expected):
+    return row.get("id") in expected or row.get("title") in expected
+
+
+def _p95(values):
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, int(0.95 * (len(ordered) - 1)))
+    return ordered[index]
+
+
+def evaluate_search(args):
+    cases = _load_eval_cases(args.cases)
+    mode, warnings = search_mode_summary(args.mode)
+    top1 = top5 = no_result = project_leaks = restricted_leaks = synonym_hits = synonym_total = 0
+    latencies = []
+    for case in cases:
+        query = case.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("Each retrieval evaluation case requires a non-empty query.")
+        search_args = argparse.Namespace(
+            root=args.root,
+            state_dir=args.state_dir,
+            query=query,
+            kind="all",
+            source_kind=None,
+            project=case.get("project"),
+            context_id=case.get("context_id"),
+            workspace=case.get("workspace"),
+            status=None,
+            as_of=case.get("as_of"),
+            include_unassigned=False,
+            limit=20,
+            json=True,
+            mode=mode,
+        )
+        started = time.perf_counter()
+        rows = search_store(search_args)
+        latencies.append((time.perf_counter() - started) * 1000)
+        if not rows:
+            no_result += 1
+        expected = set(case.get("expected_ids") or [])
+        if expected:
+            if rows and _expected_hit(rows[0], expected):
+                top1 += 1
+            if any(_expected_hit(row, expected) for row in rows[:5]):
+                top5 += 1
+            if case.get("synonym"):
+                synonym_total += 1
+                if any(_expected_hit(row, expected) for row in rows[:5]):
+                    synonym_hits += 1
+        project = case.get("project")
+        if project and any(row.get("project") not in {None, project} and row.get("scope") != "global" for row in rows):
+            project_leaks += 1
+        if any(row.get("confidentiality") == "restricted" for row in rows):
+            restricted_leaks += 1
+    denominator = len(cases) or 1
+    return {
+        "requested_mode": args.mode,
+        "mode": args.mode,
+        "effective_mode": mode,
+        "case_count": len(cases),
+        "top1": top1 / denominator,
+        "top5": top5 / denominator,
+        "no_result_rate": no_result / denominator,
+        "project_leak_rate": project_leaks / denominator,
+        "restricted_leak_rate": restricted_leaks / denominator,
+        "average_latency_ms": sum(latencies) / len(latencies) if latencies else 0.0,
+        "p95_latency_ms": _p95(latencies),
+        "synonym_hit_rate": (synonym_hits / synonym_total) if synonym_total else 0.0,
+        "warnings": warnings,
+    }
 
 
 def build_parser():
@@ -2160,7 +3111,8 @@ def build_parser():
     add_parser.add_argument("--source", required=True)
     add_parser.add_argument("--confidence", required=True, choices=CONFIDENCE_CHOICES)
     add_parser.add_argument("--content", required=True)
-    add_parser.add_argument("--status", default="active", choices=STATUS_CHOICES)
+    add_parser.add_argument("--status", default="candidate", choices=STATUS_CHOICES)
+    add_parser.add_argument("--confirmed", action="store_true")
     add_parser.add_argument("--context-id", dest="context_id")
     add_parser.add_argument("--project")
     add_parser.add_argument("--valid-from", dest="valid_from")
@@ -2182,6 +3134,19 @@ def build_parser():
         help="Local state directory for memory.sqlite.",
     )
 
+    db_rebuild_parser = subparsers.add_parser("db-rebuild", help="Rebuild the local SQLite index from files.")
+    db_rebuild_parser.add_argument("--root", required=True, help="Initialized data root.")
+    db_rebuild_parser.add_argument(
+        "--state-dir",
+        default=str(default_state_dir()),
+        help="Local state directory for memory.sqlite.",
+    )
+
+    migrate_parser = subparsers.add_parser("migrate-db-v2-v3", help="Create a validated v3 shadow database from a v2 source.")
+    migrate_parser.add_argument("--source", required=True, help="Read-only v2 source database.")
+    migrate_parser.add_argument("--output", required=True, help="New v3 candidate database.")
+    migrate_parser.add_argument("--data-root", required=True, dest="data_root", help="Authoritative data root.")
+
     index_parser = subparsers.add_parser("index", help="Incrementally index memory files into SQLite.")
     index_parser.add_argument("--root", required=True, help="Initialized data root.")
     index_parser.add_argument(
@@ -2191,15 +3156,7 @@ def build_parser():
     )
     index_parser.add_argument("--dry-run", action="store_true")
 
-    rebuild_parser = subparsers.add_parser("db-rebuild", help="Safely rebuild the local SQLite database.")
-    rebuild_parser.add_argument("--root", required=True, help="Initialized data root.")
-    rebuild_parser.add_argument(
-        "--state-dir",
-        default=str(default_state_dir()),
-        help="Local state directory for memory.sqlite.",
-    )
-
-    search_parser = subparsers.add_parser("search", help="Search indexed memory records.")
+    search_parser = subparsers.add_parser("search", help="Search memories and indexed documents.")
     search_parser.add_argument("query")
     search_parser.add_argument("--root", required=True, help="Initialized data root.")
     search_parser.add_argument(
@@ -2207,19 +3164,71 @@ def build_parser():
         default=str(default_state_dir()),
         help="Local state directory for memory.sqlite.",
     )
-    search_parser.add_argument("--workspace", default="personal", choices=WORKSPACE_CHOICES)
-    search_parser.add_argument("--type", choices=TYPE_CHOICES)
+    search_parser.add_argument("--kind", choices=["all", "memory", "document"], default="all")
+    search_parser.add_argument("--source-kind", choices=["chatgpt", "manual", "literature", "manuscript", "journal"])
     search_parser.add_argument("--project")
-    search_parser.add_argument("--context-id", dest="context_id")
-    search_parser.add_argument("--status", action="append", choices=STATUS_CHOICES)
-    search_parser.add_argument("--include-historical", action="store_true")
+    search_parser.add_argument("--context-id")
+    search_parser.add_argument("--workspace")
+    search_parser.add_argument("--status")
+    search_parser.add_argument("--as-of")
+    search_parser.add_argument("--mode", choices=["lexical", "semantic", "hybrid"], default="lexical")
+    search_parser.add_argument("--include-unassigned", action="store_true")
     search_parser.add_argument("--include-restricted", action="store_true")
-    search_parser.add_argument("--limit", type=int, default=10)
-    search_parser.add_argument("--json", action="store_true", dest="json_output")
+    search_parser.add_argument("--include-inactive", action="store_true")
+    search_parser.add_argument("--limit", type=int, default=20)
+    search_parser.add_argument("--json", action="store_true")
+
+    meta_parser = subparsers.add_parser("document-meta", help="Manage authoritative document metadata overrides.")
+    meta_subparsers = meta_parser.add_subparsers(dest="meta_command", required=True)
+    meta_set = meta_subparsers.add_parser("set", help="Set document metadata.")
+    meta_set.add_argument("--root", required=True)
+    meta_set.add_argument("--path", required=True)
+    meta_set.add_argument("--project")
+    meta_set.add_argument("--workspace", choices=WORKSPACE_CHOICES)
+    meta_set.add_argument("--confidentiality", choices=CONFIDENTIALITY_CHOICES)
+    meta_set.add_argument("--context-id")
+    meta_unset = meta_subparsers.add_parser("unset", help="Remove document metadata.")
+    meta_unset.add_argument("--root", required=True)
+    meta_unset.add_argument("--path", required=True)
+
+    project_status_parser = subparsers.add_parser("project-status", help="Summarize project memory and evidence health.")
+    project_status_parser.add_argument("--root", required=True)
+    project_status_parser.add_argument("--state-dir", default=str(default_state_dir()))
+    project_status_parser.add_argument("--project", required=True)
+    project_status_parser.add_argument("--as-of")
+    project_status_parser.add_argument("--json", action="store_true")
+
+    context_parser = subparsers.add_parser("context", help="Generate an Agent Context Pack.")
+    context_parser.add_argument("query")
+    context_parser.add_argument("--root", required=True)
+    context_parser.add_argument("--state-dir", default=str(default_state_dir()))
+    context_parser.add_argument("--project")
+    context_parser.add_argument("--workspace", default="personal", choices=WORKSPACE_CHOICES)
+    context_parser.add_argument("--format", choices=["json", "markdown"], default="json")
+    context_parser.add_argument("--output")
+    context_parser.add_argument("--as-of")
+    context_parser.add_argument("--max-chars", type=int, default=16000)
+
+    eval_parser = subparsers.add_parser("evaluate-search", help="Evaluate lexical retrieval cases.")
+    eval_parser.add_argument("--root", required=True)
+    eval_parser.add_argument("--state-dir", default=str(default_state_dir()))
+    eval_parser.add_argument("--cases", required=True)
+    eval_parser.add_argument("--mode", choices=["lexical", "semantic", "hybrid"], default="lexical")
+    eval_parser.add_argument("--json", action="store_true")
+
+    doctor_parser = subparsers.add_parser("doctor", help="Inspect data root and derived SQLite index health.")
+    doctor_parser.add_argument("--root", required=True, help="Initialized data root.")
+    doctor_parser.add_argument(
+        "--state-dir",
+        default=str(default_state_dir()),
+        help="Local state directory for memory.sqlite.",
+    )
+    doctor_parser.add_argument("--json", action="store_true")
 
     export_parser = subparsers.add_parser("export", help="Export memory records.")
     export_parser.add_argument("--root", required=True, help="Initialized data root.")
     export_parser.add_argument("--include-internal", action="store_true")
+    export_parser.add_argument("--state-dir", default=str(default_state_dir()))
 
     transition_parser = subparsers.add_parser("context-transition", help="Migrate an active context.")
     transition_parser.add_argument("--root", required=True, help="Initialized data root.")
@@ -2256,6 +3265,8 @@ def main(argv=None):
             print(f"path: {relative_path}")
             print(f"type: {memory_type}")
             print(f"status: {status}")
+            if args.confirmed:
+                print("Review/accept required: --confirmed records confirmation metadata only.")
             return 0
         if args.command == "validate":
             count, errors = validate_store(args.root)
@@ -2277,6 +3288,28 @@ def main(argv=None):
             print("FTS5: available")
             print("Tables: " + ", ".join(summary["tables"]))
             return 0
+        if args.command == "db-rebuild":
+            summary = db_rebuild(args)
+            print("Database rebuilt")
+            print(f"Database: {summary['database']}")
+            print(f"Schema version: {summary['version']}")
+            print(f"Memories added: {summary['memories']['added']}")
+            print(f"Documents added: {summary['documents']['added']}")
+            return 0
+        if args.command == "migrate-db-v2-v3":
+            summary = migrate_database_v2_to_v3(args.source, args.output, args.data_root)
+            print("Database migration candidate created")
+            print(f"Source: {summary['source']}")
+            print(f"Output: {summary['output']}")
+            print(f"Memories preserved: {summary['memories']}")
+            print(f"Memory FTS preserved: {summary['memory_fts']}")
+            print(f"Index state preserved: {summary['index_state']}")
+            print(f"Links preserved: {summary['links']}")
+            print(f"Documents indexed: {summary['documents']}")
+            print(f"Documents skipped: {summary['skipped_documents']}")
+            for reason, count in summary["skip_reasons"].items():
+                print(f"Skipped {reason}: {count}")
+            return 0
         if args.command == "index":
             summary = index_store(args)
             if summary["dry_run"]:
@@ -2284,30 +3317,131 @@ def main(argv=None):
                 print(f"Would add: {summary['added']}")
                 print(f"Would update: {summary['updated']}")
                 print(f"Would delete: {summary['deleted']}")
+                print(f"Would add documents: {summary['documents']['added']}")
+                print(f"Would update documents: {summary['documents']['updated']}")
+                print(f"Would delete documents: {summary['documents']['deleted']}")
             else:
                 print("Index complete")
                 print(f"Added: {summary['added']}")
                 print(f"Updated: {summary['updated']}")
                 print(f"Deleted: {summary['deleted']}")
+                print(f"Documents added: {summary['documents']['added']}")
+                print(f"Documents updated: {summary['documents']['updated']}")
+                print(f"Documents deleted: {summary['documents']['deleted']}")
             print(f"Unchanged: {summary['unchanged']}")
-            print(f"Database: {summary['database']}")
-            return 0
-        if args.command == "db-rebuild":
-            summary = db_rebuild(args)
-            print("Database rebuilt")
-            print(f"Records: {summary['records']}")
-            print(f"Schema version: {summary['version']}")
+            print(f"Documents unchanged: {summary['documents']['unchanged']}")
             print(f"Database: {summary['database']}")
             return 0
         if args.command == "search":
-            summary = search_store(args)
-            if args.json_output:
-                print(json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2))
+            effective_mode, warnings = search_mode_summary(args.mode)
+            for warning in warnings:
+                print(warning, file=sys.stderr)
+            rows = search_store(args)
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "requested_mode": args.mode,
+                            "effective_mode": effective_mode,
+                            "warnings": warnings,
+                            "results": rows,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
             else:
-                print(render_search_text(summary), end="")
+                print(f"Requested mode: {args.mode}")
+                print(f"Effective mode: {effective_mode}")
+                for warning in warnings:
+                    print(f"Warning: {warning}")
+                for row in rows:
+                    source = f" source={row['source_kind']}" if row.get("source_kind") else ""
+                    project = f" project={row['project']}" if row.get("project") else ""
+                    print(f"{row['id']}  {row['title']}  kind={row['kind']}{source}{project}")
+                    if row.get("excerpt"):
+                        print(f"  {row['excerpt']}")
+                    print(f"  {row['relative_path']}")
+                print(f"Results: {len(rows)}")
             return 0
+        if args.command == "document-meta":
+            if args.meta_command == "set":
+                summary = document_meta_set(args)
+                print(f"Metadata set: {summary['path']}")
+            else:
+                summary = document_meta_unset(args)
+                print(f"Metadata removed: {summary['path']}")
+                print(f"Removed: {summary['removed']}")
+            return 0
+        if args.command == "project-status":
+            summary = project_status(args)
+            if args.json:
+                print(json.dumps(summary, ensure_ascii=False, indent=2))
+            else:
+                print(f"Project: {summary['project']}")
+                print(f"Status: {summary['status']}")
+                print(f"Project memories: {summary['project_memories']}")
+                print(f"Documents: {summary['documents']}")
+                print(f"Unassigned documents: {summary['unassigned_documents']}")
+                print(f"Candidates: {summary['candidates']}")
+                print(f"Conflicts: {summary['conflicts']}")
+                print(f"Expired: {summary['expired']}")
+                print(f"Unresolved relations: {summary['unresolved_relations']}")
+            return 0
+        if args.command == "context":
+            pack = context_pack(args)
+            content = _pack_json(pack) if args.format == "json" else render_context_markdown(pack)
+            if args.output:
+                atomic_write_text(Path(args.output).expanduser(), content)
+            else:
+                print(content, end="")
+            return 0
+        if args.command == "evaluate-search":
+            summary = evaluate_search(args)
+            if args.json:
+                print(json.dumps(summary, ensure_ascii=False, indent=2))
+            else:
+                print(f"Requested mode: {summary['requested_mode']}")
+                print(f"Effective mode: {summary['effective_mode']}")
+                for warning in summary["warnings"]:
+                    print(f"Warning: {warning}")
+                print(f"Cases: {summary['case_count']}")
+                print(f"Top-1: {summary['top1']:.3f}")
+                print(f"Top-5: {summary['top5']:.3f}")
+                print(f"No result rate: {summary['no_result_rate']:.3f}")
+                print(f"Project leak rate: {summary['project_leak_rate']:.3f}")
+                print(f"Restricted leak rate: {summary['restricted_leak_rate']:.3f}")
+                print(f"Average latency ms: {summary['average_latency_ms']:.3f}")
+                print(f"P95 latency ms: {summary['p95_latency_ms']:.3f}")
+                print(f"Synonym hit rate: {summary['synonym_hit_rate']:.3f}")
+            return 0
+        if args.command == "doctor":
+            summary = doctor_store(args)
+            if args.json:
+                print(json.dumps(summary, ensure_ascii=False, indent=2))
+            else:
+                print(f"Data root: {summary['data_root']}")
+                print(f"SQLite initialized: {summary['sqlite_initialized']}")
+                print(f"Schema version: {summary['schema_version']}")
+                print(f"WAL: {summary['wal']}")
+                print(f"Memory index fresh: {summary['memory_index_fresh']}")
+                print(f"Document index fresh: {summary['document_index_fresh']}")
+                print(f"Hash mismatches: {len(summary['hash_mismatches'])}")
+                print(f"Raw files: {summary['raw_files']}")
+                print(f"Supported documents: {summary['supported_documents']}")
+                print(f"Quarantine files: {summary['quarantine_files']}")
+                print(f"Hidden files: {summary['hidden_files']}")
+                print(f"Manual orphan text: {len(summary['manual_orphan_text'])}")
+                print(f"Legacy provenance: {summary['legacy_provenance']}")
+                print(f"Unresolved links: {summary['unresolved_links']}")
+                print(f"Incomplete distill runs: {len(summary['incomplete_distill_runs'])}")
+                print(f"Stale export: {summary['export_stale']}")
+                print(f"Legacy LaunchAgent active: {summary['launch_agent_active']}")
+                print(f"Port 8765 listening: {summary['port_8765_listening']}")
+                print(f"Errors: {len(summary['errors'])}")
+            return 1 if summary["errors"] else 0
         if args.command == "export":
-            summary, errors = export_store(args.root, args.include_internal)
+            summary, errors = export_store(args.root, args.include_internal, args.state_dir)
             if errors:
                 for rel_path, message in errors:
                     print(f"ERROR {rel_path}: {message}")
@@ -2330,13 +3464,14 @@ def main(argv=None):
                 print(f"New context: {summary['new_context_path']}")
                 print(f"Transition: {summary['transition_path']}")
                 return 0
-            print("Transition completed")
+            print("Transition candidate created")
             print(f"From context: {summary['from_context']}")
             print(f"To context: {summary['to_context']}")
             print(f"Effective date: {summary['effective_date']}")
-            print(f"Updated: {summary['source_path']}")
-            print(f"Created context: {summary['new_context_path']}")
-            print(f"Created transition: {summary['transition_path']}")
+            print(f"Source unchanged: {summary['source_path']}")
+            print(f"Planned context: {summary['new_context_path']}")
+            print(f"Candidate: {summary['transition_path']}")
+            print("Review/accept required")
             return 0
     except (OSError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

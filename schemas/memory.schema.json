@@ -61,6 +61,19 @@
         "archived"
       ]
     },
+    "audit_status": {
+      "enum": [
+        "prepared",
+        "awaiting_review",
+        "accepted",
+        "rejected",
+        "conflict",
+        "pending_delete",
+        "deleted",
+        "stale",
+        "failed"
+      ]
+    },
     "scope": {
       "enum": [
         "global",
@@ -154,6 +167,101 @@
     "reason": {
       "type": "string",
       "minLength": 1
+    },
+    "candidate_action": {
+      "enum": [
+        "ADD",
+        "UPDATE",
+        "DEPRECATE",
+        "NOOP",
+        "REVIEW_REQUIRED",
+        "create",
+        "merge",
+        "support",
+        "supersede",
+        "conflict",
+        "discard"
+      ]
+    },
+    "requested_action": {
+      "type": "string",
+      "minLength": 1
+    },
+    "target_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_sha256": {
+      "type": "string",
+      "pattern": "^[a-fA-F0-9]{64}$"
+    },
+    "confirmation": {
+      "enum": [
+        "explicit"
+      ]
+    },
+    "expected_target_status": {
+      "enum": [
+        "active",
+        "historical",
+        "deprecated",
+        "candidate",
+        "conflict",
+        "archived"
+      ]
+    },
+    "expected_target_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "proposal_input_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "new_record_json": {
+      "type": "string",
+      "minLength": 2
+    },
+    "reviewed_at": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "review_reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "source_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "relations": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
     }
   },
   "allOf": [
