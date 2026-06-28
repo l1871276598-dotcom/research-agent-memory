@@ -207,7 +207,7 @@ class AddCommandTests(unittest.TestCase):
             self.assertIn("tags:\n  - \"coding\"\n  - \"architecture\"", text)
             self.assertIn("# 代码最少原则", text)
             self.assertIn("该记忆的结构化内容保存在 front matter 的 content 字段中。", text)
-            self.assertIn(str(created.relative_to(root)), result.stdout)
+            self.assertIn(created.relative_to(root).as_posix(), result.stdout)
 
     def test_add_defaults_to_candidate_without_explicit_confirmation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -886,7 +886,7 @@ class ContextTransitionCommandTests(unittest.TestCase):
             new_record = json.loads(candidate["new_record_json"])
             self.assertEqual(new_record["context_id"], "industry-engineer")
             self.assertEqual(new_record["status"], "active")
-            self.assertIn(str(candidate_path.relative_to(root)), result.stdout)
+            self.assertIn(candidate_path.relative_to(root).as_posix(), result.stdout)
 
     def test_context_transition_same_workspace_leaves_source_active_and_creates_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -904,7 +904,7 @@ class ContextTransitionCommandTests(unittest.TestCase):
             self.assertEqual([record for _, record in self.records(root) if record.get("context_id") == "industry-engineer"], [])
             self.assertEqual(len(transitions), 1)
             self.assertEqual(transitions[0][1]["status"], "candidate")
-            self.assertIn(f"Source unchanged: {source_path.relative_to(root)}", result.stdout)
+            self.assertIn(f"Source unchanged: {source_path.relative_to(root).as_posix()}", result.stdout)
 
     def test_context_transition_cross_workspace_records_planned_work_context(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1444,7 +1444,12 @@ class DbInitCommandTests(unittest.TestCase):
             target = Path(tmp) / "target"
             state_dir = Path(tmp) / "state-link"
             target.mkdir()
-            state_dir.symlink_to(target, target_is_directory=True)
+            try:
+                state_dir.symlink_to(target, target_is_directory=True)
+            except OSError as exc:
+                if getattr(exc, "winerror", None) != 1314:
+                    raise
+                self.skipTest(f"symbolic links unavailable: {exc}")
             self.assertEqual(self.run_init(root).returncode, 0)
 
             result = self.run_db_init(root, state_dir)
@@ -1459,7 +1464,12 @@ class DbInitCommandTests(unittest.TestCase):
             target = Path(tmp) / "target.sqlite"
             state_dir.mkdir()
             target.write_text("", encoding="utf-8")
-            self.db_path(state_dir).symlink_to(target)
+            try:
+                self.db_path(state_dir).symlink_to(target)
+            except OSError as exc:
+                if getattr(exc, "winerror", None) != 1314:
+                    raise
+                self.skipTest(f"symbolic links unavailable: {exc}")
             self.assertEqual(self.run_init(root).returncode, 0)
 
             result = self.run_db_init(root, state_dir)

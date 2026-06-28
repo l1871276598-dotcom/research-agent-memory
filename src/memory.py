@@ -1024,6 +1024,8 @@ def _replace_transaction(operations, cleanup_paths):
     directories = {path.parent for path, _ in operations}
 
     def sync_directories():
+        if os.name == "nt":
+            return
         for directory in directories:
             descriptor = os.open(directory, os.O_RDONLY)
             try:
@@ -1629,6 +1631,8 @@ def _verify_database_memory_files(conn, root):
 
 
 def _sync_directory(path):
+    if os.name == "nt":
+        return
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
@@ -1832,8 +1836,8 @@ def parse_document_frontmatter(text):
         "context_id": None,
     }
     body = text
-    if text.startswith("---\n"):
-        lines = text.splitlines()
+    lines = text.splitlines()
+    if lines and lines[0] == "---":
         try:
             end = lines.index("---", 1)
         except ValueError:
@@ -2713,14 +2717,15 @@ def doctor_store(args):
     document_items, skipped = collect_document_items_with_skips(root)
     result["supported_documents"] = len(document_items)
     result["skipped_documents"] = skipped
-    try:
-        launch = subprocess.run(
-            ["launchctl", "print", f"gui/{os.getuid()}/com.researchagent.chatgpt-archive"],
-            capture_output=True, text=True, timeout=2,
-        )
-        result["launch_agent_active"] = launch.returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        pass
+    if sys.platform == "darwin":
+        try:
+            launch = subprocess.run(
+                ["launchctl", "print", f"gui/{os.getuid()}/com.researchagent.chatgpt-archive"],
+                capture_output=True, text=True, timeout=2,
+            )
+            result["launch_agent_active"] = launch.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            pass
     with closing(socket.socket()) as probe:
         probe.settimeout(0.2)
         result["port_8765_listening"] = probe.connect_ex(("127.0.0.1", 8765)) == 0
@@ -3262,7 +3267,7 @@ def main(argv=None):
         if args.command == "add":
             memory_id, relative_path, memory_type, status = add_memory(args)
             print(f"memory_id: {memory_id}")
-            print(f"path: {relative_path}")
+            print(f"path: {relative_path.as_posix()}")
             print(f"type: {memory_type}")
             print(f"status: {status}")
             if args.confirmed:

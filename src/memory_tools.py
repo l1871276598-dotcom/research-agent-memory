@@ -244,11 +244,12 @@ def _write_versioned_bytes(preferred, data, write=True):
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
-            descriptor = os.open(target.parent, os.O_RDONLY)
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
+            if os.name != "nt":
+                descriptor = os.open(target.parent, os.O_RDONLY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
             return target, True
         except FileExistsError:
             if not target.is_symlink() and target.is_file() and _file_sha256(target) == digest:
