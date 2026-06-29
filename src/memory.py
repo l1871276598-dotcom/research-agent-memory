@@ -14,6 +14,11 @@ from contextlib import closing
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+try:
+    from platform_paths import default_state_dir, known_sync_roots
+except ModuleNotFoundError:
+    from src.platform_paths import default_state_dir, known_sync_roots
+
 
 DIRECTORIES = [
     "memory/profile",
@@ -247,13 +252,6 @@ def _repository_root():
             return path
     return None
 
-
-def _icloud_root():
-    return Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs"
-
-
-def default_state_dir():
-    return Path.home() / "Library" / "Application Support" / "ResearchAgent"
 
 
 def _contains_or_equals(parent, child):
@@ -1229,14 +1227,20 @@ def check_state_dir(root, state_dir):
     root = Path(root).expanduser().resolve(strict=True)
     state = raw_state.resolve(strict=False)
     repo_root = _repository_root()
-    icloud = _icloud_root().expanduser().resolve(strict=False)
+    sync_roots = [
+        path.expanduser().resolve(strict=False)
+        for path in known_sync_roots()
+    ]
 
     if (
         state == root
         or _contains_or_equals(root, state)
         or _contains_or_equals(state, root)
         or (repo_root is not None and _contains_or_equals(repo_root.resolve(), state))
-        or _contains_or_equals(icloud, state)
+        or any(
+            _contains_or_equals(sync_root, state)
+            for sync_root in sync_roots
+        )
     ):
         raise ValueError(STATE_DIR_ERROR)
 

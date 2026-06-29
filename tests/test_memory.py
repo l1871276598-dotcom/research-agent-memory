@@ -1424,16 +1424,20 @@ class DbInitCommandTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("SQLite state directory must be local", result.stderr)
 
-    def test_db_init_rejects_icloud_state_dir(self):
+    def test_db_init_rejects_known_sync_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             module = load_memory_module()
             root = Path(tmp) / "data"
-            fake_icloud = Path(tmp) / "icloud"
-            state_dir = fake_icloud / "state"
+            fake_sync_root = Path(tmp) / "sync-root"
+            state_dir = fake_sync_root / "state"
             module.init_store(root)
             args = mock.Mock(root=str(root), state_dir=str(state_dir))
 
-            with mock.patch.object(module, "_icloud_root", return_value=fake_icloud.resolve()):
+            with mock.patch.object(
+                module,
+                "known_sync_roots",
+                return_value=[fake_sync_root.resolve()],
+            ):
                 with self.assertRaisesRegex(ValueError, "SQLite state directory must be local"):
                     module.db_init(args)
             self.assertFalse(state_dir.exists())
