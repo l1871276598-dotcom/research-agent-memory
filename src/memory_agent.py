@@ -204,6 +204,12 @@ def _validate_finalize_input(
 
 
 def _validate_loop_input(outcome, error, reflection, policy_suggestions):
+    if outcome is None and any(
+        value is not None for value in (error, reflection, policy_suggestions)
+    ):
+        raise AgentError(
+            "conflicting_input", "Loop Engineering fields require an outcome."
+        )
     if outcome not in {None, "pass", "fail"}:
         raise AgentError("invalid_arguments", "Invalid command arguments.")
     if error is not None and not isinstance(error, str):
@@ -337,6 +343,50 @@ def _create_loop_run(state, task, result, outcome, error, reflection, policy_sug
     }, run_dir
 
 
+def _link_loop_candidate(run_dir, candidate_id):
+    run_path = run_dir / "run.json"
+    run_data = json.loads(run_path.read_text(encoding="utf-8"))
+    if run_data.get("candidate_ids") != []:
+        raise ValueError("loop run already has candidate linkage")
+    run_data["candidate_ids"] = [candidate_id]
+    memory.atomic_write_text(
+        run_path,
+        json.dumps(run_data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+
+
+def _rollback_loop_link(root, state, run_dir, candidate_path, journal_before):
+    errors = []
+    try:
+        candidate_path.unlink()
+    except OSError as exc:
+        errors.append(exc)
+
+    journal_path = memory_distill._journal_path(root)
+    try:
+        if journal_before is None:
+            journal_path.unlink(missing_ok=True)
+        else:
+            memory.atomic_write_text(journal_path, journal_before)
+    except OSError as exc:
+        errors.append(exc)
+
+    try:
+        if (state / "memory.sqlite").exists():
+            memory.index_store(
+                argparse.Namespace(root=str(root), state_dir=str(state), dry_run=False)
+            )
+    except Exception as exc:
+        errors.append(exc)
+
+    try:
+        shutil.rmtree(run_dir)
+    except OSError as exc:
+        errors.append(exc)
+    if errors:
+        raise errors[0]
+
+
 def finalize_memory(
     root,
     task,
@@ -363,6 +413,12 @@ def finalize_memory(
         )
     artifacts = []
     if result.strip():
+        journal_path = memory_distill._journal_path(root)
+        journal_before = (
+            journal_path.read_text(encoding="utf-8")
+            if run_dir is not None and journal_path.exists()
+            else None
+        )
         try:
             summary = memory_distill.apply_candidate(
                 _candidate_args(root, state, task, result)
@@ -372,6 +428,27 @@ def finalize_memory(
                 candidate_path = root / relative_path
                 if not candidate_path.is_file():
                     raise ValueError("candidate artifact is missing")
+                if run_dir is not None:
+                    try:
+                        _link_loop_candidate(run_dir, summary["candidate_id"])
+                    except Exception as exc:
+                        try:
+                            _rollback_loop_link(
+                                root,
+                                state,
+                                run_dir,
+                                candidate_path,
+                                journal_before,
+                            )
+                        except Exception as rollback_exc:
+                            raise AgentError(
+                                "loop_link_failed",
+                                "Loop Engineering candidate linkage failed.",
+                            ) from rollback_exc
+                        raise AgentError(
+                            "loop_link_failed",
+                            "Loop Engineering candidate linkage failed.",
+                        ) from exc
                 artifacts.append(
                     {
                         "kind": "candidate",
@@ -379,6 +456,8 @@ def finalize_memory(
                         "path": relative_path,
                     }
                 )
+        except AgentError:
+            raise
         except Exception as exc:
             if run_dir is not None:
                 try:

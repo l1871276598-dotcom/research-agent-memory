@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -505,6 +506,7 @@ class MemoryAgentTests(unittest.TestCase):
             reflection = (run_dir / "reflection.md").read_text(encoding="utf-8")
             policies = (run_dir / "policy_suggestions.md").read_text(encoding="utf-8")
             file_names = {path.name for path in run_dir.iterdir()}
+            candidate_exists = (root / payload["artifacts"][0]["path"]).is_file()
 
         self.assertEqual(
             file_names,
@@ -520,7 +522,10 @@ class MemoryAgentTests(unittest.TestCase):
             hashlib.sha256("迁移验证通过".encode("utf-8")).hexdigest(),
         )
         self.assertEqual(run_data["outcome"], "pass")
-        self.assertEqual(run_data["candidate_ids"], [])
+        self.assertEqual(len(payload["artifacts"]), 1)
+        artifact = payload["artifacts"][0]
+        self.assertEqual(run_data["candidate_ids"], [artifact["id"]])
+        self.assertTrue(candidate_exists)
         self.assertTrue(run_data["review_required"])
         self.assertEqual(run_data["approved_policy_count"], 0)
         self.assertEqual(run_data["status"], "waiting_for_human")
@@ -530,6 +535,19 @@ class MemoryAgentTests(unittest.TestCase):
         self.assertIn("## Error Evidence\n\nNone", reflection)
         self.assertIn("## What Worked\n\n预检查成功阻止了错误目标。", reflection)
         self.assertRegex(policies, r"- \[ \] 迁移前验证目标状态。 <!-- policy_id: [0-9a-f]{16} -->")
+
+    def test_finalize_blank_result_with_outcome_keeps_candidate_ids_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = self.init_root(tmp)
+            payload = memory_agent.finalize_memory(
+                root, "task", "   ", state_dir=state, outcome="pass"
+            )
+            run_dir = state / payload["loop_run"]["path"]
+            run_data = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["candidate_count"], 0)
+        self.assertEqual(payload["artifacts"], [])
+        self.assertEqual(run_data["candidate_ids"], [])
 
     def test_finalize_fail_records_error_and_reflection_without_inventing_cause(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -728,6 +746,88 @@ class MemoryAgentTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "distillation_failed")
         self.assertTrue(published_before_candidate["value"])
         self.assertEqual(list(run_root.iterdir()) if run_root.exists() else [], [])
+
+    def test_finalize_link_failure_rolls_back_run_candidate_journal_and_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = self.init_root(tmp, indexed=True)
+            journal = root / "state" / "distill_runs.jsonl"
+            journal_before = journal.read_bytes() if journal.exists() else None
+            captured = {}
+            real_apply = memory_agent.memory_distill.apply_candidate
+            real_write = memory_agent.memory.atomic_write_text
+
+            def apply_and_index(args):
+                summary = real_apply(args)
+                captured.update(summary)
+                memory_agent.memory.index_store(
+                    memory_agent.argparse.Namespace(
+                        root=str(root), state_dir=str(state), dry_run=False
+                    )
+                )
+                return summary
+
+            def fail_link_write(path, content):
+                if (
+                    path.name == "run.json"
+                    and path.parent.parent.name == "runs"
+                    and re.fullmatch(r"[0-9a-f]{32}", path.parent.name)
+                ):
+                    raise OSError("sensitive linkage failure")
+                return real_write(path, content)
+
+            output = io.StringIO()
+            errors = io.StringIO()
+            with (
+                mock.patch.object(
+                    memory_agent.memory_distill,
+                    "apply_candidate",
+                    side_effect=apply_and_index,
+                ),
+                mock.patch.object(
+                    memory_agent.memory,
+                    "atomic_write_text",
+                    side_effect=fail_link_write,
+                ),
+                contextlib.redirect_stdout(output),
+                contextlib.redirect_stderr(errors),
+            ):
+                code = memory_agent.main(
+                    [
+                        "finalize",
+                        "--root",
+                        str(root),
+                        "--state-dir",
+                        str(state),
+                        "--task",
+                        "task",
+                        "--result",
+                        "result",
+                        "--outcome",
+                        "fail",
+                    ]
+                )
+
+            run_root = state / "loop_engineering" / "runs"
+            run_entries = list(run_root.iterdir()) if run_root.exists() else []
+            candidate_exists = bool(captured.get("path")) and (
+                root / captured["path"]
+            ).exists()
+            journal_after = journal.read_bytes() if journal.exists() else None
+            with contextlib.closing(sqlite3.connect(state / "memory.sqlite")) as conn:
+                indexed = conn.execute(
+                    "SELECT COUNT(*) FROM memories WHERE id=?",
+                    (captured.get("candidate_id"),),
+                ).fetchone()[0]
+
+        self.assertNotEqual(code, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["error"]["code"], "loop_link_failed")
+        self.assertNotIn("sensitive linkage failure", output.getvalue() + errors.getvalue())
+        self.assertNotIn("Traceback", errors.getvalue())
+        self.assertEqual(run_entries, [])
+        self.assertFalse(candidate_exists)
+        self.assertEqual(indexed, 0)
+        self.assertEqual(journal_after, journal_before)
 
     def test_approve_policies_requires_explicit_confirmation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -955,6 +1055,81 @@ class MemoryAgentTests(unittest.TestCase):
         self.assertNotEqual(missing.returncode, 0)
         self.assertEqual(self.parse_stdout(missing)["error"]["code"], "missing_input")
         self.assertNotIn("Traceback", conflicting.stderr + missing.stderr)
+
+    def test_finalize_loop_fields_without_outcome_fail_without_writes(self):
+        for option, value in (
+            ("--error", "sensitive error evidence"),
+            ("--reflection", "sensitive reflection"),
+            ("--policy-suggestion", "sensitive policy"),
+        ):
+            with self.subTest(option=option), tempfile.TemporaryDirectory() as tmp:
+                root, state = self.init_root(tmp)
+                before = {
+                    path.relative_to(root): path.read_bytes()
+                    for path in root.rglob("*")
+                    if path.is_file()
+                }
+                result = self.run_cli(
+                    "finalize",
+                    "--root",
+                    root,
+                    "--state-dir",
+                    state,
+                    "--task",
+                    "task",
+                    "--result",
+                    "result",
+                    option,
+                    value,
+                )
+                after = {
+                    path.relative_to(root): path.read_bytes()
+                    for path in root.rglob("*")
+                    if path.is_file()
+                }
+
+                self.assertNotEqual(result.returncode, 0)
+                payload = self.parse_stdout(result)
+                self.assertEqual(payload["error"]["code"], "conflicting_input")
+                self.assertEqual(
+                    payload["error"]["message"],
+                    "Loop Engineering fields require an outcome.",
+                )
+                self.assertEqual(after, before)
+                self.assertFalse(state.exists())
+                self.assertNotIn(value, result.stdout + result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_finalize_function_rejects_loop_fields_without_outcome_before_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state = self.init_root(tmp)
+            before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+
+            with self.assertRaises(memory_agent.AgentError) as raised:
+                memory_agent.finalize_memory(
+                    root,
+                    "task",
+                    "result",
+                    state_dir=state,
+                    reflection="sensitive reflection",
+                )
+
+            after = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+
+        self.assertEqual(raised.exception.code, "conflicting_input")
+        self.assertEqual(
+            raised.exception.message, "Loop Engineering fields require an outcome."
+        )
+        self.assertEqual(after, before)
+        self.assertFalse(state.exists())
 
     def test_finalize_does_not_modify_authoritative_memory_or_apply(self):
         with tempfile.TemporaryDirectory() as tmp:
