@@ -342,10 +342,41 @@ python3 src/memory_agent.py finalize \
   --root "$DATA_ROOT" \
   --state-dir "$STATE_DIR" \
   --task "整理 PDC 项目的证据链" \
-  --result-file completed-result.txt
+  --result-file completed-result.txt \
+  --max-task-chars 20000 \
+  --max-result-chars 60000 \
+  --max-candidate-chars 80000
 ```
 
-短结果可改用 `--result "..."`；`--result` 与 `--result-file` 互斥。成功输出包含 `operation: "finalize"`、真实 `candidate_count`、真实候选 `artifacts`、`review_required: true`、`applied: false` 和 `warnings`。第一版只进入现有候选审核队列，候选必须人工审核，绝不自动应用到权威记忆。
+短结果可改用 `--result "..."`；`--result` 与 UTF-8 `--result-file` 互斥。默认 task、result 和候选正文上限分别为 20,000、60,000 和 80,000 个 Python 字符，三个选项都必须是正整数。超限不会静默截断，也不会创建候选或 Loop 文件，而是以 `task_too_large`、`result_too_large`、`candidate_too_large` 或 `invalid_max_chars` 稳定错误码退出。成功输出包含 `operation: "finalize"`、真实 `candidate_count`、真实候选 `artifacts`、`review_required: true`、`applied: false` 和 `warnings`；候选仍必须人工审核。
+
+可选的轻量 Loop Engineering 只记录外部调用者已经执行完的 pass/fail 结果，不执行 shell 命令：
+
+```bash
+python3 src/memory_agent.py finalize \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --task "验证迁移" \
+  --result "迁移失败" \
+  --outcome fail \
+  --error "目标版本不匹配" \
+  --reflection "版本预检查缺失" \
+  --policy-suggestion "迁移前验证目标状态"
+```
+
+提供 `--outcome pass|fail` 后，会在本地 `<state-dir>/loop_engineering/runs/<run_id>/` 生成 `run.json`、`reflection.md` 和 `policy_suggestions.md`。三文件先写入同一文件系统内的临时目录，再以目录 rename 发布；候选创建失败会删除本次运行目录。审批同时修改数据根和本地 state 时使用现有事务回滚与一致性约束，不宣称跨文件系统具备单次 rename 级原子性。省略 `--outcome` 时保持原有 `finalize` 行为和 JSON 输出。
+
+人工审核者只需把认可的策略复选框改为 `[x]` 或 `[X]`，再显式确认：
+
+```bash
+python3 src/memory_agent.py approve-policies \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --run-id "$RUN_ID" \
+  --confirmed
+```
+
+只有已勾选且内容哈希有效的策略会按哈希去重后写入 `<root>/memory_rules.md`，并与对应 `run.json` 状态通过现有事务机制同步更新。`memory_rules.md` 只是可审计的已批准规则注册表，不会自动改变提示词、代码、active memory 或 Agent 行为。本阶段不包含 Meta Planner、自动重试、自动策略应用或自动接受 session candidate。
 
 预期错误同样返回单个 JSON 对象，包含稳定的 `error.code` 和安全的 `error.message`，并以非零状态退出。Windows、macOS 和 Linux 使用相同命令；省略 `--state-dir` 时继续使用 `platform_paths.py` 的平台本地状态目录，SQLite 不写入同步数据目录。
 
