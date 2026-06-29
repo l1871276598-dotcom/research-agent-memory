@@ -322,6 +322,33 @@ python3 src/memory.py doctor \
 
 `doctor` 检查数据根、SQLite schema、WAL、memory/document 索引新鲜度、哈希不一致、manual raw/text 孤立文件和旧网络残留标记。
 
+## Memory Agent 编排接口
+
+`memory_agent.py` 是现有检索、路径安全和候选审核能力之上的薄编排层。`prepare` 在任务执行前返回有字符上限的相关上下文；`finalize` 在任务完成后生成待审核候选，不调用外部模型，也不会自动 accept 或 apply。
+
+```bash
+python3 src/memory_agent.py prepare \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --task "整理 PDC 项目的证据链" \
+  --project pdc \
+  --max-chars 8000
+```
+
+成功输出是单个 JSON 对象，包含 `operation: "prepare"`、`context`、`context_chars`、`max_chars`、真实召回来源 `sources` 和 `warnings`。`context_chars` 始终等于 Python `len(context)`，且不超过 `max_chars`。
+
+```bash
+python3 src/memory_agent.py finalize \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --task "整理 PDC 项目的证据链" \
+  --result-file completed-result.txt
+```
+
+短结果可改用 `--result "..."`；`--result` 与 `--result-file` 互斥。成功输出包含 `operation: "finalize"`、真实 `candidate_count`、真实候选 `artifacts`、`review_required: true`、`applied: false` 和 `warnings`。第一版只进入现有候选审核队列，候选必须人工审核，绝不自动应用到权威记忆。
+
+预期错误同样返回单个 JSON 对象，包含稳定的 `error.code` 和安全的 `error.message`，并以非零状态退出。Windows、macOS 和 Linux 使用相同命令；省略 `--state-dir` 时继续使用 `platform_paths.py` 的平台本地状态目录，SQLite 不写入同步数据目录。
+
 ## 候选审核
 
 候选审核只有一套当前实现的流程：
