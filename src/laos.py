@@ -6,6 +6,7 @@ from pathlib import Path
 import memory_tools
 from agents.orchestrator import ContextAgent, ImportAgent, MemoryAgent, ReviewAgent, SearchAgent
 from agents.registry import AgentRegistry
+from agents.runtime import HermesRuntimeAgent
 from context.builder import ContextBuilder
 from memory.candidate import CandidateStore
 from memory.core import MemoryCore
@@ -32,6 +33,7 @@ def build_application(root, state_dir=None):
             default_workspace="personal",
         ),
         ContextAgent(ContextBuilder(store)),
+        HermesRuntimeAgent(),
     ]
     config = Path(__file__).with_name("agents") / "registry.yaml"
     return Orchestrator(AgentRegistry.from_config(config, agents))
