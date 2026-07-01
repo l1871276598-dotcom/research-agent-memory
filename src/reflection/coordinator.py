@@ -85,24 +85,16 @@ class ConversationReviewCoordinator:
         if force and review_position is not None:
             memory_position = counters.get("last_memory_review_position")
             skill_position = counters.get("last_skill_review_position")
-            if (
-                memory_position is not None
-                and skill_position is not None
-                and memory_position >= review_position
-                and skill_position >= review_position
-            ):
-                return {
-                    "status": "skipped",
-                    "reason": "already_reviewed",
-                    "session_id": session_id,
-                    "counters": counters,
-                }
+            review_memory = memory_position is None or memory_position < review_position
+            review_skills = skill_position is None or skill_position < review_position
+        else:
+            review_memory = force or counters["turns"] >= self.memory_interval
+            review_skills = force or counters["tool_iterations"] >= self.skill_interval
 
-        review_memory = force or counters["turns"] >= self.memory_interval
-        review_skills = force or counters["tool_iterations"] >= self.skill_interval
         if not review_memory and not review_skills:
             return {
-                "status": "not_due",
+                "status": "skipped" if force else "not_due",
+                "reason": "already_reviewed" if force else None,
                 "session_id": session_id,
                 "counters": counters,
             }
