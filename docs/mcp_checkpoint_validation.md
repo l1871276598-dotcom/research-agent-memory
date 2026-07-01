@@ -35,10 +35,45 @@ The receipt always states:
 
 These values are architectural facts, not test outcomes.
 
-## Start the existing MCP server in validation mode
+## One-command trial workflow
 
-Checkpoint capture is disabled by default. Enable it explicitly and choose the
-LAOS workspace that will receive the test data:
+Prepare an isolated five-checkpoint trial without enabling any model review:
+
+```bash
+python3 tools/mcp_checkpoint_trial.py prepare \
+  --data-root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --workspace personal \
+  --project laos-checkpoint-test \
+  --expected-checkpoints 5
+```
+
+This initializes the local store, writes `mcp_checkpoint_trial.json` into the
+state directory, and prints the exact ChatGPT instruction for the trial.
+
+Start the MCP server from the saved manifest:
+
+```bash
+python3 tools/mcp_checkpoint_trial.py serve \
+  --state-dir "$STATE_DIR"
+```
+
+After the expected calls, generate the automated portion of the decision report:
+
+```bash
+python3 tools/mcp_checkpoint_trial.py report \
+  --state-dir "$STATE_DIR"
+```
+
+The report intentionally leaves three empirical fields unresolved: whether the
+tool was called on every expected turn, whether each assistant hash matches the
+final displayed response, and whether the write-confirmation burden is
+acceptable. A passing automated report alone cannot promote MCP to a formal
+checkpoint channel.
+
+## Direct server command
+
+Checkpoint capture is disabled by default. It can also be enabled directly:
 
 ```bash
 python3 tools/serve_laos.py \
@@ -91,9 +126,9 @@ For each exchange, record:
 Regeneration and edited-message branching should be tested separately. Use a
 new checkpoint ID and increment `version`, or use a distinct branch ID.
 
-## Generate the LAOS report
+## Generate the lower-level LAOS report
 
-After five expected calls:
+The original report command remains available:
 
 ```bash
 python3 tools/checkpoint_validation.py \
