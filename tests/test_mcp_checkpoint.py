@@ -1,4 +1,5 @@
 import hashlib
+import importlib.util
 import sys
 import tempfile
 import unittest
@@ -12,6 +13,13 @@ if str(SRC) not in sys.path:
 from bridge import McpCheckpointCapture, build_bridge_pipeline
 from memory import init_store
 
+
+SPEC = importlib.util.spec_from_file_location(
+    "checkpoint_validation",
+    ROOT / "tools" / "checkpoint_validation.py",
+)
+CHECKPOINT_VALIDATION = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(CHECKPOINT_VALIDATION)
 
 TOKEN = "internal-checkpoint-token-123456"
 SCOPE = {
@@ -94,6 +102,7 @@ class McpCheckpointTests(unittest.TestCase):
             second = capture.capture(**values)
 
             self.assertEqual(first["checkpoint_id"], second["checkpoint_id"])
+            self.assertEqual(first["session_id"], second["session_id"])
             self.assertTrue(first["capability_evidence"]["stable_checkpoint_id_provided"])
             self.assertEqual(
                 [receipt["status"] for receipt in second["receipts"]],
@@ -138,6 +147,31 @@ class McpCheckpointTests(unittest.TestCase):
                 session["messages"][1]["metadata"]["bridge_message_id"],
                 "real-assistant-message-id",
             )
+
+            report = CHECKPOINT_VALIDATION.build_report(state, expected_checkpoints=1)
+            self.assertTrue(report["checkpoint_capture_ready"])
+            self.assertFalse(report["lossless_conversation_capture_proven"])
+            self.assertEqual(report["stable_checkpoint_ids"], 1)
+            self.assertEqual(
+                report["source_id_coverage"],
+                {"conversation": 1, "user_message": 1, "assistant_message": 1},
+            )
+            self.assertEqual(report["complete_checkpoints"], 1)
+
+    def test_report_fails_readiness_when_expected_calls_are_missing(self):
+        with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as state:
+            init_store(data)
+            _, capture = self.build_capture(data, state)
+            capture.capture(
+                session_alias="conversation-alpha",
+                user_message="Question",
+                assistant_response="Answer",
+                checkpoint_id="checkpoint-one",
+            )
+            report = CHECKPOINT_VALIDATION.build_report(state, expected_checkpoints=2)
+            self.assertFalse(report["checkpoint_capture_ready"])
+            self.assertEqual(report["observed_checkpoints"], 1)
+            self.assertIn("every expected turn", report["manual_checks_required"][0])
 
     def test_incomplete_response_is_rejected(self):
         with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as state:
