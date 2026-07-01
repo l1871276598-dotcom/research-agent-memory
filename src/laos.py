@@ -13,6 +13,7 @@ from memory.candidate import CandidateStore
 from memory.core import MemoryCore
 from memory.store import MemoryStore
 from orchestrator import Orchestrator
+from procedures.proposals import ProcedureProposalStore
 from reflection import ConversationReviewCoordinator, ConversationReviewService, ReviewStateStore
 from review.gate import ReviewGate
 from runtime.codex import CodexConversationReviewer
@@ -31,6 +32,7 @@ def build_application(root, state_dir=None):
     review_coordinator = ConversationReviewCoordinator(
         review_service,
         ReviewStateStore(candidates.state_dir),
+        procedure_proposals=ProcedureProposalStore(candidates.state_dir),
     )
     agents = [
         ImportAgent(root, memory_tools),
