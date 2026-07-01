@@ -1,0 +1,41 @@
+{
+  "run_id": "stage07-context-audit-1",
+  "task_id": "context-builder-audit",
+  "type": "repository.module_audit",
+  "title": "Audit Context Builder",
+  "instruction": "Audit the module for reliability and cite concrete code evidence for every conclusion.",
+  "query": "module audit idempotency fail-closed recovery restricted context",
+  "workspace": "personal",
+  "confidentiality": "personal",
+  "inputs": [
+    "src/context/builder.py"
+  ],
+  "minimum_score": 1.0,
+  "context_limit": 8000,
+  "criteria": [
+    {
+      "id": "idempotency",
+      "description": "verify deterministic or idempotent context construction",
+      "required_terms": [
+        "idempotency"
+      ],
+      "strategy": "For module audits, explicitly verify idempotency or deterministic replay behavior and cite the governing identity or deduplication mechanism."
+    },
+    {
+      "id": "fail_closed",
+      "description": "verify fail-closed behavior for invalid or ineligible context",
+      "required_terms": [
+        "fail-closed"
+      ],
+      "strategy": "For module audits, verify fail-closed behavior before treating a capability as available or safe."
+    },
+    {
+      "id": "restricted",
+      "description": "verify restricted information cannot enter exported context",
+      "required_terms": [
+        "restricted"
+      ],
+      "strategy": "For context and bridge audits, explicitly verify that restricted information is excluded before model invocation."
+    }
+  ]
+}
