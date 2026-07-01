@@ -24,6 +24,8 @@ connection.
   deployment, and no reliability claim can be made.
 - Even in an eligible workspace, model-initiated MCP calls cannot prove passive
   or lossless transcript capture.
+- The implementation passes unit tests, compile checks, and whitespace checks
+  on Ubuntu, macOS, and Windows.
 
 ## Architecture consequence
 
