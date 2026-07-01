@@ -35,6 +35,7 @@ def validate_proposal(value):
         "category",
         "target_file",
         "expected_sha256",
+        "review_key",
     }
     if not set(value) <= allowed:
         raise ValueError("procedure proposal has unsupported fields")
@@ -49,7 +50,7 @@ def validate_proposal(value):
         isinstance(item, str) and item.strip() for item in refs
     ):
         raise ValueError("source_refs must contain evidence references")
-    for field in ("reason", "category", "target_file"):
+    for field in ("reason", "category", "target_file", "review_key"):
         if field in value and value[field] is not None:
             _text(value[field], field)
     digest = value.get("expected_sha256")
@@ -73,22 +74,60 @@ class ProcedureProposalStore:
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     reviewed_at TEXT,
-                    review_reason TEXT
+                    review_reason TEXT,
+                    review_key TEXT
                 )
+                """
+            )
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(proposals)")
+            }
+            if "review_key" not in columns:
+                connection.execute("ALTER TABLE proposals ADD COLUMN review_key TEXT")
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_proposals_review_key
+                ON proposals(review_key) WHERE review_key IS NOT NULL
                 """
             )
             connection.commit()
 
     def create(self, value):
         validate_proposal(value)
+        review_key = value.get("review_key")
         proposal_id = f"procedure-{uuid.uuid4().hex[:12]}"
         now = _timestamp()
         payload = json.dumps(value, ensure_ascii=False, sort_keys=True)
         with closing(sqlite3.connect(self.path)) as connection:
-            connection.execute(
-                "INSERT INTO proposals(id,status,payload,created_at) VALUES(?,?,?,?)",
-                (proposal_id, "candidate", payload, now),
-            )
+            connection.execute("BEGIN IMMEDIATE")
+            if review_key:
+                existing = connection.execute(
+                    "SELECT id FROM proposals WHERE review_key=?",
+                    (review_key,),
+                ).fetchone()
+                if existing is not None:
+                    connection.rollback()
+                    return self.get(existing[0])
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO proposals(id,status,payload,created_at,review_key)
+                    VALUES(?,?,?,?,?)
+                    """,
+                    (proposal_id, "candidate", payload, now, review_key),
+                )
+            except sqlite3.IntegrityError:
+                connection.rollback()
+                if review_key:
+                    with closing(sqlite3.connect(self.path)) as lookup:
+                        existing = lookup.execute(
+                            "SELECT id FROM proposals WHERE review_key=?",
+                            (review_key,),
+                        ).fetchone()
+                    if existing is not None:
+                        return self.get(existing[0])
+                raise
             connection.commit()
         return self.get(proposal_id)
 
