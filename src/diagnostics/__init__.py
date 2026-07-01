@@ -1,3 +1,5 @@
-from .doctor import Doctor
+from .health import HealthCheck
 
-__all__ = ["Doctor"]
+Doctor = HealthCheck
+
+__all__ = ["Doctor", "HealthCheck"]
