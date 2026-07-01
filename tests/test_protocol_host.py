@@ -27,6 +27,9 @@ class FakeFastMCP:
 
 
 class Facade:
+    def __init__(self, checkpoint_enabled=True):
+        self.checkpoint_capture = object() if checkpoint_enabled else None
+
     def run_task(self, task):
         return {"task": task}
 
@@ -43,16 +46,19 @@ class Facade:
         return []
 
 
+def mcp_modules():
+    module = types.ModuleType("mcp.server.fastmcp")
+    module.FastMCP = FakeFastMCP
+    return {
+        "mcp": types.ModuleType("mcp"),
+        "mcp.server": types.ModuleType("mcp.server"),
+        "mcp.server.fastmcp": module,
+    }
+
+
 class ProtocolHostTests(unittest.TestCase):
     def test_checkpoint_tool_is_explicit_and_routes_all_evidence_fields(self):
-        module = types.ModuleType("mcp.server.fastmcp")
-        module.FastMCP = FakeFastMCP
-        modules = {
-            "mcp": types.ModuleType("mcp"),
-            "mcp.server": types.ModuleType("mcp.server"),
-            "mcp.server.fastmcp": module,
-        }
-        with mock.patch.dict(sys.modules, modules):
+        with mock.patch.dict(sys.modules, mcp_modules()):
             host = build_protocol_host(Facade())
 
         self.assertIn("explicit, not passive", host.instructions)
@@ -75,6 +81,13 @@ class ProtocolHostTests(unittest.TestCase):
         self.assertEqual(values["source_conversation_id"], "source-conversation")
         self.assertTrue(values["force_review"])
         self.assertIn("cannot inspect the conversation automatically", tool.__doc__)
+
+    def test_checkpoint_tool_is_absent_when_capture_is_disabled(self):
+        with mock.patch.dict(sys.modules, mcp_modules()):
+            host = build_protocol_host(Facade(checkpoint_enabled=False))
+
+        self.assertNotIn("checkpoint", host.instructions)
+        self.assertNotIn("laos_capture_checkpoint", host.tools)
 
 
 if __name__ == "__main__":
