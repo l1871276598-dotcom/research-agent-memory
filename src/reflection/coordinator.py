@@ -33,13 +33,13 @@ class ConversationReviewCoordinator:
         self.memory_interval = memory_interval
         self.skill_interval = skill_interval
 
-    def _save_procedures(self, candidates, session_id):
+    def _save_procedures(self, candidates, session_id, review_id=None):
         if not candidates:
             return []
         if self.procedure_proposals is None:
             return []
         saved = []
-        for item in candidates:
+        for index, item in enumerate(candidates):
             value = dict(item)
             content = value.get("content") or value.pop("change", None)
             value["content"] = content
@@ -50,6 +50,8 @@ class ConversationReviewCoordinator:
             if reference not in refs:
                 refs.append(reference)
             value["source_refs"] = refs
+            if review_id:
+                value["review_key"] = f"review:{review_id}:procedure:{index}"
             saved.append(self.procedure_proposals.create(value))
         return saved
 
@@ -115,10 +117,12 @@ class ConversationReviewCoordinator:
                 review_memory=review_memory,
                 review_skills=review_skills,
                 routed=True,
+                review_id=event_key,
             )
             result["procedure_proposals"] = self._save_procedures(
                 result.get("skill_candidates", []),
                 session_id,
+                event_key,
             )
         except Exception as exc:
             failed = self.state.fail(session_id, str(exc))
