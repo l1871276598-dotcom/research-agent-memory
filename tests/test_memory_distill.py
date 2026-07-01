@@ -121,7 +121,18 @@ class MemoryDistillReviewTests(unittest.TestCase):
         )
 
     def distill_reject(self, root, candidate_id, reason="not useful"):
-        return self.run_cli(DISTILL, "reject", "--root", root, "--id", candidate_id, "--reason", reason)
+        return self.run_cli(
+            DISTILL,
+            "reject",
+            "--root",
+            root,
+            "--state-dir",
+            root.parent / "state",
+            "--id",
+            candidate_id,
+            "--reason",
+            reason,
+        )
 
     def record_by_id(self, root, memory_id):
         for path in (root / "memory").rglob("*.md"):
@@ -253,7 +264,7 @@ class MemoryDistillReviewTests(unittest.TestCase):
             _, candidate = self.record_by_id(root, candidate_id)
             self.assertIn("confirmed content", target)
             self.assertNotIn("conflicting content", target)
-            self.assertIn('status: "conflict"', candidate)
+            self.assertIn('status: "conflicted"', candidate)
             self.assertIn('audit_status: "conflict"', candidate)
 
     def test_reject_records_reason(self):
@@ -268,6 +279,30 @@ class MemoryDistillReviewTests(unittest.TestCase):
             self.assertIn('status: "archived"', text)
             self.assertIn('audit_status: "rejected"', text)
             self.assertIn('review_reason: "weak evidence"', text)
+
+    def test_reject_reindexes_indexed_candidate_to_archived(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.init_root(tmp)
+            candidate_id = self.distill_apply(root)
+
+            indexed = self.run_cli(
+                MEMORY, "index", "--root", root, "--state-dir", root.parent / "state"
+            )
+            self.assertEqual(indexed.returncode, 0, indexed.stdout + indexed.stderr)
+            with closing(sqlite3.connect(root.parent / "state/memory.sqlite")) as conn:
+                self.assertEqual(
+                    conn.execute("SELECT status FROM memories WHERE id=?", (candidate_id,)).fetchone(),
+                    ("candidate",),
+                )
+
+            result = self.distill_reject(root, candidate_id, "weak evidence")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            with closing(sqlite3.connect(root.parent / "state/memory.sqlite")) as conn:
+                self.assertEqual(
+                    conn.execute("SELECT status FROM memories WHERE id=?", (candidate_id,)).fetchone(),
+                    ("archived",),
+                )
 
     def test_accept_blocks_changed_source_hash_and_missing_target(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -405,6 +440,28 @@ class MemoryDistillReviewTests(unittest.TestCase):
             self.assertEqual(after, before)
             entries = [json.loads(line) for line in (root / "state/distill_runs.jsonl").read_text(encoding="utf-8").splitlines()]
             self.assertEqual(entries[-1]["status"], "index_failed")
+
+    def test_conflict_review_index_failure_restores_candidate_and_appends_failure_journal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.init_root(tmp)
+            target_id = self.add_memory(root, content="confirmed content")
+            candidate_id = self.distill_apply(root, action="conflict", target_id=target_id, content="conflicting content")
+            before = {path.relative_to(root): path.read_bytes() for path in (root / "memory").rglob("*.md")}
+            module = load_distill_module()
+            from review.gate import ReviewGate
+
+            gate = ReviewGate(root, root.parent / "state", backend=module._review_backend())
+
+            with mock.patch.object(module, "index_store", side_effect=ValueError("injected index failure")):
+                with self.assertRaises(module.DistillError) as raised:
+                    gate.review("conflict", candidate_id)
+
+            self.assertEqual(raised.exception.feedback["code"], "index_failed")
+            after = {path.relative_to(root): path.read_bytes() for path in (root / "memory").rglob("*.md")}
+            self.assertEqual(after, before)
+            entries = [json.loads(line) for line in (root / "state/distill_runs.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(entries[-1]["status"], "index_failed")
+            self.assertEqual(entries[-1]["proposal_ids"], [candidate_id])
 
     def test_unrelated_change_allows_accept_and_regenerated_stale_proposal_succeeds(self):
         with tempfile.TemporaryDirectory() as tmp:

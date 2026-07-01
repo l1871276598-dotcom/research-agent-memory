@@ -8,6 +8,7 @@ import uuid
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from memory import (
     CONFIDENTIALITY_CHOICES,
@@ -29,6 +30,7 @@ from memory import (
     safe_slug,
     validate_record,
 )
+from memory import lifecycle
 
 
 CANONICAL_ACTIONS = {"ADD", "UPDATE", "DEPRECATE", "NOOP", "REVIEW_REQUIRED"}
@@ -150,6 +152,42 @@ def _merge_unique(left, right):
     return result
 
 
+def _same_partition(record, workspace, confidentiality):
+    return (
+        record.get("workspace") == workspace
+        and record.get("confidentiality") == confidentiality
+    )
+
+
+def _validate_partition_references(records, values):
+    get = values.get if isinstance(values, dict) else lambda name: getattr(values, name, None)
+    workspace = get("workspace")
+    confidentiality = get("confidentiality")
+    visible = [
+        item["record"]
+        for item in records.values()
+        if _same_partition(item["record"], workspace, confidentiality)
+    ]
+    project = get("project")
+    if get("type") != "project" and (get("scope") == "project" or project) and not any(
+        record.get("type") == "project"
+        and record.get("status") == "active"
+        and record.get("project") == project
+        for record in visible
+    ):
+        raise DistillError(
+            "invalid_transition", "project reference not found", False, "select_project"
+        )
+    context_id = get("context_id")
+    if get("type") not in {"context", "context_transition"} and context_id and not any(
+        record.get("type") == "context" and record.get("context_id") == context_id
+        for record in visible
+    ):
+        raise DistillError(
+            "invalid_transition", "context reference not found", False, "select_context"
+        )
+
+
 def _input_hash(args):
     fields = {
         name: getattr(args, name, None)
@@ -167,13 +205,18 @@ def _normalized_action(requested, records, args):
     action = ACTION_ALIASES.get(requested, requested)
     if action not in CANONICAL_ACTIONS:
         raise DistillError("invalid_schema", "invalid candidate action", False, "choose_valid_action")
-    for item in records.values():
+    partition = [
+        item
+        for item in records.values()
+        if _same_partition(item["record"], args.workspace, args.confidentiality)
+    ]
+    for item in partition:
         record = item["record"]
         if record.get("content") == args.content:
             return "NOOP", record["id"]
         if args.source_sha256 and record.get("source_sha256") == args.source_sha256:
             return "NOOP", record["id"]
-    if action == "ADD" and any(item["record"].get("title") == args.title for item in records.values()):
+    if action == "ADD" and any(item["record"].get("title") == args.title for item in partition):
         return "REVIEW_REQUIRED", None
     return action, None
 
@@ -193,19 +236,18 @@ def _validate_proposal(root, records, args, action):
             raise DistillError("raw_integrity_violation", "source hash changed", False, "review_raw_source")
     if args.scope == "project" and not args.project:
         raise DistillError("invalid_schema", "project scope requires project", True, "add_project")
-    active_projects = {
-        item["record"].get("project") for item in records.values()
-        if item["record"].get("type") == "project" and item["record"].get("status") == "active"
-    }
-    if args.scope == "project" and args.type != "project" and args.project not in active_projects:
-        raise DistillError("invalid_schema", "project does not reference an active project", True, "select_project")
+    _validate_partition_references(records, args)
     if args.confidentiality in {"internal", "restricted"} and args.workspace != "work":
         raise DistillError("permission_denied", "confidentiality internal or restricted requires workspace work", False, "use_work_workspace")
     if action in {"UPDATE", "DEPRECATE"} and not args.target_id:
         raise DistillError("invalid_transition", "target-id is required for this action", True, "select_target")
-    if args.target_id and args.target_id not in records:
+    target = records.get(args.target_id) if args.target_id else None
+    if args.target_id and (
+        target is None
+        or not _same_partition(target["record"], args.workspace, args.confidentiality)
+    ):
         raise DistillError("invalid_transition", "target memory not found", True, "select_target")
-    if action in {"UPDATE", "DEPRECATE"} and records[args.target_id]["record"].get("status") != "active":
+    if action in {"UPDATE", "DEPRECATE"} and target["record"].get("status") != "active":
         raise DistillError("invalid_transition", "only active memory may be replaced", False, "select_active_target")
 
 
@@ -386,6 +428,11 @@ def _require_candidate(records, candidate_id):
     return item
 
 
+def _candidate_record(root, candidate_id):
+    _, records = _records_by_id(root)
+    return dict(_require_candidate(records, candidate_id)["record"])
+
+
 def _check_source(root, record):
     source_path = record.get("source_path")
     source_sha256 = record.get("source_sha256")
@@ -410,7 +457,109 @@ def _reviewed(record, status, audit_status, reason=None):
     return reviewed
 
 
-def accept_candidate(args):
+def _require_review_authority(authority):
+    from review.gate import _REVIEW_AUTHORITY
+
+    if authority is not _REVIEW_AUTHORITY:
+        raise ValueError("review gate authority is required")
+
+
+def _validate_review_transitions(records, expected):
+    original = {item["path"]: item["record"].get("status") for item in records.values()}
+    for path, record in expected:
+        source = original.get(path, "candidate")
+        target = record.get("status")
+        if source != target:
+            lifecycle.validate_transition(source, target)
+
+
+def _validated_context_transition(candidate, target_item):
+    try:
+        new_record = json.loads(candidate["new_record_json"])
+        fields = (
+            "from_context",
+            "to_context",
+            "effective_date",
+            "reason",
+            "source",
+            "confidence",
+            "target_id",
+            "expected_target_sha256",
+            "proposal_input_hash",
+            "workspace",
+            "confidentiality",
+        )
+        if not isinstance(new_record, dict) or any(
+            not isinstance(candidate.get(field), str) or not candidate[field]
+            for field in fields
+        ):
+            raise ValueError
+        if target_item is None:
+            raise DistillError(
+                "stale_target", "target memory no longer exists", False, "regenerate_proposal"
+            )
+        target = target_item["record"]
+        destination = (candidate["workspace"], candidate["confidentiality"])
+        source = (target.get("workspace"), target.get("confidentiality"))
+        allowed = source == destination or (
+            source == ("personal", "personal")
+            and destination[0] == "work"
+            and destination[1] in {"internal", "restricted"}
+        )
+        if not allowed or any(
+            (
+                new_record.get("workspace") != candidate["workspace"],
+                new_record.get("confidentiality") != candidate["confidentiality"],
+                new_record.get("source") != candidate["source"],
+                new_record.get("confidence") != candidate["confidence"],
+                new_record.get("context_id") != candidate["to_context"],
+                new_record.get("supersedes") != [candidate["target_id"]],
+                target.get("context_id") != candidate["from_context"],
+                new_record.get("type") != "context",
+                new_record.get("status") != "active",
+                new_record.get("scope") != "context",
+                not isinstance(new_record.get("id"), str),
+                not isinstance(new_record.get("title"), str),
+            )
+        ):
+            raise ValueError
+        relative_path = (
+            f"{TYPE_DIRS['context']}/{new_record['id']}-{safe_slug(new_record['title'])}.md"
+        )
+        if validate_record(new_record, Path(relative_path), relative_path, "context"):
+            raise ValueError
+        proposal_input = {
+            "from_context": candidate["from_context"],
+            "to_context": candidate["to_context"],
+            "effective_date": candidate["effective_date"],
+            "reason": candidate["reason"],
+            "source": candidate["source"],
+            "confidence": candidate["confidence"],
+            "target_id": candidate["target_id"],
+            "target_sha256": candidate["expected_target_sha256"],
+            "new_record": new_record,
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                proposal_input, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        if digest != candidate["proposal_input_hash"]:
+            raise ValueError
+        return new_record
+    except DistillError:
+        raise
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise DistillError(
+            "invalid_transition",
+            "context transition proposal is invalid",
+            False,
+            "regenerate_proposal",
+        ) from exc
+
+
+def _accept_candidate_impl(args, authority=None):
+    _require_review_authority(authority)
     root, records = _records_by_id(args.root)
     candidate_item = _require_candidate(records, args.id)
     candidate = dict(candidate_item["record"])
@@ -426,6 +575,24 @@ def accept_candidate(args):
         uuid.uuid4().hex,
     )
     try:
+        new_context = None
+        if requested_action == "context_transition":
+            new_context = _validated_context_transition(candidate, target_item)
+        else:
+            _validate_partition_references(records, candidate)
+        if (
+            target_id
+            and requested_action != "context_transition"
+            and target_item is not None
+            and not _same_partition(
+                target_item["record"],
+                candidate.get("workspace"),
+                candidate.get("confidentiality"),
+            )
+        ):
+            raise DistillError(
+                "invalid_transition", "target memory not found", False, "select_target"
+            )
         _check_source(root, candidate)
         if action in {"UPDATE", "DEPRECATE"}:
             if target_item is None:
@@ -440,7 +607,7 @@ def accept_candidate(args):
         expected = []
         if requested_action == "context_transition":
             try:
-                new_record = json.loads(candidate["new_record_json"])
+                new_record = new_context
                 new_path = root / TYPE_DIRS[new_record["type"]] / f"{new_record['id']}-{safe_slug(new_record['title'])}.md"
                 valid_until = (date.fromisoformat(candidate["effective_date"]) - timedelta(days=1)).isoformat()
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -507,7 +674,7 @@ def accept_candidate(args):
             )
             expected.extend([(target_item["path"], target), (candidate_item["path"], final)])
         elif action == "REVIEW_REQUIRED":
-            final = _reviewed(candidate, "conflict", "conflict")
+            final = _reviewed(candidate, "conflicted", "conflict")
             operations.append((candidate_item["path"], render_existing_memory(candidate_item["path"], final)))
             expected.append((candidate_item["path"], final))
         else:
@@ -515,6 +682,7 @@ def accept_candidate(args):
             operations.append((candidate_item["path"], render_existing_memory(candidate_item["path"], final)))
             expected.append((candidate_item["path"], final))
 
+        _validate_review_transitions(records, expected)
         replacements = {path: record for path, record in expected}
         hypothetical = [
             {**item, "record": replacements.get(item["path"], item["record"])}
@@ -549,12 +717,122 @@ def accept_candidate(args):
     return {"candidate_id": candidate["id"], "action": action, "run_id": run_id, "status": "completed"}
 
 
-def reject_candidate(args):
+def _conflict_candidate_impl(args, authority=None):
+    _require_review_authority(authority)
     root, records = _records_by_id(args.root)
     candidate_item = _require_candidate(records, args.id)
-    final = _reviewed(candidate_item["record"], "archived", "rejected", args.reason)
-    _replace_transaction([(candidate_item["path"], render_existing_memory(candidate_item["path"], final))], [])
+    candidate = dict(candidate_item["record"])
+    _validate_partition_references(records, candidate)
+    target_id = candidate.get("target_id")
+    target_item = records.get(target_id) if target_id else None
+    if target_id and (
+        target_item is None
+        or not _same_partition(
+            target_item["record"],
+            candidate.get("workspace"),
+            candidate.get("confidentiality"),
+        )
+    ):
+        raise DistillError(
+            "invalid_transition", "target memory not found", False, "select_target"
+        )
+    run_id = next(
+        (
+            entry["run_id"] for entry in reversed(_journal_entries(root))
+            if candidate["id"] in entry.get("proposal_ids", [])
+        ),
+        uuid.uuid4().hex,
+    )
+    final = _reviewed(candidate, "conflicted", "conflict")
+    expected = [(candidate_item["path"], final)]
+    _validate_review_transitions(records, expected)
+    try:
+        _apply_files_and_index(
+            root,
+            args.state_dir,
+            [(candidate_item["path"], render_existing_memory(candidate_item["path"], final))],
+            expected,
+        )
+    except DistillError as exc:
+        _append_journal(
+            root, run_id=run_id, status=exc.feedback["code"], iteration=1, max_iterations=2,
+            input_hash=hashlib.sha256(candidate["id"].encode()).hexdigest(),
+            proposal_ids=[candidate["id"]], errors=[exc.feedback], stop_reason=exc.feedback["code"],
+            next_action=exc.feedback["next_action"],
+            resume_command=f"memory_distill.py resume --root {root} --run-id {run_id}",
+        )
+        raise
+    _append_journal(
+        root, run_id=run_id, status="completed", iteration=1, max_iterations=2,
+        input_hash=hashlib.sha256(candidate["id"].encode()).hexdigest(),
+        proposal_ids=[candidate["id"]], stop_reason="completed", next_action=None,
+        resume_command=f"memory_distill.py resume --root {root} --run-id {run_id}",
+    )
+    return {"candidate_id": candidate["id"], "action": "conflict", "run_id": run_id, "status": final["status"]}
+
+
+def _reject_candidate_impl(args, authority=None):
+    _require_review_authority(authority)
+    root, records = _records_by_id(args.root)
+    candidate_item = _require_candidate(records, args.id)
+    reason = getattr(args, "reason", None) or "rejected by reviewer"
+    final = _reviewed(candidate_item["record"], "archived", "rejected", reason)
+    _validate_review_transitions(records, [(candidate_item["path"], final)])
+    operations = [(candidate_item["path"], render_existing_memory(candidate_item["path"], final))]
+    if getattr(args, "state_dir", None):
+        _apply_files_and_index(root, args.state_dir, operations, [(candidate_item["path"], final)])
+    else:
+        _replace_transaction(operations, [])
     return {"candidate_id": args.id, "status": "archived", "audit_status": "rejected"}
+
+
+def _review_backend():
+    return SimpleNamespace(
+        _accept_candidate_impl=_accept_candidate_impl,
+        _candidate_record=_candidate_record,
+        _conflict_candidate_impl=_conflict_candidate_impl,
+        _reject_candidate_impl=_reject_candidate_impl,
+    )
+
+
+def _review_agent(root, state_dir=None):
+    from agents.orchestrator import ReviewAgent
+    from review.gate import ReviewGate
+
+    return ReviewAgent(ReviewGate(root, state_dir, backend=_review_backend()))
+
+
+def accept_candidate(args):
+    candidate = _candidate_record(args.root, args.id)
+    requested = candidate.get("requested_action")
+    if requested in {"merge", "support"}:
+        action = "merge"
+    elif requested in {"conflict", "REVIEW_REQUIRED"} or candidate.get(
+        "candidate_action"
+    ) == "REVIEW_REQUIRED":
+        action = "conflict"
+    else:
+        action = "accept"
+    result = _review_agent(args.root, args.state_dir).run(
+        {"type": "memory.review", "input": {"action": action, "candidate_id": args.id}},
+        {},
+    )
+    return result["output"]
+
+
+def reject_candidate(args):
+    result = _review_agent(args.root, getattr(args, "state_dir", None)).run(
+        {
+            "type": "memory.review",
+            "input": {
+                "action": "reject",
+                "candidate_id": args.id,
+                "reason": args.reason,
+            },
+        },
+        {},
+    )
+    return result["output"]
 
 
 def review_candidates(args):
@@ -615,6 +893,7 @@ def build_parser():
 
     reject_parser = subparsers.add_parser("reject", help="Reject a candidate memory.")
     reject_parser.add_argument("--root", required=True)
+    reject_parser.add_argument("--state-dir", default=str(default_state_dir()))
     reject_parser.add_argument("--id", required=True)
     reject_parser.add_argument("--reason", required=True)
 

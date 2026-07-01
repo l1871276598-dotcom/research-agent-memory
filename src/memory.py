@@ -59,6 +59,7 @@ STATUS_CHOICES = [
     "historical",
     "deprecated",
     "candidate",
+    "conflicted",
     "conflict",
     "archived",
 ]
@@ -78,6 +79,7 @@ WORKSPACE_CHOICES = ["personal", "work"]
 CONFIDENTIALITY_CHOICES = ["public", "personal", "internal", "restricted"]
 CONFIDENCE_CHOICES = ["confirmed", "inferred", "uncertain"]
 TEXT_DOCUMENT_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".json", ".html", ".htm", ".rtf"}
+CONFLICT_STATUS_CHOICES = {"conflict", "conflicted"}
 
 TYPE_DIRS = {
     "profile": "memory/profile",
@@ -2805,7 +2807,7 @@ def project_status(args):
     project_records = [item for item in records if item["record"].get("type") == "project" and item["record"].get("project") == args.project and item["record"].get("status") == "active"]
     project_memories = [item for item in records if item["record"].get("project") == args.project]
     candidates = [item for item in project_memories if item["record"].get("status") == "candidate"]
-    conflicts = [item for item in project_memories if item["record"].get("status") == "conflict"]
+    conflicts = [item for item in project_memories if item["record"].get("status") in CONFLICT_STATUS_CHOICES]
     expired = [item for item in project_memories if temporal_status(item["record"], as_of) == "expired"]
     known_ids = {item["record"]["id"] for item in records}
     unresolved = 0
@@ -2878,7 +2880,7 @@ def _visible_memory(record, project, workspace, as_of, include_conflict=False):
     if record.get("confidentiality") not in {"public", "personal"}:
         return False
     if include_conflict:
-        if record.get("status") != "conflict":
+        if record.get("status") not in CONFLICT_STATUS_CHOICES:
             return False
     elif record.get("status") != "active":
         return False

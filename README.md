@@ -129,7 +129,7 @@ raw evidence
 
 ## 当前版本状态
 
-- 当前软件版本：v0.7.0 Memory Core
+- 当前软件版本：v0.8.0
 - SQLite schema：v3
 - 默认检索模式：lexical
 - 主要支持平台：macOS
@@ -161,12 +161,15 @@ raw evidence
 - 可插拔 Agent 目录结构
 - 自动更新 Loop：watch/import → detect → candidate → quality gate → review → apply → reindex → refresh context pack
 - 新导入对话自动批量生成候选记忆
+- ChatGPT 附件导入
+- PDF/DOCX 深度结构化解析
 - Link Understanding Agent / Hermes provider
 - Rule Agent
 - Reflection Agent
 - Evolution Agent
 - Code / Codex Bridge Agent
 - owner/agent 身份认证与多 Agent 授权
+- 内置文献管理、文献矩阵自动填充和 Zotero / EndNote 同步已移出路线；后续如有需要，仅通过外部接口或 Adapter 集成
 - 真实本地向量 embedding
 - 真实语义相似度检索
 - 真实 lexical + semantic 混合排序
@@ -225,7 +228,7 @@ ResearchAgent/
 └── backups/
 ```
 
-说明：`literature/` 是历史残留目录，后续不再作为内置文献系统主线。未来应迁移为 External Adapter 输出目录或在下一版本中移除/降级。
+`literature/` 是旧版本兼容和历史残留目录，不再作为内置文献系统主线。未来应迁移为 External Adapter 输出目录，并可在后续版本中进一步移除或降级。
 
 本地 state 目录至少包含：
 
@@ -239,7 +242,7 @@ SQLite、WAL、SHM、锁、缓存和日志都属于可重建的本地派生状�
 ## 快速开始
 
 ```bash
-REPO_ROOT="/Users/user/projects/research-agent-memory"
+REPO_ROOT="/path/to/laos-v0.8"
 DATA_ROOT="$HOME/Library/Mobile Documents/com~apple~CloudDocs/ResearchAgent"
 STATE_DIR="$HOME/Library/Application Support/ResearchAgent"
 cd "$REPO_ROOT"
@@ -275,6 +278,34 @@ python3 src/memory.py index --root "$DATA_ROOT" --state-dir "$STATE_DIR"
 python3 src/memory.py search "代码最少" --root "$DATA_ROOT" --state-dir "$STATE_DIR"
 python3 src/memory.py doctor --root "$DATA_ROOT" --state-dir "$STATE_DIR"
 ```
+
+## LAOS JSON CLI
+
+创建记忆只会生成 `candidate`：
+
+```bash
+python3 src/laos.py --root "$DATA_ROOT" --state-dir "$STATE_DIR" \
+  --task-json '{"type":"memory.create","input":{"type":"principle","title":"最少代码","scope":"global","workspace":"personal","confidentiality":"personal","source":"manual:user_confirmed","confidence":"confirmed","content":"使用尽可能少的代码。"}}'
+```
+
+使用上一步输出的候选 ID 显式审核：
+
+```bash
+python3 src/laos.py --root "$DATA_ROOT" --state-dir "$STATE_DIR" \
+  --task-json '{"type":"memory.review","workspace":"personal","input":{"action":"accept","candidate_id":"CANDIDATE_ID"}}'
+```
+
+```bash
+python3 src/laos.py --root "$DATA_ROOT" --state-dir "$STATE_DIR" \
+  --task-json '{"type":"memory.search","input":{"query":"最少代码","workspace":"personal"}}'
+```
+
+```bash
+python3 src/laos.py --root "$DATA_ROOT" --state-dir "$STATE_DIR" \
+  --task-json '{"type":"context.build","input":{"query":"最少代码","workspace":"personal"}}'
+```
+
+LAOS 不会自动 accept；只有显式通过 Review Gate 的审核才能将候选记忆变为 `active`。`restricted` 记忆永远不会进入 LAOS context。 LAOS 审核省略 workspace 时默认限定为 `personal`；审核 work candidate 必须显式提交 `workspace: work`，workspace 不一致时审核失败。
 
 ## 添加结构化记忆
 
@@ -346,8 +377,8 @@ python3 src/memory.py search "RMRE" \
 - `imports/chatgpt/conversations/`
 - `imports/manual/text/`
 - `imports/manual/raw/`，仅当没有对应 text sidecar 且 raw 是 UTF-8 可读文本
-- `literature/notes/`，历史残留，后续应迁移为 external adapter 输出
-- `literature/journals/`，历史残留，后续应迁移为 external adapter 输出
+- `literature/notes/`，仅保留旧版本兼容，后续迁移为 external adapter 输出
+- `literature/journals/`，仅保留旧版本兼容，后续迁移为 external adapter 输出
 - `manuscripts/current/`
 - `manuscripts/evidence/`
 - `manuscripts/archive/`
@@ -434,10 +465,43 @@ python3 src/memory_agent.py finalize \
   --root "$DATA_ROOT" \
   --state-dir "$STATE_DIR" \
   --task "整理 PDC 项目的证据链" \
-  --result-file completed-result.txt
+  --result-file completed-result.txt \
+  --max-task-chars 20000 \
+  --max-result-chars 60000 \
+  --max-candidate-chars 80000
 ```
 
-`finalize` 成功输出包含 `operation: "finalize"`、真实 `candidate_count`、真实候选 `artifacts`、`review_required: true`、`applied: false` 和 `warnings`。第一版只进入现有候选审核队列，候选必须人工审核，绝不自动应用到权威记忆。
+短结果可改用 `--result "..."`；`--result` 与 UTF-8 `--result-file` 互斥。默认 task、result 和候选正文上限分别为 20,000、60,000 和 80,000 个 Python 字符，三个选项都必须是正整数。超限不会静默截断，也不会创建候选或 Loop 文件，而是以 `task_too_large`、`result_too_large`、`candidate_too_large` 或 `invalid_max_chars` 稳定错误码退出。成功输出包含 `operation: "finalize"`、真实 `candidate_count`、真实候选 `artifacts`、`review_required: true`、`applied: false` 和 `warnings`；候选仍必须人工审核。
+
+可选的轻量 Loop Engineering 只记录外部调用者已经执行完的 pass/fail 结果，不执行 shell 命令：
+
+```bash
+python3 src/memory_agent.py finalize \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --task "验证迁移" \
+  --result "迁移失败" \
+  --outcome fail \
+  --error "目标版本不匹配" \
+  --reflection "版本预检查缺失" \
+  --policy-suggestion "迁移前验证目标状态"
+```
+
+提供 `--outcome pass|fail` 后，会在本地 `<state-dir>/loop_engineering/runs/<run_id>/` 生成 `run.json`、`reflection.md` 和 `policy_suggestions.md`。三文件先写入同一文件系统内的临时目录，再以目录 rename 发布；候选创建失败会删除本次运行目录。审批同时修改数据根和本地 state 时使用现有事务回滚与一致性约束，不宣称跨文件系统具备单次 rename 级原子性。省略 `--outcome` 时保持原有 `finalize` 行为和 JSON 输出。
+
+人工审核者只需把认可的策略复选框改为 `[x]` 或 `[X]`，再显式确认：
+
+```bash
+python3 src/memory_agent.py approve-policies \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --run-id "$RUN_ID" \
+  --confirmed
+```
+
+只有已勾选且内容哈希有效的策略会按哈希去重后写入 `<root>/memory_rules.md`，并与对应 `run.json` 状态通过现有事务机制同步更新。`memory_rules.md` 只是可审计的已批准规则注册表，不会自动改变提示词、代码、active memory 或 Agent 行为。本阶段不包含 Meta Planner、自动重试、自动策略应用或自动接受 session candidate。
+
+预期错误同样返回单个 JSON 对象，包含稳定的 `error.code` 和安全的 `error.message`，并以非零状态退出。Windows、macOS 和 Linux 使用相同命令；省略 `--state-dir` 时继续使用 `platform_paths.py` 的平台本地状态目录，SQLite 不写入同步数据目录。
 
 ## 候选审核
 
@@ -479,7 +543,8 @@ python3 src/memory_distill.py reject \
 
 记忆文件状态与审核状态分离：
 
-- 记忆 `status`：`candidate`、`active`、`conflict`、`historical`、`archived`、`deprecated`
+- LAOS v0.8 规范状态：`raw`、`candidate`、`active`、`deprecated`、`conflicted`、`archived`
+- 旧版状态 `conflict` 和 `historical` 仅为兼容读取，不作为新的 LAOS 状态写入
 - 审核 `audit_status`：`prepared`、`awaiting_review`、`accepted`、`rejected`、`conflict`、`pending_delete`、`deleted`、`stale`、`failed`
 
 行为边界：
@@ -488,14 +553,14 @@ python3 src/memory_distill.py reject \
 - `merge`：目标必须存在；只合并 `source_refs`、`tags`、`relations`；候选归档为 `audit_status: accepted`
 - `support`：不改目标核心 `content`；只增加来源和证据；候选归档为 `audit_status: accepted`
 - `supersede`：accept 后新记录 active；旧记录 deprecated；维护双向 supersession 关系
-- `conflict`：不覆盖正式记忆；候选变为 `status: conflict`、`audit_status: conflict`
+- `conflict`：不覆盖正式记忆；新候选变为 `status: conflicted`、`audit_status: conflict`
 - `reject`：候选归档为 `status: archived`、`audit_status: rejected`，保存 `review_reason`
 
 如果候选记录带有 `source_path` 和 `source_sha256`，accept 前会重新校验 source hash。UPDATE/DEPRECATE proposal 同时保存目标 ID、预期状态和预期文件 SHA256；accept 会基于当前 store 重新校验并运行完整 hypothetical validation，变化时返回结构化 `stale_target`，不会修改文件或索引。
 
 ## 记忆生命周期
 
-当前 v0.7.0 支持的真实生命周期：
+当前 v0.8.0 开发分支支持的真实生命周期：
 
 ```text
 ChatGPT ZIP / manual import
@@ -505,7 +570,7 @@ ChatGPT ZIP / manual import
 → 人工或自动流程调用 apply 生成 candidate
 → review
 → accept / reject
-→ active / archived / conflict / historical
+→ active / archived / conflicted
 ```
 
 raw 原始证据不会被 `index`、`db-rebuild`、`accept` 或 `reject` 删除。当前没有 recent purge 命令、删除宽限期命令或自动 recent 生命周期管理。
@@ -620,22 +685,9 @@ git diff --check
 
 尚未推送分支或运行远程 workflow 时，不应声称远程 CI 已通过。
 
-## 建议版本路线
+## 不属于 v0.8.0
 
-```text
-v0.8：LAOS 文档与边界修正，去文献系统主线残留
-v0.9：Agent Registry + Orchestrator 最小骨架
-v1.0：把现有能力包装为 Import / Memory / Review / Search / Context Agent
-v1.1：Auto Update Loop 与低风险自动候选生成
-v1.2：Link Understanding Agent 与 Hermes provider
-v1.3：Rule / Reflection Agent
-v1.4：Evolution Agent
-v1.5：Controlled Agent Access / MCP / Codex Bridge
-```
-
-## 不属于 v0.7.0
-
-iCloud 多端同步、设备注册、设备状态、移动端写入、自动索引刷新、实时同步、自动 ZIP 下载、ChatGPT 自动登录、Web 服务、GUI、桌面 App、云数据库、独立向量数据库和常驻后台监听服务不属于 v0.7.0，本次未实现。
+iCloud 多端同步、设备注册、设备状态、移动端写入、自动索引刷新、实时同步、自动 ZIP 下载、ChatGPT 自动登录、Web 服务、GUI、桌面 App、云数据库、独立向量数据库、常驻后台监听服务和内置文献系统扩展不属于 v0.8.0，本次未实现。文献能力后续仅考虑外部接口集成。
 
 ## 许可证
 
