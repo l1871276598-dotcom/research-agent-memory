@@ -15,6 +15,9 @@ from src.sessions import SessionStore
 from src.tool_facade import LaosToolFacade
 
 
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
 def _json(path):
     if path is None:
         return None
@@ -24,11 +27,27 @@ def _json(path):
     return value
 
 
+def _mcp_path(value):
+    if not isinstance(value, str) or not value.startswith("/"):
+        raise argparse.ArgumentTypeError("MCP path must start with /")
+    if value != "/" and value.endswith("/"):
+        value = value.rstrip("/")
+    return value
+
+
 def _parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--model-config")
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "streamable-http"),
+        default="stdio",
+    )
+    parser.add_argument("--host", choices=tuple(sorted(LOOPBACK_HOSTS)), default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--mcp-path", type=_mcp_path, default="/mcp")
     parser.add_argument("--enable-checkpoint-capture", action="store_true")
     parser.add_argument("--checkpoint-account-id", default="default")
     parser.add_argument("--checkpoint-workspace", choices=("personal", "work"))
@@ -42,6 +61,22 @@ def _parser():
     parser.add_argument("--memory-interval", type=int, default=10)
     parser.add_argument("--skill-interval", type=int, default=10)
     return parser
+
+
+def _server_options(args):
+    if args.transport == "stdio":
+        return None
+    if args.host not in LOOPBACK_HOSTS:
+        raise ValueError("Streamable HTTP must bind to a loopback host")
+    if isinstance(args.port, bool) or not 1 <= args.port <= 65535:
+        raise ValueError("port must be between 1 and 65535")
+    return {
+        "host": args.host,
+        "port": args.port,
+        "streamable_http_path": args.mcp_path,
+        "json_response": True,
+        "stateless_http": True,
+    }
 
 
 def build_facade(args):
@@ -91,9 +126,16 @@ def build_facade(args):
     )
 
 
+def build_host(args):
+    return build_protocol_host(
+        build_facade(args),
+        server_options=_server_options(args),
+    )
+
+
 def main(argv=None):
     args = _parser().parse_args(argv)
-    build_protocol_host(build_facade(args)).run()
+    build_host(args).run(transport=args.transport)
     return 0
 
 
