@@ -46,16 +46,18 @@ class AgentRuntime:
                 blocks.append(recall)
         if blocks:
             messages.append({"role": "system", "content": "\n\n".join(blocks)})
-        if self.sessions is not None:
-            try:
-                history = self.sessions.get(session_id)["messages"]
-            except ValueError:
-                history = []
-            messages.extend(
-                {"role": item["role"], "content": item["content"]}
-                for item in history
-            )
-        messages.append({"role": "user", "content": user_message})
+        if self.sessions is None:
+            messages.append({"role": "user", "content": user_message})
+            return messages
+        history = self.sessions.get(session_id)["messages"]
+        messages.extend(
+            {
+                "role": item["role"],
+                "content": item["content"],
+                **item.get("metadata", {}),
+            }
+            for item in history
+        )
         return messages
 
     @staticmethod
@@ -116,13 +118,12 @@ class AgentRuntime:
                     "iterations": iteration,
                 }
 
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": content,
-                    "tool_calls": calls,
-                }
-            )
+            assistant_message = {
+                "role": "assistant",
+                "content": content,
+                "tool_calls": calls,
+            }
+            messages.append(assistant_message)
             if self.sessions is not None:
                 self.sessions.append(
                     session_id,
@@ -141,13 +142,12 @@ class AgentRuntime:
                     arguments = json.loads(arguments)
                 result = self.tools.execute(name, arguments)
                 text = json.dumps(result, ensure_ascii=False, default=str)
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.get("id", ""),
-                        "content": text,
-                    }
-                )
+                tool_message = {
+                    "role": "tool",
+                    "tool_call_id": call.get("id", ""),
+                    "content": text,
+                }
+                messages.append(tool_message)
                 if self.sessions is not None:
                     self.sessions.append(
                         session_id,
