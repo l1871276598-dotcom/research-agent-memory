@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "upstream": "NousResearch/hermes-agent",
+  "branch": "main",
+  "last_reviewed_commit": "01bf61c865c31d47be6cd4cfcc3ecef1a28aba0b",
+  "policy": {
+    "vendor_full_repository": false,
+    "run_external_hermes": false,
+    "copy_only_needed_code": true,
+    "preserve_license_notice": true,
+    "manual_review_before_port": true,
+    "excluded_feature_numbers": [2, 12, 21]
+  },
+  "components": [
+    {
+      "number": 1,
+      "id": "agent_runtime",
+      "status": "planned",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["run_agent.py", "agent/agent_init.py", "agent/agent_runtime_helpers.py"],
+      "laos_paths": ["src/runtime/agent.py", "src/orchestrator/"],
+      "notes": "Reuse the loop and lifecycle helpers, but LAOS remains the only runtime entry point."
+    },
+    {
+      "number": 3,
+      "id": "codex_runtime",
+      "status": "planned",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["agent/codex_runtime.py", "agent/codex_responses_adapter.py", "agent/transports/codex_app_server.py", "agent/transports/codex_app_server_session.py", "agent/transports/codex_event_projector.py"],
+      "laos_paths": ["src/runtime/codex/"],
+      "notes": "Keep only ChatGPT/Codex OAuth execution needed by LAOS; do not port the general provider-management surface."
+    },
+    {
+      "number": 4,
+      "id": "tool_system",
+      "status": "planned",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["tools/registry.py", "toolsets.py", "model_tools.py"],
+      "laos_paths": ["src/tools/"],
+      "notes": "Port registry and dispatch contracts before individual tools."
+    },
+    {
+      "number": 5,
+      "id": "long_term_memory",
+      "status": "partial",
+      "port_mode": "selective_copy",
+      "upstream_paths": ["agent/memory_manager.py", "agent/memory_provider.py"],
+      "laos_paths": ["src/memory/", "src/review/"],
+      "notes": "LAOS MemoryCore, CandidateStore and ReviewGate stay authoritative; only provider lifecycle and fencing helpers are candidates for reuse."
+    },
+    {
+      "number": 6,
+      "id": "automatic_memory_extraction",
+      "status": "next",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["agent/background_review.py"],
+      "laos_paths": ["src/reflection/conversation_review.py"],
+      "notes": "Port review prompts, routed digest, trigger counters and restricted-tool execution; output must be LAOS candidates, never direct active memory."
+    },
+    {
+      "number": 7,
+      "id": "skill_system",
+      "status": "planned",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["tools/skill_manager_tool.py", "agent/skill_commands.py"],
+      "laos_paths": ["src/skills/store.py", "src/skills/manager.py"],
+      "notes": "Use class-level skills and support-file layout while storing LAOS provenance and review metadata."
+    },
+    {
+      "number": 8,
+      "id": "skill_auto_update",
+      "status": "planned",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["agent/background_review.py", "tools/skill_manager_tool.py"],
+      "laos_paths": ["src/skills/review.py"],
+      "notes": "Reuse skill-review signals and patch actions; persistent changes require LAOS review."
+    },
+    {
+      "number": 9,
+      "id": "curator",
+      "status": "planned",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["agent/curator.py"],
+      "laos_paths": ["src/skills/curator.py"],
+      "notes": "Reuse classification, stale/archive and consolidation planning; default to report-only and reversible actions."
+    },
+    {
+      "number": 10,
+      "id": "context_management",
+      "status": "partial",
+      "port_mode": "selective_copy",
+      "upstream_paths": ["agent/context_compressor.py", "agent/memory_manager.py"],
+      "laos_paths": ["src/context/"],
+      "notes": "LAOS ContextBuilder already exists; port compression and context-fencing utilities only where they improve it."
+    },
+    {
+      "number": 11,
+      "id": "sessions",
+      "status": "planned",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["hermes_state.py", "hermes_cli/active_sessions.py"],
+      "laos_paths": ["src/sessions/"],
+      "notes": "Adopt useful SQLite/session-search patterns without creating a second authority beside LAOS."
+    },
+    {
+      "number": 13,
+      "id": "subagents_and_kanban",
+      "status": "planned_optional",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["tools/delegate_task.py", "hermes_cli/kanban_db.py"],
+      "laos_paths": ["src/agents/delegation.py", "src/agents/kanban.py"],
+      "notes": "Port after the single-agent runtime, permissions and context isolation are stable."
+    },
+    {
+      "number": 14,
+      "id": "message_gateways",
+      "status": "planned_optional",
+      "port_mode": "selective_copy",
+      "upstream_paths": ["gateway/"],
+      "laos_paths": ["src/gateway/"],
+      "notes": "Port common routing contract first; individual platform adapters remain optional."
+    },
+    {
+      "number": 15,
+      "id": "execution_environments",
+      "status": "planned_optional",
+      "port_mode": "selective_copy",
+      "upstream_paths": ["tools/environments/"],
+      "laos_paths": ["src/execution/"],
+      "notes": "Local execution first, then Docker and SSH; cloud-specific backends are optional."
+    },
+    {
+      "number": 16,
+      "id": "mcp",
+      "status": "planned",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["mcp_serve.py", "tools/mcp_client.py", "tools/mcp_oauth.py"],
+      "laos_paths": ["src/mcp/"],
+      "notes": "Expose existing LAOS tasks through MCP rather than duplicating MemoryCore logic."
+    },
+    {
+      "number": 17,
+      "id": "plugins",
+      "status": "planned",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["hermes_cli/plugins.py", "plugins/"],
+      "laos_paths": ["src/plugins/"],
+      "notes": "Port the plugin contract and loader, not bundled plugins indiscriminately."
+    },
+    {
+      "number": 18,
+      "id": "security",
+      "status": "planned_high_priority",
+      "port_mode": "selective_copy",
+      "upstream_paths": ["tools/approval.py", "agent/tool_guardrails.py", "agent/memory_manager.py"],
+      "laos_paths": ["src/security/"],
+      "notes": "Prioritize command approval, tool guardrails, context fencing, token-path denylisting and restricted-memory tests."
+    },
+    {
+      "number": 19,
+      "id": "profiles",
+      "status": "planned",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["hermes_constants.py", "scripts/profile-tui.py"],
+      "laos_paths": ["src/profiles/"],
+      "notes": "Map profiles to LAOS workspace/project/confidentiality instead of preserving Hermes home semantics."
+    },
+    {
+      "number": 20,
+      "id": "deployment_and_updates",
+      "status": "in_progress",
+      "port_mode": "reference_and_adapt",
+      "upstream_paths": ["hermes_cli/doctor.py", "hermes_cli/update.py", "scripts/install.sh"],
+      "laos_paths": ["src/doctor/", "tools/check_hermes_updates.py"],
+      "notes": "Hermes updates are observed and classified; LAOS never auto-copies or auto-applies upstream changes."
+    }
+  ]
+}
