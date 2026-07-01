@@ -16,6 +16,7 @@ def main(argv=None):
     parser.add_argument("--profile", default="personal")
     parser.add_argument("--workspace", choices=("personal", "work"), default="personal")
     parser.add_argument("--project")
+    parser.add_argument("--model-backend", default="codex")
     parser.add_argument(
         "--confidentiality",
         choices=("public", "personal", "internal", "restricted"),
@@ -39,13 +40,18 @@ def main(argv=None):
             confidentiality=args.confidentiality,
         )
 
-    health = HealthCheck(data_root, state_dir).run()
+    health = HealthCheck(
+        data_root,
+        state_dir,
+        model_backend=args.model_backend,
+    ).run()
     print(
         json.dumps(
             {
                 "data_root": str(data_root),
                 "state_dir": str(state_dir),
                 "profile": profile,
+                "model_backend": args.model_backend,
                 "health": health,
             },
             ensure_ascii=False,
