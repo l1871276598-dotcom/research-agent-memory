@@ -104,25 +104,32 @@ class SessionProjector:
             raise ValueError("bridge session scope changed")
         return session_id
 
+    def _already_projected(self, session_id, event_id):
+        history = self.sessions.get(session_id)["messages"]
+        return any(
+            item.get("metadata", {}).get("bridge_event_id") == event_id
+            for item in history
+        )
+
     @staticmethod
     def _review_messages(messages):
-        return [
-            {
-                "role": item["role"],
-                "content": item["content"],
-                **{
-                    key: item.get("metadata", {}).get(key)
-                    for key in ("tool_calls", "tool_call_id")
-                    if key in item.get("metadata", {})
-                },
-            }
-            for item in messages
-        ]
+        output = []
+        for item in messages:
+            metadata = item.get("metadata", {})
+            message = {"role": item["role"], "content": item["content"]}
+            if isinstance(metadata, dict):
+                for key in ("tool_calls", "tool_call_id"):
+                    if key in metadata:
+                        message[key] = metadata[key]
+            output.append(message)
+        return output
 
     def _review(self, session_id, scope, *, force=False, tool_iterations=0):
         if self.coordinator is None:
             return None
         history = self.sessions.get(session_id)["messages"]
+        if not history:
+            return {"status": "skipped", "reason": "empty_conversation"}
         return self.coordinator.record_turn(
             session_id=session_id,
             messages=self._review_messages(history),
@@ -139,23 +146,25 @@ class SessionProjector:
         session_id = self._ensure_session(event, scope)
         review = None
         if event["event_type"] == "message":
-            metadata = {
-                "bridge_event_id": event["event_id"],
-                "bridge_message_id": event["message_id"],
-                "bridge_parent_message_id": event["parent_message_id"],
-                "bridge_branch_id": event["branch_id"],
-                "bridge_version": event["version"],
-                "bridge_source": event["source"],
-                "bridge_generated": event["role"] == "assistant",
-                **event["metadata"],
-            }
-            self.sessions.append(
-                session_id,
-                event["role"],
-                event["content"],
-                metadata,
-            )
-            if event["role"] == "assistant":
+            already_projected = self._already_projected(session_id, event["event_id"])
+            if not already_projected:
+                metadata = {
+                    "bridge_event_id": event["event_id"],
+                    "bridge_message_id": event["message_id"],
+                    "bridge_parent_message_id": event["parent_message_id"],
+                    "bridge_branch_id": event["branch_id"],
+                    "bridge_version": event["version"],
+                    "bridge_source": event["source"],
+                    "bridge_generated": event["role"] == "assistant",
+                    **event["metadata"],
+                }
+                self.sessions.append(
+                    session_id,
+                    event["role"],
+                    event["content"],
+                    metadata,
+                )
+            if event["role"] == "assistant" and not already_projected:
                 tool_iterations = event["metadata"].get("tool_iterations", 0)
                 if isinstance(tool_iterations, bool) or not isinstance(tool_iterations, int):
                     tool_iterations = 0
@@ -198,4 +207,6 @@ class SessionProjector:
             if result is None:
                 break
             results.append(result)
+            if result.get("status") == "queued":
+                break
         return results
