@@ -3,6 +3,8 @@ from __future__ import annotations
 import hmac
 import json
 
+from .recovery import recover_processing
+
 
 class BridgeIngestService:
     """Validate authenticated bridge payloads before durable ingestion."""
@@ -49,6 +51,8 @@ class BridgeIngestService:
             event = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError("bridge payload must be valid UTF-8 JSON") from exc
+        if not isinstance(event, dict):
+            raise ValueError("bridge payload must contain one event object")
         if self.allowed_sources is not None:
             source = str(event.get("source", "")).strip().lower()
             if source not in self.allowed_sources:
@@ -76,3 +80,8 @@ class BridgePipeline:
         accepted = self.service.ingest_json(payload, token=token)
         projected = self.projector.drain(limit) if process else []
         return {"accepted": accepted, "projected": projected}
+
+    def recover(self, *, drain=True, limit=100):
+        count = recover_processing(self.service.inbox)
+        projected = self.projector.drain(limit) if drain else []
+        return {"requeued": count, "projected": projected}
