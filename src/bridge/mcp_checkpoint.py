@@ -136,6 +136,8 @@ class McpCheckpointCapture:
         metadata = {
             "capture_mode": "explicit_mcp_checkpoint",
             "caller_submitted": True,
+            "checkpoint_id": checkpoint_id,
+            "session_alias": session_alias,
             "assistant_response_complete": True,
             "conversation_summary": conversation_summary,
             "source_ids": {
