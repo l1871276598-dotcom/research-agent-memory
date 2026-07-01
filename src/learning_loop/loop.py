@@ -72,10 +72,7 @@ def _atomic_write(path, text):
 
 
 def _write_json(path, value):
-    _atomic_write(
-        path,
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-    )
+    _atomic_write(path, json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
 
 
 def _read_json(path):
@@ -88,16 +85,7 @@ def _read_json(path):
 def validate_task(task):
     if not isinstance(task, dict):
         raise ValueError("task must be an object")
-    required = (
-        "run_id",
-        "task_id",
-        "title",
-        "instruction",
-        "query",
-        "workspace",
-        "inputs",
-        "criteria",
-    )
+    required = ("run_id", "task_id", "title", "instruction", "query", "workspace", "inputs", "criteria")
     for field in required:
         if field not in task:
             raise ValueError(f"task is missing {field}")
@@ -148,11 +136,7 @@ def validate_task(task):
         if item.get("strategy") is not None:
             _text(item["strategy"], "criterion strategy")
     minimum = task.get("minimum_score", 1.0)
-    if (
-        isinstance(minimum, bool)
-        or not isinstance(minimum, (int, float))
-        or not 0 <= minimum <= 1
-    ):
+    if isinstance(minimum, bool) or not isinstance(minimum, (int, float)) or not 0 <= minimum <= 1:
         raise ValueError("minimum_score must be between 0 and 1")
     limit = task.get("context_limit", 8000)
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
@@ -264,10 +248,7 @@ class LearningLoop:
         source_records = []
         for source_id in context["sources"]:
             record = self.memory_store.get(source_id)
-            if (
-                record.get("status") != "active"
-                or record.get("confidentiality") == "restricted"
-            ):
+            if record.get("status") != "active" or record.get("confidentiality") == "restricted":
                 raise ValueError("context builder returned an ineligible memory")
             source_records.append(
                 {
@@ -289,7 +270,8 @@ class LearningLoop:
     @staticmethod
     def _prompt(task, context, inputs):
         criteria = "\n".join(
-            f"- {item['id']}: {item['description']}" for item in task["criteria"]
+            f"- {item['id']}: {item['description']}"
+            for item in task["criteria"]
         )
         system = (
             "You are executing a bounded LAOS learning-loop task. Use only the supplied "
@@ -303,10 +285,7 @@ class LearningLoop:
             f"# Task\n{task['title']}\n\n{task['instruction']}\n\n"
             f"# Acceptance criteria\n{criteria}\n\n# Evidence inputs\n{inputs}"
         )
-        return [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
+        return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
     def _call_backend(self, messages):
         if self.backend is None or not callable(getattr(self.backend, "complete", None)):
@@ -325,11 +304,7 @@ class LearningLoop:
         haystack = result.casefold()
         criteria = []
         for item in task["criteria"]:
-            missing = [
-                term
-                for term in item["required_terms"]
-                if term.casefold() not in haystack
-            ]
+            missing = [term for term in item["required_terms"] if term.casefold() not in haystack]
             present_forbidden = [
                 term
                 for term in item.get("forbidden_terms", [])
@@ -374,11 +349,9 @@ class LearningLoop:
             "",
             "## What happened",
             "",
-            (
-                "The task result did not satisfy every declared acceptance criterion."
-                if missed
-                else "The task satisfied the declared acceptance criteria."
-            ),
+            "The task result did not satisfy every declared acceptance criterion."
+            if missed
+            else "The task satisfied the declared acceptance criteria.",
             "",
             "## Missed criteria",
             "",
@@ -390,21 +363,15 @@ class LearningLoop:
             if item["missing_terms"]:
                 details.append("missing: " + ", ".join(item["missing_terms"]))
             if item["forbidden_terms_present"]:
-                details.append(
-                    "forbidden present: "
-                    + ", ".join(item["forbidden_terms_present"])
-                )
-            lines.append(
-                f"- **{item['id']}** — {item['description']} "
-                f"({'; '.join(details)})"
-            )
+                details.append("forbidden present: " + ", ".join(item["forbidden_terms_present"]))
+            lines.append(f"- **{item['id']}** — {item['description']} ({'; '.join(details)})")
         lines.extend(
             [
                 "",
                 "## Reusable lesson",
                 "",
-                "Convert only missed, reusable criteria into reviewable strategy "
-                "candidates. Do not update active memory without human approval.",
+                "Convert only missed, reusable criteria into reviewable strategy candidates. "
+                "Do not update active memory without human approval.",
                 "",
             ]
         )
@@ -422,9 +389,7 @@ class LearningLoop:
         for item in outcome["criteria"]:
             if item["passed"]:
                 continue
-            criterion = next(
-                value for value in task["criteria"] if value["id"] == item["id"]
-            )
+            criterion = next(value for value in task["criteria"] if value["id"] == item["id"])
             source_id = f"learning-loop:{task['run_id']}:criterion:{item['id']}"
             existing = self.candidates.find_by_source_id(source_id)
             if existing is None:
@@ -434,29 +399,18 @@ class LearningLoop:
                     "scope": "global",
                     "workspace": task["workspace"],
                     "confidentiality": task.get("candidate_confidentiality")
-                    or (
-                        "personal"
-                        if task["workspace"] == "personal"
-                        else "internal"
-                    ),
+                    or ("personal" if task["workspace"] == "personal" else "internal"),
                     "source": "learning_loop",
                     "content": self._suggestion_content(task, criterion),
                     "action": "create",
                     "confidence": "inferred",
                     "source_id": source_id,
-                    "evidence": [
-                        f"run:{task['run_id']}",
-                        f"criterion:{item['id']}",
-                    ],
+                    "evidence": [f"run:{task['run_id']}", f"criterion:{item['id']}"],
                     "source_refs": [
                         f"learning-run:{task['run_id']}:outcome.json",
                         f"learning-run:{task['run_id']}:reflection.md",
                     ],
-                    "tags": [
-                        "learning-loop",
-                        task.get("type", "task"),
-                        item["id"],
-                    ],
+                    "tags": ["learning-loop", task.get("type", "task"), item["id"]],
                 }
                 existing = self.candidates.create(values)
             candidates.append(
@@ -488,10 +442,7 @@ class LearningLoop:
                     "",
                 ]
             )
-        lines.append(
-            "These are candidates only. Active memory remains unchanged until "
-            "Review Gate approval."
-        )
+        lines.append("These are candidates only. Active memory remains unchanged until Review Gate approval.")
         lines.append("")
         return "\n".join(lines)
 
@@ -519,9 +470,7 @@ class LearningLoop:
                 result = self._call_backend(self._prompt(task, context, inputs))
                 _atomic_write(result_path, result.rstrip() + "\n")
             if not evidence_path.is_file():
-                stored_result = (
-                    result if result.endswith("\n") else result.rstrip() + "\n"
-                )
+                stored_result = result if result.endswith("\n") else result.rstrip() + "\n"
                 _write_json(
                     evidence_path,
                     {
@@ -541,10 +490,7 @@ class LearningLoop:
                 outcome = self._evaluate(task, result, context)
                 outcome["run_id"] = run_id
                 _write_json(outcome_path, outcome)
-                run = self._save_run(
-                    run,
-                    "completed" if outcome["status"] == "passed" else "failed",
-                )
+                run = self._save_run(run, "completed" if outcome["status"] == "passed" else "failed")
 
             reflection_path = self._artifact(run_id, "reflection.md")
             if not reflection_path.is_file():
@@ -557,7 +503,13 @@ class LearningLoop:
                 self._policy_markdown(task, candidates),
             )
             candidate_ids = [item["candidate_id"] for item in candidates]
-            target_state = "review_pending" if candidate_ids else "completed"
+            decisions = self._load_decisions(run_id)["decisions"]
+            if run.get("state") in {"verified", "verification_failed"}:
+                target_state = run["state"]
+            elif candidate_ids and set(candidate_ids) <= set(decisions):
+                target_state = "reviewed"
+            else:
+                target_state = "review_pending" if candidate_ids else "completed"
             run = self._save_run(
                 run,
                 target_state,
@@ -592,18 +544,9 @@ class LearningLoop:
         if not accepted:
             lines.append("- None.")
         for record in accepted:
-            lines.extend(
-                [
-                    f"### {record['id']}",
-                    "",
-                    record.get("content", ""),
-                    "",
-                ]
-            )
+            lines.extend([f"### {record['id']}", "", record.get("content", ""), ""])
         lines.extend(["## Rejected", ""])
-        lines.extend(
-            [f"- `{candidate_id}`" for candidate_id in rejected] or ["- None."]
-        )
+        lines.extend([f"- `{candidate_id}`" for candidate_id in rejected] or ["- None."])
         lines.append("")
         _atomic_write(self._artifact(run_id, "memory_rules.md"), "\n".join(lines))
 
@@ -627,11 +570,7 @@ class LearningLoop:
             action == "reject" and record.get("audit_status") == "rejected"
         )
         result = (
-            {
-                "status": "already_reviewed",
-                "candidate_id": candidate_id,
-                "action": action,
-            }
+            {"status": "already_reviewed", "candidate_id": candidate_id, "action": action}
             if already_applied
             else self.review_gate.review(
                 action,
@@ -648,16 +587,11 @@ class LearningLoop:
         }
         _write_json(self._decisions_path(run_id), decisions)
         self._write_memory_rules(run_id, decisions)
-        all_decided = set(run.get("candidate_ids") or []) <= set(
-            decisions["decisions"]
-        )
+        all_decided = set(run.get("candidate_ids") or []) <= set(decisions["decisions"])
         run = self._save_run(
             run,
             "reviewed" if all_decided else "review_pending",
-            review_decisions={
-                key: value["action"]
-                for key, value in decisions["decisions"].items()
-            },
+            review_decisions={key: value["action"] for key, value in decisions["decisions"].items()},
         )
         return self.status(run_id)
 
@@ -673,25 +607,17 @@ class LearningLoop:
         first_outcome = _read_json(self._artifact(first_run_id, "outcome.json"))
         second_outcome = _read_json(self._artifact(second_run_id, "outcome.json"))
         second_context = _read_json(self._artifact(second_run_id, "context.json"))
-        second_result = self._artifact(second_run_id, "result.md").read_text(
-            encoding="utf-8"
-        )
+        second_result = self._artifact(second_run_id, "result.md").read_text(encoding="utf-8")
         decisions = self._load_decisions(first_run_id)["decisions"]
         accepted = sorted(
-            candidate_id
-            for candidate_id, item in decisions.items()
-            if item["action"] == "accept"
+            candidate_id for candidate_id, item in decisions.items() if item["action"] == "accept"
         )
         rejected = sorted(
-            candidate_id
-            for candidate_id, item in decisions.items()
-            if item["action"] == "reject"
+            candidate_id for candidate_id, item in decisions.items() if item["action"] == "reject"
         )
         context_sources = set(second_context.get("sources") or [])
         accepted_in_context = [item for item in accepted if item in context_sources]
-        accepted_in_result = [
-            item for item in accepted_in_context if item in second_result
-        ]
+        accepted_in_result = [item for item in accepted_in_context if item in second_result]
         rejected_in_context = [item for item in rejected if item in context_sources]
         restricted_sources = []
         for source_id in context_sources:
@@ -705,8 +631,7 @@ class LearningLoop:
             "accepted_strategy_attributed": bool(accepted_in_result),
             "rejected_strategy_excluded": not rejected_in_context,
             "restricted_memory_excluded": not restricted_sources,
-            "second_run_not_worse": second_outcome["failed_count"]
-            <= first_outcome["failed_count"],
+            "second_run_not_worse": second_outcome["failed_count"] <= first_outcome["failed_count"],
         }
         passed = all(checks.values())
         comparison = {
@@ -745,40 +670,19 @@ class LearningLoop:
             "## Checks",
             "",
         ]
-        lines.extend(
-            f"- [{'x' if value else ' '}] {name}"
-            for name, value in checks.items()
-        )
+        lines.extend(f"- [{'x' if value else ' '}] {name}" for name, value in checks.items())
         lines.extend(
             [
                 "",
                 "## Memory reuse",
                 "",
-                "- Accepted in context: "
-                + (
-                    ", ".join(accepted_in_context)
-                    if accepted_in_context
-                    else "none"
-                ),
-                "- Accepted cited in result: "
-                + (
-                    ", ".join(accepted_in_result)
-                    if accepted_in_result
-                    else "none"
-                ),
-                "- Rejected in context: "
-                + (
-                    ", ".join(rejected_in_context)
-                    if rejected_in_context
-                    else "none"
-                ),
+                "- Accepted in context: " + (", ".join(accepted_in_context) if accepted_in_context else "none"),
+                "- Accepted cited in result: " + (", ".join(accepted_in_result) if accepted_in_result else "none"),
+                "- Rejected in context: " + (", ".join(rejected_in_context) if rejected_in_context else "none"),
                 "",
             ]
         )
-        _atomic_write(
-            self._artifact(second_run_id, "comparison.md"),
-            "\n".join(lines),
-        )
+        _atomic_write(self._artifact(second_run_id, "comparison.md"), "\n".join(lines))
         self._save_run(second, "verified" if passed else "verification_failed")
         return comparison
 
