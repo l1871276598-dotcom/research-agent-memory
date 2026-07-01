@@ -22,10 +22,11 @@ def module_available(name):
 
 
 class HealthCheck:
-    def __init__(self, data_root, state_dir, codex_home=None):
+    def __init__(self, data_root, state_dir, codex_home=None, model_backend="codex"):
         self.data_root = Path(data_root).expanduser()
         self.state_dir = Path(state_dir).expanduser()
         self.codex_home = Path(codex_home).expanduser() if codex_home else Path.home() / ".codex"
+        self.model_backend = str(model_backend or "codex").strip().lower()
 
     @staticmethod
     def item(name, status, detail="", fix=""):
@@ -62,9 +63,15 @@ class HealthCheck:
             return str(exc)
 
     def codex(self):
+        required = self.model_backend == "codex"
         binary = shutil.which("codex")
         if binary is None:
-            return self.item("codex_cli", "fail", "not found", "Install Codex CLI and sign in.")
+            return self.item(
+                "codex_cli",
+                "fail" if required else "optional",
+                "not found",
+                "Install Codex CLI and sign in." if required else "",
+            )
         try:
             result = subprocess.run(
                 [binary, "--version"],
@@ -74,20 +81,32 @@ class HealthCheck:
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            return self.item("codex_cli", "fail", str(exc), "Repair the Codex CLI installation.")
+            return self.item(
+                "codex_cli",
+                "fail" if required else "optional",
+                str(exc),
+                "Repair the Codex CLI installation." if required else "",
+            )
         text = (result.stdout or result.stderr).strip()
         match = _VERSION.search(text)
         if result.returncode != 0 or match is None:
-            return self.item("codex_cli", "fail", text, "Update the Codex CLI installation.")
+            return self.item(
+                "codex_cli",
+                "fail" if required else "optional",
+                text,
+                "Update the Codex CLI installation." if required else "",
+            )
         version = tuple(int(part) for part in match.groups())
         return self.item(
             "codex_cli",
             "ok" if version >= (0, 130, 0) else "warn",
             text,
-            "Update Codex CLI." if version < (0, 130, 0) else "",
+            "Update Codex CLI." if version < (0, 130, 0) and required else "",
         )
 
     def run(self):
+        codex_required = self.model_backend == "codex"
+        auth_exists = (self.codex_home / "auth.json").is_file()
         checks = [
             self.item(
                 "python",
@@ -113,12 +132,13 @@ class HealthCheck:
                 sqlite3.sqlite_version,
                 "Use a Python build with SQLite FTS5.",
             ),
+            self.item("model_backend", "ok", self.model_backend),
             self.codex(),
             self.item(
                 "codex_oauth",
-                "ok" if (self.codex_home / "auth.json").is_file() else "warn",
+                "ok" if auth_exists else ("warn" if codex_required else "optional"),
                 str(self.codex_home / "auth.json"),
-                "Sign in with the Codex CLI.",
+                "Sign in with the Codex CLI." if codex_required and not auth_exists else "",
             ),
             self.item(
                 "mcp_sdk",
