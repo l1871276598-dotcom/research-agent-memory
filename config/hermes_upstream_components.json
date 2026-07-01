@@ -100,8 +100,8 @@
       "status": "integrated",
       "port_mode": "copy_then_adapt",
       "upstream_paths": ["hermes_state.py", "hermes_cli/active_sessions.py"],
-      "laos_paths": ["src/sessions/", "src/bridge/inbox.py", "src/bridge/projector.py", "tools/session_cli.py"],
-      "notes": "Finalized bridge messages are projected into branch-specific SQLite sessions with stable identities, ordering, replay protection, and crash recovery."
+      "laos_paths": ["src/sessions/", "src/bridge/inbox.py", "src/bridge/projector.py", "src/bridge/mcp_checkpoint.py", "tools/session_cli.py"],
+      "notes": "Finalized bridge messages are projected into branch-specific SQLite sessions with stable identities, ordering, replay protection, crash recovery, and explicit MCP checkpoint receipts."
     },
     {
       "number": 13,
@@ -117,8 +117,8 @@
       "status": "foundation_integrated",
       "port_mode": "selective_copy",
       "upstream_paths": ["gateway/platforms/base.py", "gateway/"],
-      "laos_paths": ["src/message_io/", "src/bridge/", "tools/bridge_server.py", "config/bridge_scope.example.json"],
-      "notes": "The ChatGPT web bridge uses a token-authenticated localhost inbox, explicit source and account scope policies, streaming finalization, parent ordering, deduplication, and optional model review."
+      "laos_paths": ["src/message_io/", "src/bridge/", "src/protocol_host.py", "tools/bridge_server.py", "tools/serve_laos.py", "tools/checkpoint_validation.py", "config/bridge_scope.example.json"],
+      "notes": "The web bridge supports authenticated event ingestion. The existing MCP host can optionally expose an explicit laos_capture_checkpoint tool, but it is not classified as passive or lossless conversation capture."
     },
     {
       "number": 15,
@@ -134,7 +134,8 @@
       "status": "foundation_integrated",
       "port_mode": "copy_then_adapt",
       "upstream_paths": ["mcp_serve.py", "tools/mcp_client.py", "tools/mcp_oauth.py"],
-      "laos_paths": ["src/tool_facade.py", "src/protocol_host.py", "tools/serve_laos.py"]
+      "laos_paths": ["src/tool_facade.py", "src/protocol_host.py", "src/bridge/mcp_checkpoint.py", "tools/serve_laos.py", "tools/checkpoint_validation.py"],
+      "notes": "MCP checkpoint capture is opt-in and returns hashes and capability evidence. Validation explicitly separates reliable checkpoint synchronization from unproven passive transcript capture."
     },
     {
       "number": 17,
@@ -151,7 +152,7 @@
       "port_mode": "selective_copy",
       "upstream_paths": ["tools/approval.py", "agent/tool_guardrails.py", "agent/memory_manager.py"],
       "laos_paths": ["src/safety/", "src/context/", "src/memory/render.py", "src/bridge/service.py"],
-      "notes": "Bridge ingestion is localhost-only, token authenticated, source allowlisted, payload bounded, and fail-closed for unmapped accounts."
+      "notes": "Bridge ingestion is localhost-only, token authenticated, source allowlisted, payload bounded, and fail-closed for unmapped accounts. MCP checkpoint capture is absent unless explicitly enabled."
     },
     {
       "number": 19,
