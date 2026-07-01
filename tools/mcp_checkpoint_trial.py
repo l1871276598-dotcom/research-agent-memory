@@ -38,6 +38,14 @@ def _write_manifest(state_dir, manifest):
     )
 
 
+def _normalize_mcp_path(value):
+    if not isinstance(value, str) or not value.startswith("/"):
+        raise ValueError("mcp_path must start with /")
+    if value != "/":
+        value = value.rstrip("/")
+    return value
+
+
 def prepare_trial(
     data_root,
     state_dir,
@@ -47,6 +55,8 @@ def prepare_trial(
     project="laos-checkpoint-test",
     profile="personal",
     confidentiality="personal",
+    port=8766,
+    mcp_path="/mcp",
 ):
     if workspace not in {"personal", "work"}:
         raise ValueError("workspace must be personal or work")
@@ -58,11 +68,15 @@ def prepare_trial(
         or expected_checkpoints <= 0
     ):
         raise ValueError("expected_checkpoints must be a positive integer")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("port must be between 1 and 65535")
+    mcp_path = _normalize_mcp_path(mcp_path)
 
     data_root = Path(data_root).expanduser()
     state_dir = Path(state_dir).expanduser()
     init_store(data_root)
     state_dir.mkdir(parents=True, exist_ok=True)
+    local_mcp_url = f"http://127.0.0.1:{port}{mcp_path}"
     manifest = {
         "schema_version": 1,
         "trial_id": f"mcp-trial-{secrets.token_hex(6)}",
@@ -77,6 +91,12 @@ def prepare_trial(
         "confidentiality": confidentiality,
         "expected_checkpoints": expected_checkpoints,
         "model_review_enabled": False,
+        "transport": "streamable-http",
+        "host": "127.0.0.1",
+        "port": port,
+        "mcp_path": mcp_path,
+        "local_mcp_url": local_mcp_url,
+        "requires_remote_tunnel": True,
         "classification": None,
         "manual_evidence": None,
     }
@@ -84,6 +104,11 @@ def prepare_trial(
     return {
         "manifest": manifest,
         "manifest_path": str(_manifest_path(state_dir)),
+        "local_mcp_url": local_mcp_url,
+        "connection_requirement": (
+            "ChatGPT cannot connect to this loopback URL directly. Connect it through "
+            "Secure MCP Tunnel or another authenticated remote MCP endpoint."
+        ),
         "chatgpt_instruction": (
             "After preparing each completed response, call laos_capture_checkpoint exactly once. "
             "Keep one stable session_alias for this conversation. Submit the current user message "
@@ -115,6 +140,14 @@ def serve_trial(state_dir):
         manifest["data_root"],
         "--state-dir",
         manifest["state_dir"],
+        "--transport",
+        manifest["transport"],
+        "--host",
+        manifest["host"],
+        "--port",
+        str(manifest["port"]),
+        "--mcp-path",
+        manifest["mcp_path"],
         "--enable-checkpoint-capture",
         "--checkpoint-account-id",
         manifest["profile"],
@@ -150,6 +183,8 @@ def report_trial(state_dir):
     return {
         "trial_id": manifest["trial_id"],
         "classification": classification,
+        "local_mcp_url": manifest["local_mcp_url"],
+        "requires_remote_tunnel": manifest["requires_remote_tunnel"],
         "automated_report": report,
         "empirical_decision_pending": manifest.get("status") != "decided",
         "required_manual_evidence": manifest.get("manual_evidence")
@@ -239,6 +274,8 @@ def main(argv=None):
         default="personal",
     )
     prepare.add_argument("--expected-checkpoints", type=int, default=5)
+    prepare.add_argument("--port", type=int, default=8766)
+    prepare.add_argument("--mcp-path", default="/mcp")
 
     serve = commands.add_parser("serve")
     serve.add_argument("--state-dir", required=True)
@@ -266,6 +303,8 @@ def main(argv=None):
             project=args.project,
             profile=args.profile,
             confidentiality=args.confidentiality,
+            port=args.port,
+            mcp_path=args.mcp_path,
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
