@@ -117,8 +117,8 @@
       "status": "foundation_integrated",
       "port_mode": "selective_copy",
       "upstream_paths": ["gateway/platforms/base.py", "gateway/"],
-      "laos_paths": ["src/message_io/", "src/bridge/", "src/protocol_host.py", "tools/bridge_server.py", "tools/serve_laos.py", "tools/checkpoint_validation.py", "config/bridge_scope.example.json"],
-      "notes": "The web bridge supports authenticated event ingestion. The existing MCP host can optionally expose an explicit laos_capture_checkpoint tool, but it is not classified as passive or lossless conversation capture."
+      "laos_paths": ["src/message_io/", "src/bridge/", "src/protocol_host.py", "tools/bridge_server.py", "tools/serve_laos.py", "tools/mcp_checkpoint_trial.py", "tools/checkpoint_validation.py", "config/bridge_scope.example.json"],
+      "notes": "The web bridge supports authenticated event ingestion. MCP checkpoint remains an optional explicit tool path and is not adopted as the formal automatic snapshot channel for the current Plus deployment."
     },
     {
       "number": 15,
@@ -131,11 +131,11 @@
     {
       "number": 16,
       "id": "mcp",
-      "status": "foundation_integrated",
+      "status": "experimental_checkpoint_only",
       "port_mode": "copy_then_adapt",
       "upstream_paths": ["mcp_serve.py", "tools/mcp_client.py", "tools/mcp_oauth.py"],
-      "laos_paths": ["src/tool_facade.py", "src/protocol_host.py", "src/bridge/mcp_checkpoint.py", "tools/serve_laos.py", "tools/checkpoint_validation.py"],
-      "notes": "MCP checkpoint capture is opt-in and returns hashes and capability evidence. Validation explicitly separates reliable checkpoint synchronization from unproven passive transcript capture."
+      "laos_paths": ["src/tool_facade.py", "src/protocol_host.py", "src/bridge/mcp_checkpoint.py", "tools/serve_laos.py", "tools/mcp_checkpoint_trial.py", "tools/checkpoint_validation.py", "requirements-mcp.txt"],
+      "notes": "Supports stdio and loopback Streamable HTTP with a bounded trial workflow. Current deployment cannot complete the write test, so MCP is not classified as automatic or lossless conversation capture."
     },
     {
       "number": 17,
@@ -152,7 +152,7 @@
       "port_mode": "selective_copy",
       "upstream_paths": ["tools/approval.py", "agent/tool_guardrails.py", "agent/memory_manager.py"],
       "laos_paths": ["src/safety/", "src/context/", "src/memory/render.py", "src/bridge/service.py"],
-      "notes": "Bridge ingestion is localhost-only, token authenticated, source allowlisted, payload bounded, and fail-closed for unmapped accounts. MCP checkpoint capture is absent unless explicitly enabled."
+      "notes": "Bridge ingestion is localhost-only, token authenticated, source allowlisted, payload bounded, and fail-closed for unmapped accounts. MCP checkpoint HTTP binds only to loopback and requires a reviewed tunnel or remote proxy."
     },
     {
       "number": 19,

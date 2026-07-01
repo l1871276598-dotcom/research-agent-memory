@@ -134,7 +134,7 @@ raw evidence
 - 默认检索模式：lexical
 - 主要支持平台：macOS
 - 支持的 Python：3.11 或更高版本
-- 当前不需要 Codex CLI、语义模型、云 API 或付费 API
+- 默认不需要 Codex CLI、语义模型、云 API 或付费 API
 
 ## 当前已实现能力
 
@@ -151,31 +151,31 @@ raw evidence
 - Agent Context Pack JSON/Markdown 输出
 - lexical 检索评测框架
 - `semantic` / `hybrid` 模式接口的显式 lexical 回退
+- 可插拔 ModelBackend、Codex 与 OpenAI-compatible 后端
+- Agent Runtime、Tool Registry、SessionStore 和 Procedure 生命周期
+- Bridge Event Inbox、Session Projector、自动候选审查和崩溃恢复
+- MCP stdio 与回环 Streamable HTTP 服务
+- 可选显式 `laos_capture_checkpoint` 工具和实机验证流程
 - `doctor` 健康检查
 - GitHub Actions 在 push / pull_request 运行测试、compileall 和 whitespace 检查
 
-## 尚未实现能力
+## 尚未完成或尚未验证的能力
 
-- Agent Registry
-- Orchestrator Agent / Router
-- 可插拔 Agent 目录结构
-- 自动更新 Loop：watch/import → detect → candidate → quality gate → review → apply → reindex → refresh context pack
-- 新导入对话自动批量生成候选记忆
+- 真实 ChatGPT MCP checkpoint 五轮实测与正式定级
+- 浏览器侧无损对话事件采集源
+- 完整统一 Runtime 与默认 Combined Context
+- 长会话 Context Compactor 默认接线
+- 轻量 Loop Engineering 的任务结果闭环
 - ChatGPT 附件导入
 - PDF/DOCX 深度结构化解析
-- Link Understanding Agent / Hermes provider
-- Rule Agent
-- Reflection Agent
-- Evolution Agent
-- Code / Codex Bridge Agent
+- Link Understanding Agent / provider
 - owner/agent 身份认证与多 Agent 授权
 - 内置文献管理、文献矩阵自动填充和 Zotero / EndNote 同步已移出路线；后续如有需要，仅通过外部接口或 Adapter 集成
 - 真实本地向量 embedding
 - 真实语义相似度检索
 - 真实 lexical + semantic 混合排序
-- MCP 接口
 
-候选审核生命周期已经实现；自动候选生成调度尚未实现。
+MCP checkpoint 已具备代码和验证框架，但当前 Plus 部署不具备完成写入型实测的账户能力，因此不作为正式自动快照通道，也不能描述为被动或无损对话采集。
 
 ## 不作为内置主线的能力
 
@@ -234,7 +234,10 @@ ResearchAgent/
 
 ```text
 ~/Library/Application Support/ResearchAgent/
-└── memory.sqlite
+├── memory.sqlite
+├── sessions.sqlite
+├── bridge_events.sqlite
+└── review_state.sqlite
 ```
 
 SQLite、WAL、SHM、锁、缓存和日志都属于可重建的本地派生状态，不应放在 iCloud 数据目录。
@@ -249,446 +252,28 @@ cd "$REPO_ROOT"
 ```
 
 ```bash
-python3 src/memory.py init --root "$DATA_ROOT"
-```
-
-```bash
-python3 src/memory.py db-init \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR"
-```
-
-```bash
-python3 src/memory.py add \
-  --root "$DATA_ROOT" \
-  --type principle \
-  --title "代码最少原则" \
-  --scope global \
-  --workspace personal \
-  --confidentiality personal \
-  --source user \
-  --confidence confirmed \
-  --content "使用尽可能少的代码实现相同功能。" \
-  --tags coding architecture
-```
-
-```bash
-python3 src/memory.py validate --root "$DATA_ROOT"
-python3 src/memory.py index --root "$DATA_ROOT" --state-dir "$STATE_DIR"
-python3 src/memory.py search "代码最少" --root "$DATA_ROOT" --state-dir "$STATE_DIR"
-python3 src/memory.py doctor --root "$DATA_ROOT" --state-dir "$STATE_DIR"
-```
-
-## LAOS JSON CLI
-
-创建记忆只会生成 `candidate`：
-
-```bash
-python3 src/laos.py --root "$DATA_ROOT" --state-dir "$STATE_DIR" \
-  --task-json '{"type":"memory.create","input":{"type":"principle","title":"最少代码","scope":"global","workspace":"personal","confidentiality":"personal","source":"manual:user_confirmed","confidence":"confirmed","content":"使用尽可能少的代码。"}}'
-```
-
-使用上一步输出的候选 ID 显式审核：
-
-```bash
-python3 src/laos.py --root "$DATA_ROOT" --state-dir "$STATE_DIR" \
-  --task-json '{"type":"memory.review","workspace":"personal","input":{"action":"accept","candidate_id":"CANDIDATE_ID"}}'
-```
-
-```bash
-python3 src/laos.py --root "$DATA_ROOT" --state-dir "$STATE_DIR" \
-  --task-json '{"type":"memory.search","input":{"query":"最少代码","workspace":"personal"}}'
-```
-
-```bash
-python3 src/laos.py --root "$DATA_ROOT" --state-dir "$STATE_DIR" \
-  --task-json '{"type":"context.build","input":{"query":"最少代码","workspace":"personal"}}'
-```
-
-LAOS 不会自动 accept；只有显式通过 Review Gate 的审核才能将候选记忆变为 `active`。`restricted` 记忆永远不会进入 LAOS context。 LAOS 审核省略 workspace 时默认限定为 `personal`；审核 work candidate 必须显式提交 `workspace: work`，workspace 不一致时审核失败。
-
-## 添加结构化记忆
-
-```bash
-python3 src/memory.py add \
-  --root "$DATA_ROOT" \
-  --type project \
-  --title "PDC 项目" \
-  --scope project \
-  --project pdc \
-  --workspace personal \
-  --confidentiality personal \
-  --source user \
-  --confidence confirmed \
-  --content "PDC project memory registry."
-```
-
-项目作用域的 `decision`、`procedure` 或其他记忆必须引用已经 review/accept 的 active `type: project` 记录。
-
-所有创建类命令和函数只生成 `candidate`；`active` 只能由统一的 `memory_distill.py review/accept` 路径产生。兼容参数 `--confirmed` 仅记录 `confirmation: explicit` metadata，不会直接激活记录，也不会改写调用者提供的 `source`。当前版本不验证 review/accept 操作者的真实身份；owner/agent 身份认证仍未实现。
-
-## 统一索引
-
-```bash
-python3 src/memory.py index \
-  --root "$DATA_ROOT" \
+python3 tools/setup_local.py \
+  --data-root "$DATA_ROOT" \
   --state-dir "$STATE_DIR" \
-  --dry-run
+  --profile personal \
+  --workspace personal
 ```
 
-```bash
-python3 src/memory.py index \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR"
-```
-
-如需重建派生 SQLite：
-
-```bash
-python3 src/memory.py db-rebuild \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR"
-```
-
-Markdown 记忆、raw 原始证据和 text 稳定文本副本是权威数据。SQLite 是派生索引；`db-rebuild` 从权威文件重建临时数据库，验证通过后原子替换，失败时旧数据库保留。
-
-## 搜索
-
-默认搜索只返回 `active`、非 `restricted` 且符合项目边界的结果。未传 `--project` 时只返回 project 为空的记录；传入项目时只返回该项目和 project 为空的共享记录。只有显式 `--include-restricted` 或 `--include-inactive` 才放宽对应限制。`memory_tools.py search` 委托给 `memory.py search_store()`，没有独立 tokenizer 或过滤规则。
-
-```bash
-python3 src/memory.py search "论文证据链" \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR" \
-  --kind document \
-  --source-kind manuscript \
-  --project pdc
-```
-
-```bash
-python3 src/memory.py search "RMRE" \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR" \
-  --json
-```
-
-当前索引源：
-
-- `imports/chatgpt/conversations/`
-- `imports/manual/text/`
-- `imports/manual/raw/`，仅当没有对应 text sidecar 且 raw 是 UTF-8 可读文本
-- `literature/notes/`，仅保留旧版本兼容，后续迁移为 external adapter 输出
-- `literature/journals/`，仅保留旧版本兼容，后续迁移为 external adapter 输出
-- `manuscripts/current/`
-- `manuscripts/evidence/`
-- `manuscripts/archive/`
-
-手动导入资料优先索引 `imports/manual/text/`。同一份 TXT/JSON/CSV 等文件有 text sidecar 时，raw 不进入 FTS，避免重复结果。PDF/DOCX 等二进制 raw 不直接进入 FTS。
-
-## ChatGPT ZIP 手动导入
-
-当前唯一入口是：
-
-```text
-用户手动申请官方数据导出
-→ 用户自行下载 ZIP
-→ 本地运行 import-chatgpt
-```
-
-```bash
-python3 src/memory_tools.py import-chatgpt \
-  --zip "$HOME/Downloads/chatgpt-export.zip" \
-  --root "$DATA_ROOT" \
-  --dry-run
-```
-
-```bash
-python3 src/memory_tools.py import-chatgpt \
-  --zip "$HOME/Downloads/chatgpt-export.zip" \
-  --root "$DATA_ROOT"
-```
-
-导入输出：
-
-```text
-imports/chatgpt/conversations/YYYY/MM/*.md
-imports/chatgpt/import_manifest.json
-exports/import_reports/*-chatgpt-*.json
-```
-
-导入会检查 ZIP 是否存在、是否为符号链接、ZIP CRC、唯一 `conversations.json`、JSON 根节点是否为 list、conversation 基本结构，并报告 `conversation_count`、`message_count`、`new`、`updated`、`unchanged`、`raw_only` 和 `failed`。报告不包含完整聊天正文。raw 使用独占创建；同路径同内容为 NOOP，同路径不同内容生成新的 hash 版本路径，既有文件不会被覆盖。重复导入旧 ZIP 不会重建 recent，也不会把旧内容晋升为长期记忆。
-
-## 手动文件导入
-
-```bash
-python3 src/memory_tools.py import-manual \
-  --path "$HOME/Downloads/note.txt" \
-  --root "$DATA_ROOT" \
-  --dry-run
-```
-
-```bash
-python3 src/memory_tools.py import-manual \
-  --path "$HOME/Downloads/note.txt" \
-  --root "$DATA_ROOT"
-```
-
-支持的单文件入口参数是 `--path`。当前不支持目录扫描、inbox 扫描、`--file` 或 `--scan-inbox`。
-
-文本类文件会写入：
-
-```text
-imports/manual/raw/YYYY/MM/*
-imports/manual/text/YYYY/MM/*.md
-exports/import_reports/*-manual-*.json
-```
-
-text sidecar front matter 包含 `source_path`、`source_sha256`、`original_name`、`media_type`、`extractor` 和 `imported_at`，可追溯到 raw 原始证据。manual raw 同样使用独占创建和 hash 版本路径，永不覆盖既有 raw；重复导入同一文件会报告 duplicate。导入不会自动运行 `index`。
-
-PDF/DOCX 或无法 UTF-8 解码的文件只写 raw 和导入报告，报告 `archived_without_text: 1`，不写 text sidecar，不进入全文索引。
-
-## Memory Agent 编排接口
-
-`memory_agent.py` 是现有检索、路径安全和候选审核能力之上的薄编排层。`prepare` 在任务执行前返回有字符上限的相关上下文；`finalize` 在任务完成后生成待审核候选，不调用外部模型，也不会自动 accept 或 apply。
-
-```bash
-python3 src/memory_agent.py prepare \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR" \
-  --task "整理 PDC 项目的证据链" \
-  --project pdc \
-  --max-chars 8000
-```
-
-```bash
-python3 src/memory_agent.py finalize \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR" \
-  --task "整理 PDC 项目的证据链" \
-  --result-file completed-result.txt \
-  --max-task-chars 20000 \
-  --max-result-chars 60000 \
-  --max-candidate-chars 80000
-```
-
-短结果可改用 `--result "..."`；`--result` 与 UTF-8 `--result-file` 互斥。默认 task、result 和候选正文上限分别为 20,000、60,000 和 80,000 个 Python 字符，三个选项都必须是正整数。超限不会静默截断，也不会创建候选或 Loop 文件，而是以 `task_too_large`、`result_too_large`、`candidate_too_large` 或 `invalid_max_chars` 稳定错误码退出。成功输出包含 `operation: "finalize"`、真实 `candidate_count`、真实候选 `artifacts`、`review_required: true`、`applied: false` 和 `warnings`；候选仍必须人工审核。
-
-可选的轻量 Loop Engineering 只记录外部调用者已经执行完的 pass/fail 结果，不执行 shell 命令：
-
-```bash
-python3 src/memory_agent.py finalize \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR" \
-  --task "验证迁移" \
-  --result "迁移失败" \
-  --outcome fail \
-  --error "目标版本不匹配" \
-  --reflection "版本预检查缺失" \
-  --policy-suggestion "迁移前验证目标状态"
-```
-
-提供 `--outcome pass|fail` 后，会在本地 `<state-dir>/loop_engineering/runs/<run_id>/` 生成 `run.json`、`reflection.md` 和 `policy_suggestions.md`。三文件先写入同一文件系统内的临时目录，再以目录 rename 发布；候选创建失败会删除本次运行目录。审批同时修改数据根和本地 state 时使用现有事务回滚与一致性约束，不宣称跨文件系统具备单次 rename 级原子性。省略 `--outcome` 时保持原有 `finalize` 行为和 JSON 输出。
-
-人工审核者只需把认可的策略复选框改为 `[x]` 或 `[X]`，再显式确认：
-
-```bash
-python3 src/memory_agent.py approve-policies \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR" \
-  --run-id "$RUN_ID" \
-  --confirmed
-```
-
-只有已勾选且内容哈希有效的策略会按哈希去重后写入 `<root>/memory_rules.md`，并与对应 `run.json` 状态通过现有事务机制同步更新。`memory_rules.md` 只是可审计的已批准规则注册表，不会自动改变提示词、代码、active memory 或 Agent 行为。本阶段不包含 Meta Planner、自动重试、自动策略应用或自动接受 session candidate。
-
-预期错误同样返回单个 JSON 对象，包含稳定的 `error.code` 和安全的 `error.message`，并以非零状态退出。Windows、macOS 和 Linux 使用相同命令；省略 `--state-dir` 时继续使用 `platform_paths.py` 的平台本地状态目录，SQLite 不写入同步数据目录。
-
-## 候选审核
-
-候选审核只有一套当前实现的流程：
-
-```text
-apply
-→ review
-→ accept / reject
-```
-
-```bash
-python3 src/memory_distill.py apply \
-  --root "$DATA_ROOT" \
-  --action create \
-  --type principle \
-  --title "候选原则" \
-  --scope global \
-  --workspace personal \
-  --confidentiality personal \
-  --source codex \
-  --content "候选内容"
-```
-
-```bash
-python3 src/memory_distill.py review --root "$DATA_ROOT" --json
-```
-
-```bash
-python3 src/memory_distill.py accept --root "$DATA_ROOT" --id CANDIDATE_ID
-```
-
-```bash
-python3 src/memory_distill.py reject \
-  --root "$DATA_ROOT" \
-  --id CANDIDATE_ID \
-  --reason "证据不足"
-```
-
-记忆文件状态与审核状态分离：
-
-- LAOS v0.8 规范状态：`raw`、`candidate`、`active`、`deprecated`、`conflicted`、`archived`
-- 旧版状态 `conflict` 和 `historical` 仅为兼容读取，不作为新的 LAOS 状态写入
-- 审核 `audit_status`：`prepared`、`awaiting_review`、`accepted`、`rejected`、`conflict`、`pending_delete`、`deleted`、`stale`、`failed`
-
-行为边界：
-
-- `create`：候选通过后变为 `status: active`、`audit_status: accepted`
-- `merge`：目标必须存在；只合并 `source_refs`、`tags`、`relations`；候选归档为 `audit_status: accepted`
-- `support`：不改目标核心 `content`；只增加来源和证据；候选归档为 `audit_status: accepted`
-- `supersede`：accept 后新记录 active；旧记录 deprecated；维护双向 supersession 关系
-- `conflict`：不覆盖正式记忆；新候选变为 `status: conflicted`、`audit_status: conflict`
-- `reject`：候选归档为 `status: archived`、`audit_status: rejected`，保存 `review_reason`
-
-如果候选记录带有 `source_path` 和 `source_sha256`，accept 前会重新校验 source hash。UPDATE/DEPRECATE proposal 同时保存目标 ID、预期状态和预期文件 SHA256；accept 会基于当前 store 重新校验并运行完整 hypothetical validation，变化时返回结构化 `stale_target`，不会修改文件或索引。
-
-## 记忆生命周期
-
-当前 v0.8.0 开发分支支持的真实生命周期：
-
-```text
-ChatGPT ZIP / manual import
-→ raw 原始证据归档
-→ 可读文本生成 text sidecar
-→ index 写入 SQLite FTS
-→ 人工或自动流程调用 apply 生成 candidate
-→ review
-→ accept / reject
-→ active / archived / conflicted
-```
-
-raw 原始证据不会被 `index`、`db-rebuild`、`accept` 或 `reject` 删除。当前没有 recent purge 命令、删除宽限期命令或自动 recent 生命周期管理。
-
-## Project 状态
-
-```bash
-python3 src/memory.py project-status \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR" \
-  --project pdc \
-  --json
-```
-
-## Context Pack
-
-```bash
-python3 src/memory.py context \
-  "本次任务查询" \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR" \
-  --project pdc \
-  --workspace personal \
-  --format json \
-  --max-chars 16000
-```
-
-```bash
-python3 src/memory.py context \
-  "本次任务查询" \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR" \
-  --format markdown \
-  --output context-pack.md
-```
-
-生成前会检查 SQLite 索引是否过期；过期时拒绝生成，提示先运行 `index`。
-
-## Semantic / Hybrid 能力边界
-
-已实现：
-
-- lexical FTS5 检索
-- 检索评测框架
-- `--mode lexical|semantic|hybrid` 接口
-- semantic/hybrid 后端不可用时的显式 lexical 回退
-
-未实现：
-
-- embedding 模型加载
-- 文本向量生成
-- chunk / embedding 表
-- 向量持久化
-- cosine similarity
-- semantic 排序
-- lexical + semantic 混合 RRF
-
-## 保密规则
-
-- `public` 和 `personal` 默认可导出
-- `internal` 默认不导出，可用 `--include-internal` 显式包含
-- `restricted` 永远不导出
-- `internal` 和 `restricted` 必须属于 `work` workspace
-- 搜索和 Context Pack 默认不返回 restricted 文档
-- 密码、API key、SSH 私钥和其他凭证不得写入记忆库
-
-## 备份与恢复
-
-需要备份：
-
-- Markdown 记忆
-- raw 原始证据
-- text 稳定文本副本
-- `imports/document_metadata.json`
-- `imports/chatgpt/import_manifest.json`
-- 必要的项目资料
-
-可以重建：
-
-- `memory.sqlite`
-- FTS 表
-- 缓存
-- 临时任务目录
-
-恢复后执行：
-
-```bash
-python3 src/memory.py db-rebuild \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR"
-```
-
-SQLite 不是唯一备份对象，也不是权威数据源。
-
-## 自动测试与 CI
-
-本地发布门禁：
+运行完整测试：
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m compileall -q src
-git diff --check
 ```
 
-GitHub Actions 已配置在 push 和 pull request 时运行：
+MCP checkpoint 验证：
 
 ```bash
-python3 -m unittest discover -s tests -v
-python3 -m compileall -q src
-git diff --check
+python3 -m pip install -r requirements-mcp.txt
+python3 tools/mcp_checkpoint_trial.py prepare \
+  --data-root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --workspace personal
+python3 tools/mcp_checkpoint_trial.py serve --state-dir "$STATE_DIR"
 ```
 
-尚未推送分支或运行远程 workflow 时，不应声称远程 CI 已通过。
-
-## 不属于 v0.8.0
-
-iCloud 多端同步、设备注册、设备状态、移动端写入、自动索引刷新、实时同步、自动 ZIP 下载、ChatGPT 自动登录、Web 服务、GUI、桌面 App、云数据库、独立向量数据库、常驻后台监听服务和内置文献系统扩展不属于 v0.8.0，本次未实现。文献能力后续仅考虑外部接口集成。
-
-## 许可证
-
-代码使用 MIT License。
+详细流程见 `docs/mcp_checkpoint_validation.md`。
