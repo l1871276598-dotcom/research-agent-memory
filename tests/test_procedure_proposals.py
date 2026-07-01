@@ -47,6 +47,22 @@ class ProcedureProposalTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_proposal(invalid)
 
+    def test_review_key_returns_existing_proposal_on_replay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ProcedureProposalStore(directory)
+            value = {
+                "action": "update",
+                "name": "research-workflow",
+                "summary": "Add verification gate",
+                "content": "Verify evidence before promotion.",
+                "source_refs": ["session:one"],
+                "review_key": "review:event-1:procedure:0",
+            }
+            first = store.create(value)
+            replay = store.create(value)
+            self.assertEqual(first["proposal_id"], replay["proposal_id"])
+            self.assertEqual(len(store.list()), 1)
+
     def test_coordinator_converts_review_output_to_procedure_candidate(self):
         with tempfile.TemporaryDirectory() as directory:
             proposals = ProcedureProposalStore(directory)
@@ -62,6 +78,8 @@ class ProcedureProposalTests(unittest.TestCase):
                 messages=[{"role": "user", "content": "Use verification gates."}],
                 workspace="personal",
                 tool_iterations=1,
+                event_key="bridge-event-one",
+                review_position=0,
             )
             self.assertEqual(result["status"], "reviewed")
             saved = result["result"]["procedure_proposals"]
@@ -69,6 +87,10 @@ class ProcedureProposalTests(unittest.TestCase):
             proposal = saved[0]["proposal"]
             self.assertEqual(proposal["action"], "update")
             self.assertEqual(proposal["source_refs"], ["session:session-one"])
+            self.assertEqual(
+                proposal["review_key"],
+                "review:bridge-event-one:procedure:0",
+            )
             self.assertIn("Verify evidence", proposal["content"])
 
 
