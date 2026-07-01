@@ -51,8 +51,11 @@ class DelegationTests(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertTrue(all(result["status"] == "completed" for result in results))
         self.assertTrue(all("private" not in result for result in results))
-        self.assertEqual(created[0]["allowed_tools"], ["read_file"])
-        self.assertTrue(BLOCKED_CHILD_TOOLS.isdisjoint(created[0]["allowed_tools"]))
+        allowed_sets = {tuple(item["allowed_tools"]) for item in created}
+        self.assertEqual(allowed_sets, {("read_file",), ("search_files",)})
+        self.assertTrue(
+            all(BLOCKED_CHILD_TOOLS.isdisjoint(item["allowed_tools"]) for item in created)
+        )
         self.assertEqual(manager.active(), [])
 
     def test_pause_and_depth_limits_fail_closed(self):
