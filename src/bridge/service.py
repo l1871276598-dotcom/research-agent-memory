@@ -14,7 +14,7 @@ class BridgeIngestService:
         inbox,
         *,
         token,
-        allowed_sources=None,
+        allowed_sources,
         max_payload_bytes=1_000_000,
     ):
         if not callable(getattr(inbox, "ingest", None)):
@@ -27,13 +27,12 @@ class BridgeIngestService:
             or max_payload_bytes <= 0
         ):
             raise ValueError("max_payload_bytes must be positive")
+        sources = {str(item).strip().lower() for item in (allowed_sources or []) if str(item).strip()}
+        if not sources:
+            raise ValueError("allowed_sources must contain at least one source")
         self.inbox = inbox
         self.token = token
-        self.allowed_sources = (
-            {str(item).strip().lower() for item in allowed_sources}
-            if allowed_sources is not None
-            else None
-        )
+        self.allowed_sources = sources
         self.max_payload_bytes = max_payload_bytes
 
     def ingest_json(self, payload, *, token):
@@ -53,10 +52,9 @@ class BridgeIngestService:
             raise ValueError("bridge payload must be valid UTF-8 JSON") from exc
         if not isinstance(event, dict):
             raise ValueError("bridge payload must contain one event object")
-        if self.allowed_sources is not None:
-            source = str(event.get("source", "")).strip().lower()
-            if source not in self.allowed_sources:
-                raise PermissionError("bridge source is not allowed")
+        source = str(event.get("source", "")).strip().lower()
+        if source not in self.allowed_sources:
+            raise PermissionError("bridge source is not allowed")
         result = self.inbox.ingest(event)
         return {
             "event_id": result["event_id"],
