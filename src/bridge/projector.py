@@ -124,12 +124,21 @@ class SessionProjector:
             output.append(message)
         return output
 
-    def _review(self, session_id, scope, *, force=False, tool_iterations=0):
+    def _review(
+        self,
+        session_id,
+        scope,
+        *,
+        event_key,
+        force=False,
+        tool_iterations=0,
+    ):
         if self.coordinator is None:
             return None
         history = self.sessions.get(session_id)["messages"]
         if not history:
             return {"status": "skipped", "reason": "empty_conversation"}
+        position = max(item["ordinal"] for item in history)
         return self.coordinator.record_turn(
             session_id=session_id,
             messages=self._review_messages(history),
@@ -139,6 +148,8 @@ class SessionProjector:
             tool_iterations=tool_iterations,
             force=force,
             turn_increment=0 if force else 1,
+            event_key=event_key,
+            review_position=position,
         )
 
     def project(self, event):
@@ -164,17 +175,23 @@ class SessionProjector:
                     event["content"],
                     metadata,
                 )
-            if event["role"] == "assistant" and not already_projected:
+            if event["role"] == "assistant":
                 tool_iterations = event["metadata"].get("tool_iterations", 0)
                 if isinstance(tool_iterations, bool) or not isinstance(tool_iterations, int):
                     tool_iterations = 0
                 review = self._review(
                     session_id,
                     scope,
+                    event_key=event["event_id"],
                     tool_iterations=max(0, tool_iterations),
                 )
         else:
-            review = self._review(session_id, scope, force=True)
+            review = self._review(
+                session_id,
+                scope,
+                event_key=event["event_id"],
+                force=True,
+            )
         return {
             "event_id": event["event_id"],
             "session_id": session_id,
