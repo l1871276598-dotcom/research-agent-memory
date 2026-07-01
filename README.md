@@ -1,28 +1,142 @@
-# Research Agent Memory
+# Local Agent Operating System (LAOS)
 
-本仓库是本地优先的个人科研 Agent 记忆库。GitHub 只保存代码、Schema、模板、测试和文档；Markdown 记忆、raw 原始证据和稳定文本副本保存在用户选择的数据目录；活动 SQLite、WAL/SHM、缓存和日志必须保存在本地 state 目录。
+本仓库是 **Local Agent Operating System（LAOS）** 的本地优先实现。它的目标不是只“记住”信息，而是把知识、项目、经验、规则和上下文统一到一个可持续演化的本地系统中，让 GPT、Codex、Claude、本地模型以及未来 Agent 能持续学习并复用过去成果。
 
-真实记忆、真实 ChatGPT ZIP、真实聊天记录、未发表资料、PDF、SQLite、日志、缓存、API key、密码、SSH 私钥和 token 不得提交到 GitHub。
+当前代码仍处于 **Memory Core 阶段**：已经具备本地结构化记忆、SQLite FTS5 检索、ChatGPT ZIP 手动导入、Trusted Memory Loop、人工审核闸门和 Context Pack 输出能力。完整 LAOS 的 Orchestrator Agent、Agent Registry、Link Understanding Agent、Rule / Reflection / Evolution Agent 等仍属于后续路线图。
+
+真实记忆、真实 ChatGPT ZIP、真实聊天记录、未发表资料、PDF、SQLite、日志、缓存、API key、密码、SSH 私钥和 token 不得提交到 GitHub。GitHub 只保存代码、Schema、模板、测试和文档；Markdown 记忆、raw 原始证据和稳定文本副本保存在用户选择的数据目录；活动 SQLite、WAL/SHM、缓存和日志必须保存在本地 state 目录。
+
+## 核心定位
+
+LAOS 的最高目标是构建 **Agent 的本地学习层**：
+
+```text
+输入资料 / 任务结果
+→ 结构化沉淀
+→ 候选记忆
+→ 质量检查
+→ 人工审核
+→ 长期记忆更新
+→ Context Pack 编译
+→ Agent 调用复用
+→ 任务结果反哺
+```
+
+它不是普通 memory database，也不是单一 Agent 框架，而是一个以本地记忆为核心资源、以可插拔 Agent 为能力单元、以审核机制为安全边界的本地 Agent 操作系统。
+
+## 最高架构公约
+
+1. **Memory Core 是唯一可信知识源**：长期知识、项目状态、经验和规则必须通过标准接口进入 Memory Core。
+2. **所有长期记忆更新必须经过 Review Gate**：任何 Agent 都不能绕过人工审核直接写入 active memory。
+3. **所有能力优先以 Agent 形式存在**：新增需求优先新增或替换 Agent，而不是重构核心系统。
+4. **Orchestrator 只调度，不承载业务逻辑**：总控 Agent 负责理解需求、选择 Agent、组装 Context Pack 和收集结果。
+5. **Context Pack 必须最小化**：按任务、项目、可信度、时间有效性和保密等级筛选，不全量灌入上下文。
+6. **restricted 内容永不导出**：搜索、Context Pack 和外部 Agent 调用默认排除 restricted。
+7. **外部系统通过 Adapter 接入**：文献、网页、GitHub、Gmail、Zotero/EndNote 等不内置进 Memory Core。
+
+## 目标架构
+
+```text
+User
+  │
+  ▼
+Orchestrator Agent
+  │
+  ▼
+Agent Registry
+  │
+  ├── Import Agent
+  ├── Memory Agent
+  ├── Project Agent
+  ├── Rule Agent
+  ├── Reflection Agent
+  ├── Context Agent
+  ├── Search Agent
+  ├── Review Agent
+  ├── Quality Agent
+  ├── Link Understanding Agent
+  ├── Code / Codex Bridge Agent
+  ├── External Adapter Agent
+  └── Evolution Agent
+```
+
+### Orchestrator Agent
+
+唯一总控和 Router。负责理解需求、判断任务类型、读取相关记忆、选择合适 Agent / Skill、组装最小 Context Pack、收集执行结果，并把结果转成候选记忆或反思候选。
+
+### Agent Registry
+
+所有 Agent 的注册中心。未来新增需求时，优先注册一个新 Agent，而不是修改 Orchestrator 或重构核心。
+
+### Memory Agent
+
+维护长期记忆生命周期：
+
+```text
+raw evidence
+→ candidate
+→ active knowledge / experience / rule / project state
+→ deprecated / conflict / archived
+```
+
+### Import Agent
+
+负责导入 ChatGPT ZIP、手动文件、本地文件夹和未来外部来源。导入只生成 raw evidence 或候选，不直接激活长期记忆。
+
+### Link Understanding Agent
+
+负责把 GitHub、网页、帖子、论文、PDF、YouTube、Notion、Google Docs 等链接转换为任何模型都能读取的标准 Markdown / JSON 上下文。Hermes、Browser、Firecrawl、Jina Reader、Playwright 等都只是它的 provider。
+
+### Project Agent
+
+维护每个项目的持续状态、阶段、TODO、风险、决策和下一步，使项目成为可持续演化对象。
+
+### Rule Agent
+
+从成功、失败、修正和反思中提炼可复用规则。规则必须先成为 rule candidate，再经 Review Gate 审核后进入长期记忆。
+
+### Reflection Agent
+
+从任务执行结果中生成 reflection candidate，例如失败原因、复用经验、下次避免方式和可晋升规则。
+
+### Context Agent
+
+根据任务动态编译最小 Context Pack，供 GPT、Codex、Claude、本地模型或其他 Agent 使用。
+
+### Search Agent
+
+隐藏底层检索实现。当前为 SQLite FTS5 lexical search，未来可扩展 tag、knowledge graph、embedding 和 hybrid search。
+
+### Review Agent
+
+所有长期记忆更新的安全闸门。负责 candidate 的 accept、reject、merge、support、supersede、conflict 等审核动作。
+
+### Quality Agent
+
+负责去重、冲突检测、来源校验、敏感性继承、可信度检查和状态流转检查。
+
+### Code / Codex Bridge Agent
+
+未来统一连接 Codex、Claude Code、Cursor、OpenHands 等代码执行或审查工具。
+
+### External Adapter Agent
+
+外部工具接入层。文献系统不作为内置主线，只保留 external adapter，例如未来需要时接 Zotero、EndNote、本地论文库或其他资料源。
+
+### Evolution Agent
+
+观察整个 LAOS 的使用情况，发现重复工作、低质量规则、无人调用的 Agent、架构漂移和可优化点，只提出 evolution candidate，不直接修改系统。
 
 ## 当前版本状态
 
-- 当前软件版本：v0.8.0 开发分支（发布审计中）
+- 当前软件版本：v0.8.0
 - SQLite schema：v3
 - 默认检索模式：lexical
 - 主要支持平台：macOS
 - 支持的 Python：3.11 或更高版本
+- 当前不需要 Codex CLI、语义模型、云 API 或付费 API
 
-## 环境要求
-
-- Python 3.11+
-- 标准库 `sqlite3` 必须启用 FTS5
-- macOS 是主要使用平台；CI 使用 Ubuntu + Python 3.11
-- 当前代码不调用 `pdftotext` 或 `textutil`
-- 当前代码不需要 Codex CLI、语义模型、云 API 或付费 API
-
-没有文本提取器时，`import-manual` 对 PDF/DOCX 只归档 raw 原始文件，报告 `archived_without_text: 1`，不会生成 text sidecar，也不会进入全文索引。要索引 PDF/DOCX 内容，需要先用外部工具生成 Markdown/TXT，再导入该文本文件。
-
-## 当前能力
+## 当前已实现能力
 
 - 初始化本地数据目录
 - 添加、验证和导出结构化 Markdown 记忆
@@ -42,23 +156,42 @@
 
 ## 尚未实现能力
 
+- Agent Registry
+- Orchestrator Agent / Router
+- 可插拔 Agent 目录结构
+- 自动更新 Loop：watch/import → detect → candidate → quality gate → review → apply → reindex → refresh context pack
 - 新导入对话自动批量生成候选记忆
 - ChatGPT 附件导入
 - PDF/DOCX 深度结构化解析
-- 内置文献管理、文献矩阵自动填充和 Zotero / EndNote 同步已移出 v0.8 路线；后续如有需要，仅通过外部接口集成
+- Link Understanding Agent / Hermes provider
+- Rule Agent
+- Reflection Agent
+- Evolution Agent
+- Code / Codex Bridge Agent
+- owner/agent 身份认证与多 Agent 授权
+- 内置文献管理、文献矩阵自动填充和 Zotero / EndNote 同步已移出路线；后续如有需要，仅通过外部接口或 Adapter 集成
 - 真实本地向量 embedding
 - 真实语义相似度检索
 - 真实 lexical + semantic 混合排序
 - MCP 接口
-- owner/agent 身份认证与多 Agent 授权
-- 自动语义冲突合并
-- 向量数据库、GUI 和大型 coordinator / 总控 Agent
 
 候选审核生命周期已经实现；自动候选生成调度尚未实现。
 
-## 目录布局
+## 不作为内置主线的能力
 
-`init` 会创建以下数据目录和文件：
+以下能力不进入 Memory Core 主线，未来需要时通过 External Adapter Agent 接入：
+
+- 文献矩阵自动填充
+- Zotero / EndNote 同步
+- 内置 PDF/DOCX 深度文献系统
+- GUI
+- 大型分布式多 Agent 自主协商系统
+- 云数据库
+- 常驻后台监听服务
+
+## 当前数据目录布局
+
+`init` 当前仍会创建以下数据目录和文件：
 
 ```text
 ResearchAgent/
@@ -95,7 +228,7 @@ ResearchAgent/
 └── backups/
 ```
 
-`literature/` 目录仅为旧版本数据结构兼容。v0.8 不继续建设内置文献管理、PDF 文献库、文献矩阵或 Zotero/EndNote 同步；未来需要文献能力时，只保留外部接口或适配器。
+`literature/` 是旧版本兼容和历史残留目录，不再作为内置文献系统主线。未来应迁移为 External Adapter 输出目录，并可在后续版本中进一步移除或降级。
 
 本地 state 目录至少包含：
 
@@ -141,24 +274,9 @@ python3 src/memory.py add \
 
 ```bash
 python3 src/memory.py validate --root "$DATA_ROOT"
-```
-
-```bash
-python3 src/memory.py index \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR"
-```
-
-```bash
-python3 src/memory.py search "代码最少" \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR"
-```
-
-```bash
-python3 src/memory.py doctor \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR"
+python3 src/memory.py index --root "$DATA_ROOT" --state-dir "$STATE_DIR"
+python3 src/memory.py search "代码最少" --root "$DATA_ROOT" --state-dir "$STATE_DIR"
+python3 src/memory.py doctor --root "$DATA_ROOT" --state-dir "$STATE_DIR"
 ```
 
 ## LAOS JSON CLI
@@ -254,24 +372,13 @@ python3 src/memory.py search "RMRE" \
   --json
 ```
 
-JSON 输出形如：
-
-```json
-{
-  "requested_mode": "lexical",
-  "effective_mode": "lexical",
-  "warnings": [],
-  "results": []
-}
-```
-
 当前索引源：
 
 - `imports/chatgpt/conversations/`
 - `imports/manual/text/`
 - `imports/manual/raw/`，仅当没有对应 text sidecar 且 raw 是 UTF-8 可读文本
-- `literature/notes/`，仅保留旧版本兼容
-- `literature/journals/`，仅保留旧版本兼容
+- `literature/notes/`，仅保留旧版本兼容，后续迁移为 external adapter 输出
+- `literature/journals/`，仅保留旧版本兼容，后续迁移为 external adapter 输出
 - `manuscripts/current/`
 - `manuscripts/evidence/`
 - `manuscripts/archive/`
@@ -340,17 +447,6 @@ text sidecar front matter 包含 `source_path`、`source_sha256`、`original_nam
 
 PDF/DOCX 或无法 UTF-8 解码的文件只写 raw 和导入报告，报告 `archived_without_text: 1`，不写 text sidecar，不进入全文索引。
 
-## Doctor
-
-```bash
-python3 src/memory.py doctor \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR" \
-  --json
-```
-
-`doctor` 检查数据根、SQLite schema、WAL、memory/document 索引新鲜度、哈希不一致、manual raw/text 孤立文件和旧网络残留标记。
-
 ## Memory Agent 编排接口
 
 `memory_agent.py` 是现有检索、路径安全和候选审核能力之上的薄编排层。`prepare` 在任务执行前返回有字符上限的相关上下文；`finalize` 在任务完成后生成待审核候选，不调用外部模型，也不会自动 accept 或 apply。
@@ -363,8 +459,6 @@ python3 src/memory_agent.py prepare \
   --project pdc \
   --max-chars 8000
 ```
-
-成功输出是单个 JSON 对象，包含 `operation: "prepare"`、`context`、`context_chars`、`max_chars`、真实召回来源 `sources` 和 `warnings`。`context_chars` 始终等于 Python `len(context)`，且不超过 `max_chars`。
 
 ```bash
 python3 src/memory_agent.py finalize \
@@ -419,8 +513,6 @@ apply
 → accept / reject
 ```
 
-当前 `memory_distill.py` 不提供 `prepare`、`run`、`purge` 或 `status` 子命令。
-
 ```bash
 python3 src/memory_distill.py apply \
   --root "$DATA_ROOT" \
@@ -435,15 +527,11 @@ python3 src/memory_distill.py apply \
 ```
 
 ```bash
-python3 src/memory_distill.py review \
-  --root "$DATA_ROOT" \
-  --json
+python3 src/memory_distill.py review --root "$DATA_ROOT" --json
 ```
 
 ```bash
-python3 src/memory_distill.py accept \
-  --root "$DATA_ROOT" \
-  --id CANDIDATE_ID
+python3 src/memory_distill.py accept --root "$DATA_ROOT" --id CANDIDATE_ID
 ```
 
 ```bash
@@ -487,24 +575,7 @@ ChatGPT ZIP / manual import
 
 raw 原始证据不会被 `index`、`db-rebuild`、`accept` 或 `reject` 删除。当前没有 recent purge 命令、删除宽限期命令或自动 recent 生命周期管理。
 
-## 项目治理
-
-```bash
-python3 src/memory.py document-meta set \
-  --root "$DATA_ROOT" \
-  --path imports/manual/text/2026/06/note.md \
-  --project pdc \
-  --workspace personal \
-  --confidentiality personal
-```
-
-```bash
-python3 src/memory.py document-meta unset \
-  --root "$DATA_ROOT" \
-  --path imports/manual/text/2026/06/note.md
-```
-
-`document-meta` 使用相对 `DATA_ROOT` 的 `--path`。路径必须属于真实索引源，不能逃逸到 data root 外部。
+## Project 状态
 
 ```bash
 python3 src/memory.py project-status \
@@ -538,21 +609,6 @@ python3 src/memory.py context \
 
 生成前会检查 SQLite 索引是否过期；过期时拒绝生成，提示先运行 `index`。
 
-## 检索评测
-
-评测模板在 `templates/retrieval_eval.json`。真实评测数据应放在用户数据目录，不提交仓库。
-
-```bash
-python3 src/memory.py evaluate-search \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR" \
-  --cases "$DATA_ROOT/evaluation/retrieval_cases.json" \
-  --mode lexical \
-  --json
-```
-
-输出包含 `requested_mode`、`effective_mode`、`warnings`、Top-1/Top-5、泄漏率和延迟统计。
-
 ## Semantic / Hybrid 能力边界
 
 已实现：
@@ -571,40 +627,6 @@ python3 src/memory.py evaluate-search \
 - cosine similarity
 - semantic 排序
 - lexical + semantic 混合 RRF
-
-示例：
-
-```bash
-python3 src/memory.py search "PDC" \
-  --root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR" \
-  --mode hybrid
-```
-
-文本输出会显示：
-
-```text
-Requested mode: hybrid
-Effective mode: lexical
-Warning: hybrid search unavailable; falling back to lexical
-```
-
-## 情景迁移
-
-```bash
-python3 src/memory.py context-transition \
-  --root "$DATA_ROOT" \
-  --from-context university-student \
-  --to-context industry-engineer \
-  --to-title "企业研发阶段" \
-  --workspace work \
-  --confidentiality internal \
-  --effective-date 2027-07-01 \
-  --reason "从学校科研阶段进入企业研发阶段" \
-  --dry-run
-```
-
-`context-transition` 只创建一条 transition candidate，不直接修改旧 context 或创建 active 新 context。accept 重新验证旧记录状态和 hash 后，在同一文件事务中将旧记录转为 `deprecated`、创建 active 新记录、归档 accepted transition，并维护 `supersedes` / `superseded_by`；随后才 reindex 和 verify。
 
 ## 保密规则
 
