@@ -1,3 +1,4 @@
+import argparse
 import json
 import re
 import sys
@@ -10,7 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.learning_loop import LearningLoop
-from src.memory import init_store
+from src.memory import db_init, index_store, init_store
 from src.memory.candidate import CandidateStore
 from src.memory.store import MemoryStore
 from src.review.gate import ReviewGate
@@ -91,6 +92,14 @@ class LearningLoopTests(unittest.TestCase):
         self.state = tempfile.TemporaryDirectory()
         self.work = tempfile.TemporaryDirectory()
         init_store(self.data.name)
+        db_init(argparse.Namespace(root=self.data.name, state_dir=self.state.name))
+        index_store(
+            argparse.Namespace(
+                root=self.data.name,
+                state_dir=self.state.name,
+                dry_run=False,
+            )
+        )
         Path(self.work.name, "module_one.py").write_text(
             "def save(key, value):\n    return value\n",
             encoding="utf-8",
