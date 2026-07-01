@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -49,7 +50,7 @@ class McpCheckpointTrialTests(unittest.TestCase):
             assistant_response="Answer",
         )
 
-    def test_prepare_initializes_store_and_writes_manifest(self):
+    def test_prepare_initializes_store_and_writes_remote_manifest(self):
         with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as state:
             result = TRIAL.prepare_trial(
                 data,
@@ -57,6 +58,8 @@ class McpCheckpointTrialTests(unittest.TestCase):
                 workspace="personal",
                 expected_checkpoints=5,
                 project="validation",
+                port=9001,
+                mcp_path="/checkpoint/",
             )
             manifest = TRIAL.load_manifest(state)
 
@@ -65,8 +68,47 @@ class McpCheckpointTrialTests(unittest.TestCase):
             self.assertEqual(manifest["project"], "validation")
             self.assertFalse(manifest["model_review_enabled"])
             self.assertIsNone(manifest["classification"])
+            self.assertEqual(manifest["transport"], "streamable-http")
+            self.assertEqual(manifest["host"], "127.0.0.1")
+            self.assertEqual(manifest["port"], 9001)
+            self.assertEqual(manifest["mcp_path"], "/checkpoint")
+            self.assertEqual(
+                manifest["local_mcp_url"],
+                "http://127.0.0.1:9001/checkpoint",
+            )
+            self.assertTrue(manifest["requires_remote_tunnel"])
+            self.assertEqual(result["local_mcp_url"], manifest["local_mcp_url"])
+            self.assertIn("Secure MCP Tunnel", result["connection_requirement"])
             self.assertIn("laos_capture_checkpoint exactly once", result["chatgpt_instruction"])
             self.assertIn("mcp_checkpoint_trial.py serve", result["next_command"])
+
+    def test_serve_uses_streamable_http_manifest_settings(self):
+        with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as state:
+            TRIAL.prepare_trial(
+                data,
+                state,
+                workspace="personal",
+                port=9012,
+                mcp_path="/mcp-test",
+            )
+
+            class FakeServe:
+                def __init__(self):
+                    self.argv = None
+
+                def main(self, argv):
+                    self.argv = argv
+                    return 0
+
+            fake = FakeServe()
+            with mock.patch.object(TRIAL, "_load_tool", return_value=fake):
+                self.assertEqual(TRIAL.serve_trial(state), 0)
+
+            self.assertIn("--transport", fake.argv)
+            self.assertEqual(fake.argv[fake.argv.index("--transport") + 1], "streamable-http")
+            self.assertEqual(fake.argv[fake.argv.index("--host") + 1], "127.0.0.1")
+            self.assertEqual(fake.argv[fake.argv.index("--port") + 1], "9012")
+            self.assertEqual(fake.argv[fake.argv.index("--mcp-path") + 1], "/mcp-test")
 
     def test_report_never_claims_passive_or_lossless_capture(self):
         with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as state:
@@ -77,6 +119,8 @@ class McpCheckpointTrialTests(unittest.TestCase):
             self.assertEqual(result["classification"], "explicit_checkpoint_candidate")
             self.assertTrue(report["checkpoint_capture_ready"])
             self.assertFalse(report["lossless_conversation_capture_proven"])
+            self.assertTrue(result["requires_remote_tunnel"])
+            self.assertEqual(result["local_mcp_url"], "http://127.0.0.1:8766/mcp")
             self.assertTrue(result["empirical_decision_pending"])
             self.assertIsNone(
                 result["required_manual_evidence"]["tool_called_every_expected_turn"]
@@ -164,7 +208,7 @@ class McpCheckpointTrialTests(unittest.TestCase):
                 "insufficient_automated_evidence",
             )
 
-    def test_prepare_rejects_invalid_expected_count(self):
+    def test_prepare_rejects_invalid_values(self):
         with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as state:
             with self.assertRaisesRegex(ValueError, "positive integer"):
                 TRIAL.prepare_trial(
@@ -172,6 +216,20 @@ class McpCheckpointTrialTests(unittest.TestCase):
                     state,
                     workspace="personal",
                     expected_checkpoints=0,
+                )
+            with self.assertRaisesRegex(ValueError, "between 1 and 65535"):
+                TRIAL.prepare_trial(
+                    data,
+                    state,
+                    workspace="personal",
+                    port=70000,
+                )
+            with self.assertRaisesRegex(ValueError, "start with /"):
+                TRIAL.prepare_trial(
+                    data,
+                    state,
+                    workspace="personal",
+                    mcp_path="mcp",
                 )
 
 
