@@ -12,6 +12,18 @@ from .projector import BridgeScopeResolver, SessionProjector
 from .service import BridgeIngestService, BridgePipeline
 
 
+def _scope_mappings(values):
+    output = {}
+    for key, value in dict(values or {}).items():
+        if isinstance(key, str) and ":" in key:
+            source, account_id = key.split(":", 1)
+            if source.strip() and account_id.strip():
+                output[(source.strip().lower(), account_id.strip())] = value
+                continue
+        output[key] = value
+    return output
+
+
 def build_bridge_pipeline(
     data_root,
     state_dir,
@@ -49,7 +61,7 @@ def build_bridge_pipeline(
             memory_interval=memory_interval,
             skill_interval=skill_interval,
         )
-    resolver = BridgeScopeResolver(scope_mappings, default_scope)
+    resolver = BridgeScopeResolver(_scope_mappings(scope_mappings), default_scope)
     projector = SessionProjector(
         inbox,
         sessions,
