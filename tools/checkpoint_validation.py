@@ -6,6 +6,7 @@ import argparse
 import json
 import sqlite3
 from collections import defaultdict
+from contextlib import closing
 from pathlib import Path
 
 
@@ -20,7 +21,7 @@ def build_report(state_dir, expected_checkpoints=None):
     ):
         raise ValueError("expected_checkpoints must be a positive integer")
 
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """
