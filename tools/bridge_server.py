@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -82,6 +83,14 @@ def handler_factory(pipeline, token, max_payload_bytes):
             if self.path != "/events":
                 self._write(404, {"error": "not_found"})
                 return
+            supplied = self.headers.get("X-LAOS-Bridge-Token", "")
+            if not isinstance(supplied, str) or not hmac.compare_digest(supplied, token):
+                self._write(401, {"error": "unauthorized"})
+                return
+            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                self._write(415, {"error": "application_json_required"})
+                return
             try:
                 length = int(self.headers.get("Content-Length", "-1"))
             except ValueError:
@@ -92,7 +101,6 @@ def handler_factory(pipeline, token, max_payload_bytes):
             if length > max_payload_bytes:
                 self._write(413, {"error": "payload_too_large"})
                 return
-            supplied = self.headers.get("X-LAOS-Bridge-Token", "")
             payload = self.rfile.read(length)
             try:
                 result = pipeline.ingest(payload, token=supplied)
