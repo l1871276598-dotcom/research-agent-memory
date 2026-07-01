@@ -37,7 +37,12 @@ class ReviewStateStore:
             )
             connection.commit()
 
-    def advance(self, session_id: str, tool_iterations: int = 0) -> dict:
+    def advance(
+        self,
+        session_id: str,
+        tool_iterations: int = 0,
+        turn_increment: int = 1,
+    ) -> dict:
         session_id = _session_id(session_id)
         if (
             isinstance(tool_iterations, bool)
@@ -45,18 +50,24 @@ class ReviewStateStore:
             or tool_iterations < 0
         ):
             raise ValueError("tool_iterations must be a non-negative integer")
+        if (
+            isinstance(turn_increment, bool)
+            or not isinstance(turn_increment, int)
+            or turn_increment not in {0, 1}
+        ):
+            raise ValueError("turn_increment must be zero or one")
         now = _timestamp()
         with closing(sqlite3.connect(self.path)) as connection:
             connection.execute(
                 """
                 INSERT INTO review_state(session_id, turns, tool_iterations, updated_at)
-                VALUES (?, 1, ?, ?)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
-                    turns = turns + 1,
+                    turns = turns + excluded.turns,
                     tool_iterations = tool_iterations + excluded.tool_iterations,
                     updated_at = excluded.updated_at
                 """,
-                (session_id, tool_iterations, now),
+                (session_id, turn_increment, tool_iterations, now),
             )
             connection.commit()
         return self.get(session_id)
