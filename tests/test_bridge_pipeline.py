@@ -12,7 +12,6 @@ if str(SRC) not in sys.path:
 from bridge import (
     BridgeEventInbox,
     BridgeIngestService,
-    BridgePipeline,
     BridgeScopeResolver,
     SessionProjector,
     build_bridge_pipeline,
@@ -23,6 +22,8 @@ from sessions import SessionStore
 
 
 TOKEN = "bridge-test-token-123456789"
+DEFAULT_SCOPE = {"workspace": "personal", "confidentiality": "personal"}
+ALLOWED_SOURCES = {"chatgpt-web"}
 
 
 def event(
@@ -134,7 +135,7 @@ class BridgeInboxTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "identity already exists"):
                 inbox.ingest(duplicate_identity)
 
-    def test_parent_is_projected_before_child_even_when_child_arrives_first(self):
+    def test_child_waits_for_parent_even_when_parent_has_not_arrived(self):
         with tempfile.TemporaryDirectory() as state:
             inbox = BridgeEventInbox(state)
             inbox.ingest(
@@ -146,8 +147,9 @@ class BridgeInboxTests(unittest.TestCase):
                     parent="user-message",
                 )
             )
-            inbox.ingest(event("user-event", "user-message", "user", "question"))
+            self.assertIsNone(inbox.claim_next())
 
+            inbox.ingest(event("user-event", "user-message", "user", "question"))
             first = inbox.claim_next()
             self.assertEqual(first["event_id"], "user-event")
             inbox.mark_processed(first["event_id"])
@@ -157,10 +159,12 @@ class BridgeInboxTests(unittest.TestCase):
     def test_ingestion_requires_token_source_allowlist_and_bounded_json(self):
         with tempfile.TemporaryDirectory() as state:
             inbox = BridgeEventInbox(state)
+            with self.assertRaisesRegex(ValueError, "allowed_sources"):
+                BridgeIngestService(inbox, token=TOKEN, allowed_sources=set())
             service = BridgeIngestService(
                 inbox,
                 token=TOKEN,
-                allowed_sources={"chatgpt-web"},
+                allowed_sources=ALLOWED_SOURCES,
                 max_payload_bytes=5000,
             )
             payload = json.dumps(event("one", "one", "user", "hello"))
@@ -228,7 +232,12 @@ class SessionProjectorTests(unittest.TestCase):
             inbox = BridgeEventInbox(state)
             sessions = SessionStore(state)
             coordinator = RecordingCoordinator()
-            projector = SessionProjector(inbox, sessions, coordinator=coordinator)
+            projector = SessionProjector(
+                inbox,
+                sessions,
+                coordinator=coordinator,
+                scope_resolver=BridgeScopeResolver(default=DEFAULT_SCOPE),
+            )
             inbox.ingest(event("assistant", "a1", "assistant", "answer"))
 
             claimed = inbox.claim_next()
@@ -242,6 +251,23 @@ class SessionProjectorTests(unittest.TestCase):
             session = sessions.get(replayed[0]["session_id"])
             self.assertEqual(len(session["messages"]), 1)
             self.assertEqual(len(coordinator.calls), 1)
+
+    def test_unmapped_account_fails_without_creating_a_session(self):
+        with tempfile.TemporaryDirectory() as state:
+            inbox = BridgeEventInbox(state)
+            sessions = SessionStore(state)
+            projector = SessionProjector(
+                inbox,
+                sessions,
+                scope_resolver=BridgeScopeResolver(
+                    {"different-account": DEFAULT_SCOPE}
+                ),
+            )
+            inbox.ingest(event("user", "u1", "user", "private"))
+            result = projector.drain()[0]
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("not mapped", result["error"])
+            self.assertEqual(sessions.list(), [])
 
     def test_restricted_scope_saves_locally_but_review_policy_is_preserved(self):
         with tempfile.TemporaryDirectory() as state:
@@ -268,7 +294,13 @@ class BridgeEndToEndTests(unittest.TestCase):
     def test_capture_works_without_any_model_backend(self):
         with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as state:
             init_store(data)
-            pipeline = build_bridge_pipeline(data, state, token=TOKEN)
+            pipeline = build_bridge_pipeline(
+                data,
+                state,
+                token=TOKEN,
+                allowed_sources=ALLOWED_SOURCES,
+                default_scope=DEFAULT_SCOPE,
+            )
             user = pipeline.ingest(json.dumps(event("u", "u", "user", "hello")), token=TOKEN)
             assistant = pipeline.ingest(
                 json.dumps(event("a", "a", "assistant", "reply", parent="u")),
@@ -287,6 +319,8 @@ class BridgeEndToEndTests(unittest.TestCase):
                 state,
                 token=TOKEN,
                 model_backend=backend,
+                allowed_sources=ALLOWED_SOURCES,
+                default_scope=DEFAULT_SCOPE,
                 memory_interval=1,
                 skill_interval=10,
             )
