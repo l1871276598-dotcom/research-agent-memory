@@ -4,6 +4,8 @@
     {"id": "memory_agent", "class": "MemoryAgent", "handles": ["memory.create"]},
     {"id": "search_agent", "class": "SearchAgent", "handles": ["memory.search"]},
     {"id": "review_agent", "class": "ReviewAgent", "handles": ["memory.review"]},
-    {"id": "context_agent", "class": "ContextAgent", "handles": ["context.build"]}
+    {"id": "context_agent", "class": "ContextAgent", "handles": ["context.build"]},
+    {"id": "conversation_review_agent", "class": "ConversationReviewAgent", "handles": ["reflection.prepare", "reflection.apply"]},
+    {"id": "reflection_record_agent", "class": "ReflectionRecordAgent", "handles": ["reflection.record"]}
   ]
 }
