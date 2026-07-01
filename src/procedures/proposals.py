@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 ACTIONS = {"create", "update", "add_reference", "add_template", "add_script"}
-STATUSES = {"candidate", "accepted", "rejected", "applied"}
+STATUSES = {"candidate", "accepted", "rejected", "applied", "rolled_back"}
 _SHA256 = re.compile(r"[0-9a-fA-F]{64}")
 
 
@@ -139,14 +139,22 @@ class ProcedureProposalStore:
             connection.commit()
         return self.get(proposal_id)
 
-    def mark_applied(self, proposal_id):
+    def transition(self, proposal_id, expected, status):
+        if status not in {"applied", "rolled_back"}:
+            raise ValueError("invalid proposal transition")
         current = self.get(proposal_id)
-        if current["status"] != "accepted":
-            raise ValueError("only accepted proposals can be applied")
+        if current["status"] != expected:
+            raise ValueError(f"proposal must be {expected}")
         with closing(sqlite3.connect(self.path)) as connection:
             connection.execute(
                 "UPDATE proposals SET status=? WHERE id=?",
-                ("applied", proposal_id),
+                (status, proposal_id),
             )
             connection.commit()
         return self.get(proposal_id)
+
+    def mark_applied(self, proposal_id):
+        return self.transition(proposal_id, "accepted", "applied")
+
+    def mark_rolled_back(self, proposal_id):
+        return self.transition(proposal_id, "applied", "rolled_back")
