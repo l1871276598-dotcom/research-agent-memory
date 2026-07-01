@@ -1,12 +1,25 @@
 class LaosToolFacade:
-    def __init__(self, application, sessions=None, procedures=None, manager=None):
+    def __init__(
+        self,
+        application,
+        sessions=None,
+        procedures=None,
+        manager=None,
+        checkpoint_capture=None,
+    ):
         self.application = application
         self.sessions = sessions
         self.procedures = procedures
         self.manager = manager
+        self.checkpoint_capture = checkpoint_capture
 
     def run_task(self, task):
         return self.application.run(task)
+
+    def capture_checkpoint(self, **values):
+        if self.checkpoint_capture is None:
+            raise RuntimeError("MCP checkpoint capture is unavailable")
+        return self.checkpoint_capture.capture(**values)
 
     def session_list(self, workspace=None, project=None, limit=50):
         if self.sessions is None:
