@@ -5,13 +5,17 @@ from pathlib import Path
 
 import memory_tools
 from agents.orchestrator import ContextAgent, ImportAgent, MemoryAgent, ReviewAgent, SearchAgent
+from agents.reflection import ConversationReviewAgent
+from agents.reflection_record import ReflectionRecordAgent
 from agents.registry import AgentRegistry
 from context.builder import ContextBuilder
 from memory.candidate import CandidateStore
 from memory.core import MemoryCore
 from memory.store import MemoryStore
 from orchestrator import Orchestrator
+from reflection import ConversationReviewCoordinator, ConversationReviewService, ReviewStateStore
 from review.gate import ReviewGate
+from runtime.codex import CodexConversationReviewer
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -23,6 +27,11 @@ def build_application(root, state_dir=None):
     store = MemoryStore(root)
     candidates = CandidateStore(root, state_dir)
     core = MemoryCore(store, candidates)
+    review_service = ConversationReviewService(core, CodexConversationReviewer())
+    review_coordinator = ConversationReviewCoordinator(
+        review_service,
+        ReviewStateStore(candidates.state_dir),
+    )
     agents = [
         ImportAgent(root, memory_tools),
         MemoryAgent(core),
@@ -32,6 +41,8 @@ def build_application(root, state_dir=None):
             default_workspace="personal",
         ),
         ContextAgent(ContextBuilder(store)),
+        ConversationReviewAgent(review_service),
+        ReflectionRecordAgent(review_coordinator),
     ]
     config = Path(__file__).with_name("agents") / "registry.yaml"
     return Orchestrator(AgentRegistry.from_config(config, agents))
