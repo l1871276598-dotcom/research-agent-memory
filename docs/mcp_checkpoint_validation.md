@@ -71,6 +71,21 @@ final displayed response, and whether the write-confirmation burden is
 acceptable. A passing automated report alone cannot promote MCP to a formal
 checkpoint channel.
 
+Record the empirical result and make the final bounded classification:
+
+```bash
+python3 tools/mcp_checkpoint_trial.py decide \
+  --state-dir "$STATE_DIR" \
+  --tool-called-every-turn yes \
+  --hashes-match yes \
+  --confirmation-burden-acceptable yes
+```
+
+The decision command accepts MCP only when the automated report and all three
+manual evidence checks pass. Its strongest possible classification is
+`formal_explicit_checkpoint_channel`. It always records that passive or
+lossless conversation capture has not been proven.
+
 ## Direct server command
 
 Checkpoint capture is disabled by default. It can also be enabled directly:
