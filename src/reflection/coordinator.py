@@ -11,6 +11,7 @@ class ConversationReviewCoordinator:
         service: Any,
         state: Any,
         *,
+        procedure_proposals: Any = None,
         memory_interval: int = 10,
         skill_interval: int = 10,
     ) -> None:
@@ -19,13 +20,38 @@ class ConversationReviewCoordinator:
         for name in ("advance", "complete", "fail"):
             if not callable(getattr(state, name, None)):
                 raise ValueError("review state store is invalid")
+        if procedure_proposals is not None and not callable(
+            getattr(procedure_proposals, "create", None)
+        ):
+            raise ValueError("procedure proposal store is invalid")
         for value in (memory_interval, skill_interval):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError("review intervals must be positive integers")
         self.service = service
         self.state = state
+        self.procedure_proposals = procedure_proposals
         self.memory_interval = memory_interval
         self.skill_interval = skill_interval
+
+    def _save_procedures(self, candidates, session_id):
+        if not candidates:
+            return []
+        if self.procedure_proposals is None:
+            return []
+        saved = []
+        for item in candidates:
+            value = dict(item)
+            content = value.get("content") or value.pop("change", None)
+            value["content"] = content
+            value.setdefault("action", "update")
+            value.setdefault("summary", str(content or "")[:160])
+            refs = list(value.get("source_refs") or [])
+            reference = f"session:{session_id}"
+            if reference not in refs:
+                refs.append(reference)
+            value["source_refs"] = refs
+            saved.append(self.procedure_proposals.create(value))
+        return saved
 
     def record_turn(
         self,
@@ -65,6 +91,10 @@ class ConversationReviewCoordinator:
                 review_memory=review_memory,
                 review_skills=review_skills,
                 routed=True,
+            )
+            result["procedure_proposals"] = self._save_procedures(
+                result.get("skill_candidates", []),
+                session_id,
             )
         except Exception as exc:
             failed = self.state.fail(session_id, str(exc))
