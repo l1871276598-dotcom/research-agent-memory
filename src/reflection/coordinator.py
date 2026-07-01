@@ -63,6 +63,7 @@ class ConversationReviewCoordinator:
         project: str | None = None,
         tool_iterations: int = 0,
         force: bool = False,
+        turn_increment: int = 1,
     ) -> dict:
         if confidentiality == "restricted":
             return {
@@ -71,7 +72,11 @@ class ConversationReviewCoordinator:
                 "session_id": session_id,
             }
 
-        counters = self.state.advance(session_id, tool_iterations)
+        counters = self.state.advance(
+            session_id,
+            tool_iterations,
+            turn_increment=turn_increment,
+        )
         review_memory = force or counters["turns"] >= self.memory_interval
         review_skills = force or counters["tool_iterations"] >= self.skill_interval
         if not review_memory and not review_skills:
