@@ -10,8 +10,13 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--state-dir", required=True)
+    parser.add_argument("--model-backend", default="codex")
     args = parser.parse_args(argv)
-    result = HealthCheck(args.data_root, args.state_dir).run()
+    result = HealthCheck(
+        args.data_root,
+        args.state_dir,
+        model_backend=args.model_backend,
+    ).run()
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return int(not result["healthy"])
 
