@@ -12,10 +12,10 @@ _ACCEPT_REQUESTS = frozenset(
 _REVIEW_AUTHORITY = object()
 
 
-def _default_backend():
-    package_root = __package__.split(".", 1)[0] if __package__ and "." in __package__ else None
-    module_name = f"{package_root}.memory_distill" if package_root else "memory_distill"
-    return importlib.import_module(module_name)
+def _canonical_backend_and_authority():
+    backend = importlib.import_module("memory_distill")
+    gate = importlib.import_module("review.gate")
+    return backend, gate._REVIEW_AUTHORITY
 
 
 class ReviewGate:
@@ -25,8 +25,9 @@ class ReviewGate:
         except TypeError as exc:
             raise ValueError("root must be a filesystem path") from exc
         self.state_dir = None if state_dir is None else Path(state_dir).expanduser()
+        canonical_backend, authority = _canonical_backend_and_authority()
         if backend is None:
-            backend = _default_backend()
+            backend = canonical_backend
         required = (
             "_accept_candidate_impl",
             "_candidate_record",
@@ -36,6 +37,7 @@ class ReviewGate:
         if any(not callable(getattr(backend, name, None)) for name in required):
             raise ValueError("review backend is invalid")
         self.backend = backend
+        self._authority = authority if backend is canonical_backend else _REVIEW_AUTHORITY
 
     def review(self, action, candidate_id, reason=None, workspace=None):
         if action not in REVIEW_ACTIONS:
@@ -60,7 +62,7 @@ class ReviewGate:
             if self.state_dir is not None:
                 fields["state_dir"] = str(self.state_dir)
             return self.backend._reject_candidate_impl(
-                argparse.Namespace(**fields), authority=_REVIEW_AUTHORITY
+                argparse.Namespace(**fields), authority=self._authority
             )
 
         self._require_state_dir()
@@ -71,7 +73,7 @@ class ReviewGate:
                 raise ValueError("candidate does not request conflict review")
             return self.backend._conflict_candidate_impl(
                 argparse.Namespace(root=str(self.root), state_dir=str(self.state_dir), id=candidate_id),
-                authority=_REVIEW_AUTHORITY,
+                authority=self._authority,
             )
         if action == "merge":
             if requested not in _MERGE_REQUESTS:
@@ -80,7 +82,7 @@ class ReviewGate:
             raise ValueError("candidate requires an explicit review action")
         return self.backend._accept_candidate_impl(
             argparse.Namespace(root=str(self.root), state_dir=str(self.state_dir), id=candidate_id),
-            authority=_REVIEW_AUTHORITY,
+            authority=self._authority,
         )
 
     def _require_state_dir(self):
