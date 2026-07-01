@@ -22,10 +22,18 @@ from reflection.conversation_review import (
 class FakeMemoryCore:
     def __init__(self):
         self.values = []
+        self.by_source_id = {}
 
     def create_candidate(self, values):
         self.values.append(dict(values))
-        return {"candidate_id": f"candidate-{len(self.values)}", "status": "candidate"}
+        result = {"candidate_id": f"candidate-{len(self.values)}", "status": "candidate"}
+        source_id = values.get("source_id")
+        if source_id:
+            self.by_source_id[source_id] = result
+        return result
+
+    def find_candidate_by_source_id(self, source_id):
+        return self.by_source_id.get(source_id)
 
 
 class ConversationReviewTests(unittest.TestCase):
@@ -145,6 +153,36 @@ class ConversationReviewTests(unittest.TestCase):
         self.assertEqual(stored["project"], "laos")
         self.assertNotIn("target_id", stored)
         self.assertEqual(stored["source_refs"], ["session:session-1"])
+
+    def test_review_id_reuses_existing_candidate_on_replay(self):
+        core = FakeMemoryCore()
+        service = ConversationReviewService(core)
+        response = {
+            "memory_candidates": [
+                {
+                    "type": "profile",
+                    "title": "Code preference",
+                    "scope": "global",
+                    "content": "The user prefers minimal code.",
+                }
+            ],
+            "skill_candidates": [],
+            "nothing_to_save": False,
+        }
+        options = {
+            "workspace": "personal",
+            "session_id": "session-1",
+            "review_id": "bridge-event-1",
+        }
+        first = service.apply(response, **options)
+        replay = service.apply(response, **options)
+
+        self.assertEqual(first["candidate_ids"], replay["candidate_ids"])
+        self.assertEqual(len(core.values), 1)
+        self.assertEqual(
+            core.values[0]["source_id"],
+            "review:bridge-event-1:memory:0",
+        )
 
     def test_reviewer_is_injected_and_agent_does_not_activate_memory(self):
         core = FakeMemoryCore()
