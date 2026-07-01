@@ -42,10 +42,25 @@ class Manager:
         return {"rolled_back": proposal_id}
 
 
+class CheckpointCapture:
+    def capture(self, **values):
+        return {"captured": values}
+
+
 class ToolFacadeTests(unittest.TestCase):
     def test_routes_to_native_services(self):
-        facade = LaosToolFacade(Application(), Sessions(), Proposals(), Manager())
+        facade = LaosToolFacade(
+            Application(),
+            Sessions(),
+            Proposals(),
+            Manager(),
+            CheckpointCapture(),
+        )
         self.assertEqual(facade.run_task({"type": "memory.search"})["task"]["type"], "memory.search")
+        self.assertEqual(
+            facade.capture_checkpoint(session_alias="one")["captured"]["session_alias"],
+            "one",
+        )
         self.assertEqual(facade.session_get("one")["id"], "one")
         self.assertEqual(facade.session_search("PDC")[0]["query"], "PDC")
         self.assertEqual(facade.procedure_list()[0]["status"], "candidate")
@@ -54,6 +69,8 @@ class ToolFacadeTests(unittest.TestCase):
 
     def test_missing_service_fails_closed(self):
         facade = LaosToolFacade(Application())
+        with self.assertRaises(RuntimeError):
+            facade.capture_checkpoint(session_alias="one")
         with self.assertRaises(RuntimeError):
             facade.session_get("one")
         with self.assertRaises(RuntimeError):
