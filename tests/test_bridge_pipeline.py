@@ -70,8 +70,14 @@ def checkpoint(event_id="checkpoint-one", branch="main"):
 class RecordingCoordinator:
     def __init__(self):
         self.calls = []
+        self.event_keys = set()
 
     def record_turn(self, **values):
+        event_key = values.get("event_key")
+        if event_key and event_key in self.event_keys:
+            return {"status": "not_due", "session_id": values["session_id"]}
+        if event_key:
+            self.event_keys.add(event_key)
         self.calls.append(values)
         return {
             "status": "reviewed" if values.get("force") else "not_due",
