@@ -35,7 +35,7 @@ def _token(args):
 def build_pipeline(args):
     model_config = _json(args.model_config)
     backend = build_model_backend(model_config) if model_config else None
-    scopes = _json(args.scope_config) or {}
+    scopes = _json(args.scope_config)
     allowed_sources = scopes.get("allowed_sources")
     mappings = scopes.get("mappings", {})
     default_scope = scopes.get("default")
@@ -129,7 +129,7 @@ def main(argv=None):
     parser.add_argument("--token-env", default="LAOS_BRIDGE_TOKEN")
     parser.add_argument("--token-file")
     parser.add_argument("--model-config")
-    parser.add_argument("--scope-config")
+    parser.add_argument("--scope-config", required=True)
     parser.add_argument("--memory-interval", type=int, default=10)
     parser.add_argument("--skill-interval", type=int, default=10)
     parser.add_argument("--max-payload-bytes", type=int, default=1_000_000)
