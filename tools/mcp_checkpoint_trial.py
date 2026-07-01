@@ -31,6 +31,13 @@ def _manifest_path(state_dir):
     return Path(state_dir).expanduser() / MANIFEST_NAME
 
 
+def _write_manifest(state_dir, manifest):
+    _manifest_path(state_dir).write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def prepare_trial(
     data_root,
     state_dir,
@@ -61,6 +68,7 @@ def prepare_trial(
         "trial_id": f"mcp-trial-{secrets.token_hex(6)}",
         "status": "prepared",
         "prepared_at": _stamp(),
+        "decided_at": None,
         "data_root": str(data_root),
         "state_dir": str(state_dir),
         "workspace": workspace,
@@ -70,11 +78,9 @@ def prepare_trial(
         "expected_checkpoints": expected_checkpoints,
         "model_review_enabled": False,
         "classification": None,
+        "manual_evidence": None,
     }
-    _manifest_path(state_dir).write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    _write_manifest(state_dir, manifest)
     return {
         "manifest": manifest,
         "manifest_path": str(_manifest_path(state_dir)),
@@ -136,12 +142,13 @@ def report_trial(state_dir):
         if report["checkpoint_capture_ready"]
         else "not_ready"
     )
-    output = {
+    return {
         "trial_id": manifest["trial_id"],
         "classification": classification,
         "automated_report": report,
-        "empirical_decision_pending": True,
-        "required_manual_evidence": {
+        "empirical_decision_pending": manifest.get("status") != "decided",
+        "required_manual_evidence": manifest.get("manual_evidence")
+        or {
             "tool_called_every_expected_turn": None,
             "assistant_hash_matches_final_display_every_turn": None,
             "write_confirmation_burden_acceptable": None,
@@ -152,7 +159,63 @@ def report_trial(state_dir):
             "passive or lossless transcript capture."
         ),
     }
-    return output
+
+
+def decide_trial(
+    state_dir,
+    *,
+    tool_called_every_expected_turn,
+    assistant_hash_matches_final_display_every_turn,
+    write_confirmation_burden_acceptable,
+):
+    evidence = {
+        "tool_called_every_expected_turn": bool(tool_called_every_expected_turn),
+        "assistant_hash_matches_final_display_every_turn": bool(
+            assistant_hash_matches_final_display_every_turn
+        ),
+        "write_confirmation_burden_acceptable": bool(
+            write_confirmation_burden_acceptable
+        ),
+    }
+    result = report_trial(state_dir)
+    automated_ready = result["automated_report"]["checkpoint_capture_ready"]
+    if automated_ready and all(evidence.values()):
+        classification = "formal_explicit_checkpoint_channel"
+        accepted = True
+    elif not automated_ready:
+        classification = "insufficient_automated_evidence"
+        accepted = False
+    else:
+        classification = "rejected_for_formal_checkpoint_channel"
+        accepted = False
+
+    manifest = load_manifest(state_dir)
+    manifest.update(
+        {
+            "status": "decided",
+            "decided_at": _stamp(),
+            "classification": classification,
+            "manual_evidence": evidence,
+        }
+    )
+    _write_manifest(state_dir, manifest)
+    return {
+        "trial_id": manifest["trial_id"],
+        "accepted": accepted,
+        "classification": classification,
+        "manual_evidence": evidence,
+        "automated_report": result["automated_report"],
+        "lossless_conversation_capture_proven": False,
+        "scope": (
+            "explicit checkpoint synchronization only"
+            if accepted
+            else "not approved as a formal checkpoint channel"
+        ),
+    }
+
+
+def _yes_no(value):
+    return value == "yes"
 
 
 def main(argv=None):
@@ -178,6 +241,16 @@ def main(argv=None):
     report = commands.add_parser("report")
     report.add_argument("--state-dir", required=True)
 
+    decide = commands.add_parser("decide")
+    decide.add_argument("--state-dir", required=True)
+    decide.add_argument("--tool-called-every-turn", choices=("yes", "no"), required=True)
+    decide.add_argument("--hashes-match", choices=("yes", "no"), required=True)
+    decide.add_argument(
+        "--confirmation-burden-acceptable",
+        choices=("yes", "no"),
+        required=True,
+    )
+
     args = parser.parse_args(argv)
     if args.command == "prepare":
         result = prepare_trial(
@@ -193,10 +266,21 @@ def main(argv=None):
         return 0
     if args.command == "serve":
         return serve_trial(args.state_dir)
+    if args.command == "report":
+        result = report_trial(args.state_dir)
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return int(not result["automated_report"]["checkpoint_capture_ready"])
 
-    result = report_trial(args.state_dir)
+    result = decide_trial(
+        args.state_dir,
+        tool_called_every_expected_turn=_yes_no(args.tool_called_every_turn),
+        assistant_hash_matches_final_display_every_turn=_yes_no(args.hashes_match),
+        write_confirmation_burden_acceptable=_yes_no(
+            args.confirmation_burden_acceptable
+        ),
+    )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-    return int(not result["automated_report"]["checkpoint_capture_ready"])
+    return int(not result["accepted"])
 
 
 if __name__ == "__main__":
