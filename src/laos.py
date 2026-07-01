@@ -44,7 +44,7 @@ def build_application(root, state_dir=None):
         ConversationReviewAgent(review_service),
         ReflectionRecordAgent(review_coordinator),
     ]
-    config = Path(__file__).with_name("agents") / "registry.yaml"
+    config = Path(__file__).with_name("agents") / "runtime_registry.yaml"
     return Orchestrator(AgentRegistry.from_config(config, agents))
 
 
