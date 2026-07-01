@@ -1,0 +1,80 @@
+name: Sync Hermes upstream
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Optional Hermes commit, tag, or branch
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Vendor upstream source
+        env:
+          HERMES_REF: ${{ inputs.ref }}
+        run: |
+          if [ -n "$HERMES_REF" ]; then
+            python3 tools/sync_hermes_vendor.py sync --ref "$HERMES_REF" | tee /tmp/hermes-sync.json
+          else
+            python3 tools/sync_hermes_vendor.py sync | tee /tmp/hermes-sync.json
+          fi
+          python3 tools/sync_hermes_vendor.py verify
+
+      - name: Pin synchronized commit
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          manifest_path = Path("config/hermes_vendor.json")
+          metadata_path = Path("vendor/hermes_agent/_UPSTREAM.json")
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+          manifest["pinned_ref"] = metadata["commit"]
+          manifest_path.write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Validate LAOS
+        run: |
+          python3 -m compileall -q src tools
+          python3 -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Open update pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA=$(python3 -c 'import json; print(json.load(open("vendor/hermes_agent/_UPSTREAM.json"))["commit"])')
+          BRANCH="hermes-upstream-${SHA:0:12}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add config/hermes_vendor.json vendor/hermes_agent
+          if git diff --cached --quiet; then
+            echo "Hermes vendor snapshot is already current."
+            exit 0
+          fi
+          git commit -m "sync Hermes upstream ${SHA:0:12}"
+          git push --force-with-lease origin "$BRANCH"
+          gh pr create \
+            --draft \
+            --base main \
+            --head "$BRANCH" \
+            --title "[vendor] sync Hermes upstream ${SHA:0:12}" \
+            --body "Vendored Hermes Agent source update. Runtime Cron, multi-provider configuration surfaces, and trajectory/training-data surfaces remain disabled by LAOS policy. Review generated source diff and compatibility checks before merging."
