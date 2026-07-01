@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 import uuid
 from contextlib import closing
@@ -8,6 +9,7 @@ from pathlib import Path
 
 ACTIONS = {"create", "update", "add_reference", "add_template", "add_script"}
 STATUSES = {"candidate", "accepted", "rejected", "applied"}
+_SHA256 = re.compile(r"[0-9a-fA-F]{64}")
 
 
 def _timestamp():
@@ -32,6 +34,7 @@ def validate_proposal(value):
         "source_refs",
         "category",
         "target_file",
+        "expected_sha256",
     }
     if not set(value) <= allowed:
         raise ValueError("procedure proposal has unsupported fields")
@@ -49,6 +52,11 @@ def validate_proposal(value):
     for field in ("reason", "category", "target_file"):
         if field in value and value[field] is not None:
             _text(value[field], field)
+    digest = value.get("expected_sha256")
+    if digest is not None and (
+        not isinstance(digest, str) or _SHA256.fullmatch(digest) is None
+    ):
+        raise ValueError("expected_sha256 must be a SHA256 digest")
     return value
 
 
@@ -82,12 +90,7 @@ class ProcedureProposalStore:
                 (proposal_id, "candidate", payload, now),
             )
             connection.commit()
-        return {
-            "proposal_id": proposal_id,
-            "status": "candidate",
-            "created_at": now,
-            "proposal": dict(value),
-        }
+        return self.get(proposal_id)
 
     def get(self, proposal_id):
         proposal_id = _text(proposal_id, "proposal_id")
@@ -119,3 +122,31 @@ class ProcedureProposalStore:
                 )
             ]
         return [self.get(proposal_id) for proposal_id in ids]
+
+    def review(self, proposal_id, action, reason=None):
+        action = _text(action, "action")
+        if action not in {"accept", "reject"}:
+            raise ValueError("review action must be accept or reject")
+        current = self.get(proposal_id)
+        if current["status"] != "candidate":
+            raise ValueError("only candidate proposals can be reviewed")
+        status = "accepted" if action == "accept" else "rejected"
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                "UPDATE proposals SET status=?,reviewed_at=?,review_reason=? WHERE id=?",
+                (status, _timestamp(), reason, proposal_id),
+            )
+            connection.commit()
+        return self.get(proposal_id)
+
+    def mark_applied(self, proposal_id):
+        current = self.get(proposal_id)
+        if current["status"] != "accepted":
+            raise ValueError("only accepted proposals can be applied")
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                "UPDATE proposals SET status=? WHERE id=?",
+                ("applied", proposal_id),
+            )
+            connection.commit()
+        return self.get(proposal_id)
