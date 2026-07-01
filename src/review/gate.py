@@ -1,4 +1,5 @@
 import argparse
+import importlib
 from pathlib import Path
 
 
@@ -11,6 +12,12 @@ _ACCEPT_REQUESTS = frozenset(
 _REVIEW_AUTHORITY = object()
 
 
+def _default_backend():
+    package_root = __package__.split(".", 1)[0] if __package__ and "." in __package__ else None
+    module_name = f"{package_root}.memory_distill" if package_root else "memory_distill"
+    return importlib.import_module(module_name)
+
+
 class ReviewGate:
     def __init__(self, root, state_dir=None, backend=None):
         try:
@@ -19,7 +26,7 @@ class ReviewGate:
             raise ValueError("root must be a filesystem path") from exc
         self.state_dir = None if state_dir is None else Path(state_dir).expanduser()
         if backend is None:
-            import memory_distill as backend
+            backend = _default_backend()
         required = (
             "_accept_candidate_impl",
             "_candidate_record",
