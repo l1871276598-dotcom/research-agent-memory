@@ -33,16 +33,18 @@ class LocalBackend:
     def __init__(self, approval=None):
         self.approval = approval or ApprovalGate()
 
-    def run(self, command, *, cwd=None, timeout=300, env=None):
-        argv = _argv(command)
+    def _approval_result(self, argv):
         decision = self.approval.decide(shlex.join(argv))
-        if decision.action != "allow":
-            return {
-                "backend": self.name,
-                "approval": decision.action,
-                "reason": decision.reason,
-                "command": argv,
-            }
+        if decision.action == "allow":
+            return None
+        return {
+            "backend": self.name,
+            "approval": decision.action,
+            "reason": decision.reason,
+            "command": argv,
+        }
+
+    def _execute(self, argv, *, cwd=None, timeout=300, env=None):
         completed = subprocess.run(
             argv,
             cwd=cwd,
@@ -60,6 +62,11 @@ class LocalBackend:
             self.name,
         ).to_dict()
 
+    def run(self, command, *, cwd=None, timeout=300, env=None):
+        argv = _argv(command)
+        blocked = self._approval_result(argv)
+        return blocked or self._execute(argv, cwd=cwd, timeout=timeout, env=env)
+
 
 class DockerBackend(LocalBackend):
     name = "docker"
@@ -70,8 +77,17 @@ class DockerBackend(LocalBackend):
             raise ValueError("container is required")
         self.container = container
 
-    def run(self, command, **kwargs):
-        return super().run(["docker", "exec", self.container, *_argv(command)], **kwargs)
+    def run(self, command, *, cwd=None, timeout=300, env=None):
+        inner = _argv(command)
+        blocked = self._approval_result(inner)
+        if blocked:
+            return blocked
+        return self._execute(
+            ["docker", "exec", self.container, *inner],
+            cwd=cwd,
+            timeout=timeout,
+            env=env,
+        )
 
 
 class SSHBackend(LocalBackend):
@@ -84,12 +100,16 @@ class SSHBackend(LocalBackend):
         self.target = f"{user}@{host}" if user else host
         self.port = port
 
-    def run(self, command, **kwargs):
+    def run(self, command, *, cwd=None, timeout=300, env=None):
+        inner = _argv(command)
+        blocked = self._approval_result(inner)
+        if blocked:
+            return blocked
         argv = ["ssh"]
         if self.port is not None:
             argv += ["-p", str(self.port)]
-        argv += [self.target, shlex.join(_argv(command))]
-        return super().run(argv, **kwargs)
+        argv += [self.target, shlex.join(inner)]
+        return self._execute(argv, cwd=cwd, timeout=timeout, env=env)
 
 
 class SingularityBackend(LocalBackend):
@@ -101,8 +121,30 @@ class SingularityBackend(LocalBackend):
             raise ValueError("image is required")
         self.image = image
 
+    def run(self, command, *, cwd=None, timeout=300, env=None):
+        inner = _argv(command)
+        blocked = self._approval_result(inner)
+        if blocked:
+            return blocked
+        return self._execute(
+            ["singularity", "exec", self.image, *inner],
+            cwd=cwd,
+            timeout=timeout,
+            env=env,
+        )
+
+
+class CallableBackend:
+    """Adapter for optional cloud runners supplied by extensions."""
+
+    def __init__(self, name, handler):
+        if not isinstance(name, str) or not name.strip() or not callable(handler):
+            raise ValueError("invalid callable execution backend")
+        self.name = name.strip()
+        self.handler = handler
+
     def run(self, command, **kwargs):
-        return super().run(["singularity", "exec", self.image, *_argv(command)], **kwargs)
+        return self.handler(_argv(command), **kwargs)
 
 
 class BackendRegistry:
