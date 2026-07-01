@@ -18,17 +18,23 @@ MEMORY_REVIEW_PROMPT = (
     "Review the conversation above and identify only durable information worth "
     "remembering. Focus on user preferences, stable personal or project facts, "
     "explicit corrections, lasting decisions, reusable procedures, and durable "
-    "expectations about how the agent should work. Do not save one-off requests, "
-    "temporary failures, resolved setup problems, or unsupported assumptions. "
-    "Put durable proposals in memory_candidates."
+    "expectations about how the agent should work. Treat assistant messages as "
+    "generated context, not evidence about the user. A user fact or preference must "
+    "be supported by a user message, an explicit user confirmation, a provided file, "
+    "or a tool result. Never promote an assistant-only assertion, inference, or guess "
+    "into user memory. Do not save one-off requests, temporary failures, resolved "
+    "setup problems, or unsupported assumptions. Put durable proposals in "
+    "memory_candidates and include source_refs when evidence is available."
 )
 
 SKILL_REVIEW_PROMPT = (
     "Identify reusable ways of doing a class of task: workflow corrections, "
     "non-trivial techniques, fixes, verification patterns, or durable style rules. "
-    "Do not create a skill for a single task narrative, a transient environment "
-    "failure, or a negative claim that a tool is permanently broken. Put these "
-    "proposals in skill_candidates; LAOS will review them separately."
+    "A proposed procedure must be grounded in a user-approved workflow, successful "
+    "tool evidence, or an explicit correction; an assistant suggestion alone is not "
+    "sufficient evidence. Do not create a skill for a single task narrative, a "
+    "transient environment failure, or a negative claim that a tool is permanently "
+    "broken. Put these proposals in skill_candidates; LAOS will review them separately."
 )
 
 RESPONSE_SCHEMA_PROMPT = (
@@ -185,7 +191,7 @@ class ReviewCounter:
         self.turns_since_memory = 0
         self.iterations_since_skill = 0
 
-    def record_turn(self, tool_iterations: int = 0) -> dict[str, bool]:
+    def record_turn(self, tool_iterations: int = 0) -> dict:
         if (
             isinstance(tool_iterations, bool)
             or not isinstance(tool_iterations, int)
@@ -194,21 +200,21 @@ class ReviewCounter:
             raise ValueError("tool_iterations must be a non-negative integer")
         self.turns_since_memory += 1
         self.iterations_since_skill += tool_iterations
-        review_memory = self.turns_since_memory >= self.memory_interval
-        review_skills = self.iterations_since_skill >= self.skill_interval
-        if review_memory:
+        memory_due = self.turns_since_memory >= self.memory_interval
+        skill_due = self.iterations_since_skill >= self.skill_interval
+        if memory_due:
             self.turns_since_memory = 0
-        if review_skills:
+        if skill_due:
             self.iterations_since_skill = 0
-        return {"review_memory": review_memory, "review_skills": review_skills}
+        return {"review_memory": memory_due, "review_skills": skill_due}
 
 
 class ConversationReviewService:
-    """Prepare review context and route durable proposals to LAOS candidates."""
+    """Prepare model review and persist only LAOS-owned candidates."""
 
-    def __init__(self, memory_core: Any, reviewer: Callable[[list[dict[str, Any]]], Any] | None = None):
+    def __init__(self, memory_core: Any, reviewer: Callable | None = None):
         if not callable(getattr(memory_core, "create_candidate", None)):
-            raise ValueError("memory_core is invalid")
+            raise ValueError("memory core is invalid")
         if reviewer is not None and not callable(reviewer):
             raise ValueError("reviewer must be callable")
         self.memory_core = memory_core
@@ -225,40 +231,40 @@ class ConversationReviewService:
         confidentiality: str = "personal",
         project: str | None = None,
         session_id: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict:
         parsed = parse_review_response(response)
-        candidate_ids: list[str] = []
-        candidate_results: list[dict[str, Any]] = []
-
-        for proposal in parsed["memory_candidates"]:
-            values = dict(proposal)
-            values["workspace"] = workspace
-            values["confidentiality"] = confidentiality
-            values["source"] = "agent:conversation_review"
-            values["confidence"] = "inferred"
-            values["action"] = "create"
-            values["status"] = "candidate"
-            values.pop("target_id", None)
+        candidate_ids = []
+        results = []
+        for item in parsed["memory_candidates"]:
+            value = dict(item)
+            value.update(
+                {
+                    "workspace": workspace,
+                    "confidentiality": confidentiality,
+                    "source": "agent:conversation_review",
+                    "confidence": "inferred",
+                    "action": "create",
+                    "status": "candidate",
+                }
+            )
+            value.pop("target_id", None)
             if project is None:
-                values.pop("project", None)
+                value.pop("project", None)
             else:
-                values["project"] = project
-            if session_id is not None:
-                refs = list(values.get("source_refs") or [])
+                value["project"] = project
+            refs = list(value.get("source_refs") or [])
+            if session_id:
                 reference = f"session:{session_id}"
                 if reference not in refs:
                     refs.append(reference)
-                values["source_refs"] = refs
-            validate_candidate_values(values)
-            result = self.memory_core.create_candidate(values)
-            if not isinstance(result, dict) or not isinstance(result.get("candidate_id"), str):
-                raise ValueError("memory_core did not create a candidate")
+            value["source_refs"] = refs
+            validate_candidate_values(value)
+            result = self.memory_core.create_candidate(value)
+            results.append(result)
             candidate_ids.append(result["candidate_id"])
-            candidate_results.append(result)
-
         return {
             "candidate_ids": candidate_ids,
-            "candidates": candidate_results,
+            "candidate_results": results,
             "skill_candidates": parsed["skill_candidates"],
             "nothing_to_save": parsed["nothing_to_save"],
         }
@@ -275,9 +281,9 @@ class ConversationReviewService:
         review_skills: bool = False,
         routed: bool = False,
         tail: int = 24,
-    ) -> dict[str, Any]:
+    ) -> dict:
         if self.reviewer is None:
-            raise RuntimeError("no conversation reviewer is configured")
+            raise RuntimeError("conversation reviewer is not configured")
         prepared = self.prepare(
             messages,
             review_memory=review_memory,
