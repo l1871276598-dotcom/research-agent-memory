@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from src.learning_loop import LearningLoop
+from src.memory import db_init, index_store
 from src.models import build_model_backend
 
 
@@ -16,6 +17,18 @@ def _json_file(path):
     if not isinstance(value, dict):
         raise ValueError("JSON file must contain an object")
     return value
+
+
+def _prepare_memory(data_root, state_dir):
+    values = argparse.Namespace(root=data_root, state_dir=state_dir)
+    db_init(values)
+    index_store(
+        argparse.Namespace(
+            root=data_root,
+            state_dir=state_dir,
+            dry_run=False,
+        )
+    )
 
 
 def _parser():
@@ -48,10 +61,14 @@ def _parser():
 def main(argv=None):
     try:
         args = _parser().parse_args(argv)
+        _prepare_memory(args.data_root, args.state_dir)
         backend = None
         if args.command == "run":
             config = _json_file(args.model_config) if args.model_config else None
             backend = build_model_backend(config)
+            supports = getattr(backend, "supports", None)
+            if callable(supports) and not supports("chat"):
+                raise ValueError("selected model backend does not support task execution")
         loop = LearningLoop(
             args.data_root,
             args.state_dir,
