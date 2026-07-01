@@ -5,12 +5,17 @@ from pathlib import Path
 
 import memory_tools
 from agents.orchestrator import ContextAgent, ImportAgent, MemoryAgent, ReviewAgent, SearchAgent
+from agents.reflection import ConversationReviewAgent
+from agents.reflection_record import ReflectionRecordAgent
 from agents.registry import AgentRegistry
 from context.builder import ContextBuilder
 from memory.candidate import CandidateStore
 from memory.core import MemoryCore
 from memory.store import MemoryStore
+from models import build_model_backend
 from orchestrator import Orchestrator
+from procedures.proposals import ProcedureProposalStore
+from reflection import ConversationReviewCoordinator, ConversationReviewService, ReviewStateStore
 from review.gate import ReviewGate
 
 
@@ -19,10 +24,19 @@ class JsonArgumentParser(argparse.ArgumentParser):
         raise ValueError("invalid arguments")
 
 
-def build_application(root, state_dir=None):
+def build_application(root, state_dir=None, model_backend=None):
     store = MemoryStore(root)
     candidates = CandidateStore(root, state_dir)
     core = MemoryCore(store, candidates)
+    backend = model_backend or build_model_backend()
+    if not callable(getattr(backend, "review", None)):
+        raise ValueError("model backend does not support conversation review")
+    review_service = ConversationReviewService(core, backend.review)
+    review_coordinator = ConversationReviewCoordinator(
+        review_service,
+        ReviewStateStore(candidates.state_dir),
+        procedure_proposals=ProcedureProposalStore(candidates.state_dir),
+    )
     agents = [
         ImportAgent(root, memory_tools),
         MemoryAgent(core),
@@ -32,8 +46,10 @@ def build_application(root, state_dir=None):
             default_workspace="personal",
         ),
         ContextAgent(ContextBuilder(store)),
+        ConversationReviewAgent(review_service),
+        ReflectionRecordAgent(review_coordinator),
     ]
-    config = Path(__file__).with_name("agents") / "registry.yaml"
+    config = Path(__file__).with_name("agents") / "runtime_registry.yaml"
     return Orchestrator(AgentRegistry.from_config(config, agents))
 
 
@@ -41,6 +57,7 @@ def _parser():
     parser = JsonArgumentParser()
     parser.add_argument("--root", required=True)
     parser.add_argument("--state-dir")
+    parser.add_argument("--model-config")
     tasks = parser.add_mutually_exclusive_group(required=True)
     tasks.add_argument("--task-json")
     tasks.add_argument("--task-file")
@@ -59,7 +76,13 @@ def main(argv=None):
         if text is None:
             text = Path(args.task_file).read_text(encoding="utf-8-sig")
         task = json.loads(text)
-        result = build_application(args.root, args.state_dir).run(task)
+        backend = None
+        if args.model_config:
+            model_config = json.loads(
+                Path(args.model_config).read_text(encoding="utf-8-sig")
+            )
+            backend = build_model_backend(model_config)
+        result = build_application(args.root, args.state_dir, backend).run(task)
     except Exception:
         _write_json(
             sys.stderr,

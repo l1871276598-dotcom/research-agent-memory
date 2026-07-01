@@ -30,6 +30,25 @@ jobs:
         with:
           python-version: "3.11"
 
-      - run: python -m unittest discover -s tests -v
+      - name: Run unit tests
+        shell: bash
+        run: |
+          set +e
+          python -m unittest discover -s tests -v > "test-output-${{ runner.os }}.log" 2>&1
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            tail -n 220 "test-output-${{ runner.os }}.log"
+          else
+            cat "test-output-${{ runner.os }}.log"
+          fi
+          exit "$status"
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-${{ runner.os }}
+          path: test-output-${{ runner.os }}.log
+
       - run: python -m compileall -q src tests
       - run: git diff --check

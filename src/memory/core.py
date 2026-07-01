@@ -12,6 +12,10 @@ class MemoryCore:
     def create_candidate(self, values):
         return self.candidates.create(values)
 
+    def find_candidate_by_source_id(self, source_id):
+        finder = getattr(self.candidates, "find_by_source_id", None)
+        return finder(source_id) if callable(finder) else None
+
     def get(self, memory_id):
         return self.store.get(memory_id)
 

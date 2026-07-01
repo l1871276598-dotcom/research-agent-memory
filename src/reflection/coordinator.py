@@ -1,0 +1,141 @@
+from __future__ import annotations
+
+from typing import Any
+
+
+class ConversationReviewCoordinator:
+    """Trigger review after durable per-session thresholds are reached."""
+
+    def __init__(
+        self,
+        service: Any,
+        state: Any,
+        *,
+        procedure_proposals: Any = None,
+        memory_interval: int = 10,
+        skill_interval: int = 10,
+    ) -> None:
+        if not callable(getattr(service, "review", None)):
+            raise ValueError("conversation review service is invalid")
+        for name in ("advance", "complete", "fail"):
+            if not callable(getattr(state, name, None)):
+                raise ValueError("review state store is invalid")
+        if procedure_proposals is not None and not callable(
+            getattr(procedure_proposals, "create", None)
+        ):
+            raise ValueError("procedure proposal store is invalid")
+        for value in (memory_interval, skill_interval):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError("review intervals must be positive integers")
+        self.service = service
+        self.state = state
+        self.procedure_proposals = procedure_proposals
+        self.memory_interval = memory_interval
+        self.skill_interval = skill_interval
+
+    def _save_procedures(self, candidates, session_id, review_id=None):
+        if not candidates:
+            return []
+        if self.procedure_proposals is None:
+            return []
+        saved = []
+        for index, item in enumerate(candidates):
+            value = dict(item)
+            content = value.get("content") or value.pop("change", None)
+            value["content"] = content
+            value.setdefault("action", "update")
+            value.setdefault("summary", str(content or "")[:160])
+            refs = list(value.get("source_refs") or [])
+            reference = f"session:{session_id}"
+            if reference not in refs:
+                refs.append(reference)
+            value["source_refs"] = refs
+            if review_id:
+                value["review_key"] = f"review:{review_id}:procedure:{index}"
+            saved.append(self.procedure_proposals.create(value))
+        return saved
+
+    def record_turn(
+        self,
+        *,
+        session_id: str,
+        messages: list[dict],
+        workspace: str,
+        confidentiality: str = "personal",
+        project: str | None = None,
+        tool_iterations: int = 0,
+        force: bool = False,
+        turn_increment: int = 1,
+        event_key: str | None = None,
+        review_position: int | None = None,
+    ) -> dict:
+        if confidentiality == "restricted":
+            return {
+                "status": "skipped",
+                "reason": "restricted_conversation",
+                "session_id": session_id,
+            }
+
+        counters = self.state.advance(
+            session_id,
+            tool_iterations,
+            turn_increment=turn_increment,
+            event_key=event_key,
+        )
+        if force and review_position is not None:
+            memory_position = counters.get("last_memory_review_position")
+            skill_position = counters.get("last_skill_review_position")
+            review_memory = memory_position is None or memory_position < review_position
+            review_skills = skill_position is None or skill_position < review_position
+        else:
+            review_memory = force or counters["turns"] >= self.memory_interval
+            review_skills = force or counters["tool_iterations"] >= self.skill_interval
+
+        if not review_memory and not review_skills:
+            return {
+                "status": "skipped" if force else "not_due",
+                "reason": "already_reviewed" if force else None,
+                "session_id": session_id,
+                "counters": counters,
+            }
+
+        try:
+            result = self.service.review(
+                messages,
+                workspace=workspace,
+                confidentiality=confidentiality,
+                project=project,
+                session_id=session_id,
+                review_memory=review_memory,
+                review_skills=review_skills,
+                routed=True,
+                review_id=event_key,
+            )
+            result["procedure_proposals"] = self._save_procedures(
+                result.get("skill_candidates", []),
+                session_id,
+                event_key,
+            )
+        except Exception as exc:
+            failed = self.state.fail(session_id, str(exc))
+            return {
+                "status": "failed",
+                "session_id": session_id,
+                "error": str(exc),
+                "counters": failed,
+            }
+
+        completed = self.state.complete(
+            session_id,
+            memory_reviewed=review_memory,
+            skills_reviewed=review_skills,
+            review_position=review_position,
+        )
+        return {
+            "status": "reviewed",
+            "session_id": session_id,
+            "review_memory": review_memory,
+            "review_skills": review_skills,
+            "result": result,
+            "counters": completed,
+        }

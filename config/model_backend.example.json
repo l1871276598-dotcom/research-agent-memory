@@ -1,0 +1,9 @@
+{
+  "backend": "openai_compatible",
+  "options": {
+    "base_url": "http://localhost:11434/v1",
+    "model": "replace-with-model-name",
+    "api_key_env": "LAOS_MODEL_API_KEY",
+    "timeout": 120
+  }
+}

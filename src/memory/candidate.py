@@ -145,6 +145,19 @@ class CandidateStore:
             raise ValueError("candidate backend is invalid")
         self.backend = backend
 
+    def find_by_source_id(self, source_id):
+        if not _nonblank(source_id):
+            raise ValueError("source_id must be a non-empty string")
+        for item in _validated_store(self.root):
+            record = item["record"]
+            if record.get("source_id") == source_id:
+                return {
+                    "candidate_id": record.get("id"),
+                    "status": record.get("status"),
+                    "path": item["relative_path"],
+                }
+        return None
+
     def create(self, values):
         validate_candidate_values(values)
         _validated_source(self.root, values.get("source_path"))
