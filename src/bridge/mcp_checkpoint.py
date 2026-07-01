@@ -120,6 +120,7 @@ class McpCheckpointCapture:
         if not isinstance(force_review, bool):
             raise ValueError("force_review must be boolean")
 
+        checkpoint_id_supplied = checkpoint_id is not None
         checkpoint_id = self._checkpoint_id(
             session_alias,
             user_message,
@@ -207,9 +208,14 @@ class McpCheckpointCapture:
             for item in projected
             if item.get("session_id") is not None
         }
+        session_id = next(iter(session_ids)) if len(session_ids) == 1 else None
+        if session_id is None:
+            identifier = getattr(getattr(self.pipeline, "projector", None), "session_id", None)
+            if callable(identifier):
+                session_id = identifier(events[0])
         return {
             "checkpoint_id": checkpoint_id,
-            "session_id": next(iter(session_ids)) if len(session_ids) == 1 else None,
+            "session_id": session_id,
             "receipts": receipts,
             "projected": projected,
             "content_receipt": {
@@ -226,7 +232,7 @@ class McpCheckpointCapture:
                 "source_conversation_id_provided": source_conversation_id is not None,
                 "source_user_message_id_provided": source_user_message_id is not None,
                 "source_assistant_message_id_provided": source_assistant_message_id is not None,
-                "stable_checkpoint_id_provided": not checkpoint_id.startswith("derived-"),
+                "stable_checkpoint_id_provided": checkpoint_id_supplied,
                 "force_review": force_review,
             },
         }
