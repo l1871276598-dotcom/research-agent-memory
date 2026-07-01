@@ -94,6 +94,7 @@ class McpCheckpointTrialTests(unittest.TestCase):
                 write_confirmation_burden_acceptable=True,
             )
             manifest = TRIAL.load_manifest(state)
+            final_report = TRIAL.report_trial(state)
 
             self.assertTrue(result["accepted"])
             self.assertEqual(
@@ -105,7 +106,11 @@ class McpCheckpointTrialTests(unittest.TestCase):
             self.assertEqual(manifest["status"], "decided")
             self.assertEqual(manifest["classification"], result["classification"])
             self.assertIsNotNone(manifest["decided_at"])
-            self.assertFalse(TRIAL.report_trial(state)["empirical_decision_pending"])
+            self.assertFalse(final_report["empirical_decision_pending"])
+            self.assertEqual(
+                final_report["classification"],
+                "formal_explicit_checkpoint_channel",
+            )
 
     def test_decision_rejects_when_confirmation_burden_is_unacceptable(self):
         with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as state:
