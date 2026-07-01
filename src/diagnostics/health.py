@@ -147,7 +147,12 @@ class HealthCheck:
                 "Install the optional MCP SDK only when serving LAOS over MCP.",
             ),
         ]
-        for filename in ("sessions.sqlite", "conversation_review.sqlite", "procedure_proposals.sqlite"):
+        for filename in (
+            "sessions.sqlite",
+            "conversation_review.sqlite",
+            "procedure_proposals.sqlite",
+            "bridge_events.sqlite",
+        ):
             result = self.database(self.state_dir / filename)
             checks.append(
                 self.item(
