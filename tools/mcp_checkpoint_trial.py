@@ -137,10 +137,15 @@ def report_trial(state_dir):
         manifest["state_dir"],
         expected_checkpoints=manifest["expected_checkpoints"],
     )
-    classification = (
+    pending_classification = (
         "explicit_checkpoint_candidate"
         if report["checkpoint_capture_ready"]
         else "not_ready"
+    )
+    classification = (
+        manifest.get("classification")
+        if manifest.get("status") == "decided"
+        else pending_classification
     )
     return {
         "trial_id": manifest["trial_id"],
