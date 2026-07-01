@@ -13,9 +13,10 @@ from protocol_host import build_protocol_host
 
 
 class FakeFastMCP:
-    def __init__(self, name, instructions):
+    def __init__(self, name, instructions, **options):
         self.name = name
         self.instructions = instructions
+        self.options = options
         self.tools = {}
 
     def tool(self):
@@ -88,6 +89,19 @@ class ProtocolHostTests(unittest.TestCase):
 
         self.assertNotIn("checkpoint", host.instructions)
         self.assertNotIn("laos_capture_checkpoint", host.tools)
+
+    def test_remote_server_options_are_passed_to_fastmcp(self):
+        options = {
+            "host": "127.0.0.1",
+            "port": 8766,
+            "streamable_http_path": "/mcp",
+            "json_response": True,
+            "stateless_http": True,
+        }
+        with mock.patch.dict(sys.modules, mcp_modules()):
+            host = build_protocol_host(Facade(), server_options=options)
+
+        self.assertEqual(host.options, options)
 
 
 if __name__ == "__main__":
