@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "upstream": "NousResearch/hermes-agent",
+  "track_branch": "main",
+  "pinned_ref": "d5d7cab2b62afc5289157ffcf46813c3561a5b8d",
+  "destination": "vendor/hermes_agent",
+  "license_file": "LICENSE",
+  "include": ["agent", "gateway", "hermes_cli", "plugins", "skills", "optional-skills", "tools", "acp_adapter", "run_agent.py", "model_tools.py", "toolsets.py", "toolset_distributions.py", "terminal_tool.py", "hermes_bootstrap.py", "hermes_constants.py", "hermes_logging.py", "hermes_state.py", "hermes_time.py", "mcp_serve.py", "utils.py", "LICENSE"],
+  "exclude": ["cron", "plugins/cron_providers", "batch_runner.py", "trajectory_compressor.py", "datagen-config-examples", "configs/datagen"],
+  "disabled_surfaces": ["multi_provider_configuration", "agent_cron", "trajectory_and_training_data"],
+  "integration_policy": {
+    "preserve_upstream_files": true,
+    "modify_vendor_files_directly": false,
+    "laos_memory_is_authoritative": true,
+    "all_persistent_memory_writes_require_review": true
+  }
+}
