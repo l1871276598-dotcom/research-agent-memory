@@ -59,7 +59,8 @@
       "status": "integrated",
       "port_mode": "copy_then_adapt",
       "upstream_paths": ["agent/background_review.py"],
-      "laos_paths": ["src/reflection/", "src/agents/reflection.py", "src/agents/reflection_record.py"]
+      "laos_paths": ["src/reflection/", "src/agents/reflection.py", "src/agents/reflection_record.py", "src/bridge/projector.py"],
+      "notes": "Bridge assistant turns and checkpoints enter idempotent threshold review. Assistant-only assertions are not evidence of user facts, and all outputs remain candidates."
     },
     {
       "number": 7,
@@ -99,7 +100,8 @@
       "status": "integrated",
       "port_mode": "copy_then_adapt",
       "upstream_paths": ["hermes_state.py", "hermes_cli/active_sessions.py"],
-      "laos_paths": ["src/sessions/", "tools/session_cli.py"]
+      "laos_paths": ["src/sessions/", "src/bridge/inbox.py", "src/bridge/projector.py", "tools/session_cli.py"],
+      "notes": "Finalized bridge messages are projected into branch-specific SQLite sessions with stable identities, ordering, replay protection, and crash recovery."
     },
     {
       "number": 13,
@@ -115,7 +117,8 @@
       "status": "foundation_integrated",
       "port_mode": "selective_copy",
       "upstream_paths": ["gateway/platforms/base.py", "gateway/"],
-      "laos_paths": ["src/message_io/"]
+      "laos_paths": ["src/message_io/", "src/bridge/", "tools/bridge_server.py", "config/bridge_scope.example.json"],
+      "notes": "The ChatGPT web bridge uses a token-authenticated localhost inbox, explicit source and account scope policies, streaming finalization, parent ordering, deduplication, and optional model review."
     },
     {
       "number": 15,
@@ -147,7 +150,8 @@
       "status": "integrated_core",
       "port_mode": "selective_copy",
       "upstream_paths": ["tools/approval.py", "agent/tool_guardrails.py", "agent/memory_manager.py"],
-      "laos_paths": ["src/safety/", "src/context/", "src/memory/render.py"]
+      "laos_paths": ["src/safety/", "src/context/", "src/memory/render.py", "src/bridge/service.py"],
+      "notes": "Bridge ingestion is localhost-only, token authenticated, source allowlisted, payload bounded, and fail-closed for unmapped accounts."
     },
     {
       "number": 19,
@@ -155,7 +159,7 @@
       "status": "integrated",
       "port_mode": "copy_then_adapt",
       "upstream_paths": ["hermes_constants.py", "scripts/profile-tui.py"],
-      "laos_paths": ["src/profiles/"]
+      "laos_paths": ["src/profiles/", "config/bridge_scope.example.json"]
     },
     {
       "number": 20,
