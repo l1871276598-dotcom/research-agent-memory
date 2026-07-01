@@ -19,22 +19,26 @@ MEMORY_REVIEW_PROMPT = (
     "remembering. Focus on user preferences, stable personal or project facts, "
     "explicit corrections, lasting decisions, reusable procedures, and durable "
     "expectations about how the agent should work. Do not save one-off requests, "
-    "temporary failures, resolved setup problems, or unsupported assumptions.\n\n"
-    "Return JSON only with this exact shape:\n"
-    '{"memory_candidates":[],"skill_candidates":[],"nothing_to_save":true}\n\n'
-    "Each memory candidate must already match the LAOS candidate schema and may "
-    "contain: type, title, scope, workspace, confidentiality, source, content, "
-    "action, confidence, target_id, project, context_id, source_id, evidence, "
-    "source_refs, relations, and tags. Use status only as candidate. Do not mark "
-    "anything active."
+    "temporary failures, resolved setup problems, or unsupported assumptions. "
+    "Put durable proposals in memory_candidates."
 )
 
 SKILL_REVIEW_PROMPT = (
-    "Also identify reusable ways of doing a class of task: workflow corrections, "
+    "Identify reusable ways of doing a class of task: workflow corrections, "
     "non-trivial techniques, fixes, verification patterns, or durable style rules. "
     "Do not create a skill for a single task narrative, a transient environment "
     "failure, or a negative claim that a tool is permanently broken. Put these "
     "proposals in skill_candidates; LAOS will review them separately."
+)
+
+RESPONSE_SCHEMA_PROMPT = (
+    "Return JSON only with this exact top-level shape:\n"
+    '{"memory_candidates":[],"skill_candidates":[],"nothing_to_save":true}\n\n'
+    "Each memory candidate must match the LAOS candidate schema and may contain: "
+    "type, title, scope, workspace, confidentiality, source, content, action, "
+    "confidence, target_id, project, context_id, source_id, evidence, source_refs, "
+    "relations, tags, and status. Never mark anything active. Set nothing_to_save "
+    "to true only when both candidate lists are empty."
 )
 
 
@@ -128,8 +132,13 @@ def prepare_review_messages(
     prompts = []
     if review_memory:
         prompts.append(MEMORY_REVIEW_PROMPT)
+    else:
+        prompts.append("Memory review is disabled; memory_candidates must be empty.")
     if review_skills:
         prompts.append(SKILL_REVIEW_PROMPT)
+    else:
+        prompts.append("Skill review is disabled; skill_candidates must be empty.")
+    prompts.append(RESPONSE_SCHEMA_PROMPT)
     return history + [{"role": "user", "content": "\n\n".join(prompts)}]
 
 
@@ -223,13 +232,17 @@ class ConversationReviewService:
 
         for proposal in parsed["memory_candidates"]:
             values = dict(proposal)
-            values.setdefault("workspace", workspace)
-            values.setdefault("confidentiality", confidentiality)
-            values.setdefault("source", "agent:conversation_review")
-            values.setdefault("confidence", "inferred")
-            values.setdefault("action", "create")
-            if project is not None:
-                values.setdefault("project", project)
+            values["workspace"] = workspace
+            values["confidentiality"] = confidentiality
+            values["source"] = "agent:conversation_review"
+            values["confidence"] = "inferred"
+            values["action"] = "create"
+            values["status"] = "candidate"
+            values.pop("target_id", None)
+            if project is None:
+                values.pop("project", None)
+            else:
+                values["project"] = project
             if session_id is not None:
                 refs = list(values.get("source_refs") or [])
                 reference = f"session:{session_id}"
