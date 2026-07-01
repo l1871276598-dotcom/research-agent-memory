@@ -5,12 +5,14 @@ from pathlib import Path
 
 import memory_tools
 from agents.orchestrator import ContextAgent, ImportAgent, MemoryAgent, ReviewAgent, SearchAgent
+from agents.reflection import ConversationReviewAgent
 from agents.registry import AgentRegistry
 from context.builder import ContextBuilder
 from memory.candidate import CandidateStore
 from memory.core import MemoryCore
 from memory.store import MemoryStore
 from orchestrator import Orchestrator
+from reflection.conversation_review import ConversationReviewService
 from review.gate import ReviewGate
 
 
@@ -32,6 +34,7 @@ def build_application(root, state_dir=None):
             default_workspace="personal",
         ),
         ContextAgent(ContextBuilder(store)),
+        ConversationReviewAgent(ConversationReviewService(core)),
     ]
     config = Path(__file__).with_name("agents") / "registry.yaml"
     return Orchestrator(AgentRegistry.from_config(config, agents))
