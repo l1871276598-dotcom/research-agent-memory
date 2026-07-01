@@ -2,6 +2,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -24,6 +25,23 @@ class DiagnosticsHealthTests(unittest.TestCase):
             data_row = next(row for row in result["checks"] if row["name"] == "data_root")
             self.assertEqual(data_row["status"], "ok")
             self.assertIsInstance(result["healthy"], bool)
+
+    @mock.patch("diagnostics.health.shutil.which", return_value=None)
+    def test_non_codex_backend_does_not_require_codex(self, which):
+        with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as state:
+            init_store(data)
+            result = HealthCheck(
+                data,
+                state,
+                model_backend="openai_compatible",
+            ).run()
+            codex = next(row for row in result["checks"] if row["name"] == "codex_cli")
+            oauth = next(row for row in result["checks"] if row["name"] == "codex_oauth")
+            backend = next(row for row in result["checks"] if row["name"] == "model_backend")
+            self.assertEqual(codex["status"], "optional")
+            self.assertEqual(oauth["status"], "optional")
+            self.assertEqual(backend["detail"], "openai_compatible")
+            self.assertTrue(result["healthy"])
 
     def test_uninitialized_data_root_is_blocking(self):
         with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as state:
