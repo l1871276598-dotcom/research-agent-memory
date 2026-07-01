@@ -14,7 +14,7 @@ SPEC.loader.exec_module(MODULE)
 
 
 class HermesUpstreamTests(unittest.TestCase):
-    def test_component_map_excludes_rejected_features_and_full_vendor(self):
+    def test_component_map_keeps_model_backends_and_excludes_rejected_features(self):
         config = json.loads(
             (REPO_ROOT / "config" / "hermes_upstream_components.json").read_text(
                 encoding="utf-8"
@@ -22,9 +22,13 @@ class HermesUpstreamTests(unittest.TestCase):
         )
         self.assertFalse(config["policy"]["vendor_full_repository"])
         self.assertFalse(config["policy"]["run_external_hermes"])
-        self.assertEqual(config["policy"]["excluded_feature_numbers"], [2, 12, 21])
-        numbers = {component["number"] for component in config["components"]}
-        self.assertFalse(numbers & {2, 12, 21})
+        self.assertEqual(config["policy"]["excluded_feature_numbers"], [12, 21])
+
+        components = {component["number"]: component for component in config["components"]}
+        self.assertIn(2, components)
+        self.assertEqual(components[2]["id"], "model_backends")
+        self.assertEqual(components[2]["status"], "foundation_integrated")
+        self.assertFalse(set(components) & {12, 21})
 
     def test_path_matching_accepts_files_and_subtrees(self):
         self.assertTrue(MODULE._matches("agent/background_review.py", ["agent/background_review.py"]))
