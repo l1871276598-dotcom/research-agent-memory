@@ -57,6 +57,7 @@
         "historical",
         "deprecated",
         "candidate",
+        "conflicted",
         "conflict",
         "archived"
       ]
@@ -214,6 +215,7 @@
         "historical",
         "deprecated",
         "candidate",
+        "conflicted",
         "conflict",
         "archived"
       ]
