@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-def build_protocol_host(facade):
+def build_protocol_host(facade, *, server_options=None):
     try:
         from mcp.server.fastmcp import FastMCP
     except ImportError as exc:
@@ -14,7 +14,7 @@ def build_protocol_host(facade):
             " The checkpoint tool is explicit, not passive: call it only when the "
             "current user message and the exact completed assistant response are available."
         )
-    host = FastMCP("laos", instructions=instructions)
+    host = FastMCP("laos", instructions=instructions, **dict(server_options or {}))
 
     @host.tool()
     def laos_task(task: dict) -> dict:
