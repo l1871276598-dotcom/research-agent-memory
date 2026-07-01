@@ -207,6 +207,13 @@ class SessionProjector:
             return None
         try:
             result = self.project(event)
+        except (PermissionError, ValueError) as exc:
+            failed = self.inbox.mark_failed(event["event_id"], str(exc), retry=False)
+            return {
+                "event_id": event["event_id"],
+                "status": failed["status"],
+                "error": str(exc),
+            }
         except Exception as exc:
             failed = self.inbox.mark_failed(event["event_id"], str(exc))
             return {
