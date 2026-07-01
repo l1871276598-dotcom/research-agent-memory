@@ -17,7 +17,7 @@ class BridgeScopeResolver:
 
     def __init__(self, mappings=None, default=None):
         self.mappings = dict(mappings or {})
-        self.default = default or BridgeScope("personal")
+        self.default = default
 
     @staticmethod
     def _scope(value):
@@ -48,6 +48,8 @@ class BridgeScopeResolver:
         for key in keys:
             if key in self.mappings:
                 return self._scope(self.mappings[key])
+        if self.default is None:
+            raise PermissionError("bridge account is not mapped to a LAOS scope")
         return self._scope(self.default)
 
 
