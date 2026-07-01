@@ -231,11 +231,13 @@ class ConversationReviewService:
         confidentiality: str = "personal",
         project: str | None = None,
         session_id: str | None = None,
+        review_id: str | None = None,
     ) -> dict:
         parsed = parse_review_response(response)
         candidate_ids = []
         results = []
-        for item in parsed["memory_candidates"]:
+        finder = getattr(self.memory_core, "find_candidate_by_source_id", None)
+        for index, item in enumerate(parsed["memory_candidates"]):
             value = dict(item)
             value.update(
                 {
@@ -252,6 +254,8 @@ class ConversationReviewService:
                 value.pop("project", None)
             else:
                 value["project"] = project
+            if review_id:
+                value["source_id"] = f"review:{review_id}:memory:{index}"
             refs = list(value.get("source_refs") or [])
             if session_id:
                 reference = f"session:{session_id}"
@@ -259,7 +263,10 @@ class ConversationReviewService:
                     refs.append(reference)
             value["source_refs"] = refs
             validate_candidate_values(value)
-            result = self.memory_core.create_candidate(value)
+            existing = None
+            if review_id and callable(finder):
+                existing = finder(value["source_id"])
+            result = existing or self.memory_core.create_candidate(value)
             results.append(result)
             candidate_ids.append(result["candidate_id"])
         return {
@@ -281,6 +288,7 @@ class ConversationReviewService:
         review_skills: bool = False,
         routed: bool = False,
         tail: int = 24,
+        review_id: str | None = None,
     ) -> dict:
         if self.reviewer is None:
             raise RuntimeError("conversation reviewer is not configured")
@@ -298,4 +306,5 @@ class ConversationReviewService:
             confidentiality=confidentiality,
             project=project,
             session_id=session_id,
+            review_id=review_id,
         )
