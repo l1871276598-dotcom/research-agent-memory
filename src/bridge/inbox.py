@@ -300,14 +300,6 @@ class BridgeEventInbox:
                   AND (
                     e.event_type <> 'message'
                     OR e.parent_message_id IS NULL
-                    OR NOT EXISTS (
-                        SELECT 1 FROM bridge_events p
-                        WHERE p.source=e.source
-                          AND p.account_id=e.account_id
-                          AND p.conversation_id=e.conversation_id
-                          AND p.branch_id=e.branch_id
-                          AND p.message_id=e.parent_message_id
-                    )
                     OR EXISTS (
                         SELECT 1 FROM bridge_events p
                         WHERE p.source=e.source
