@@ -12,7 +12,7 @@ for path in (ROOT, ROOT / "src"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from src.learning_loop import LearningLoop
+from src.learning_loop import AutoUpdateLoopCoordinator, LearningLoop
 from src.memory import db_init, index_store, init_store
 from src.models import build_model_backend
 
@@ -48,6 +48,13 @@ def _parser():
     run.add_argument("--task-file", required=True)
     run.add_argument("--model-config")
 
+    advance = commands.add_parser("advance")
+    advance.add_argument("--task-file", required=True)
+    advance.add_argument("--verification-task-file")
+    advance.add_argument("--model-config")
+    advance.add_argument("--minimum-improvement", type=float, default=0.2)
+    advance.add_argument("--require-nonempty-exclusion-evidence", action="store_true")
+
     review = commands.add_parser("review")
     review.add_argument("--run-id", required=True)
     review.add_argument("--candidate-id", required=True)
@@ -62,6 +69,9 @@ def _parser():
 
     status = commands.add_parser("status")
     status.add_argument("--run-id", required=True)
+
+    auto_status = commands.add_parser("auto-status")
+    auto_status.add_argument("--run-id", required=True)
     return parser
 
 
@@ -70,7 +80,7 @@ def main(argv=None):
         args = _parser().parse_args(argv)
         _prepare_memory(args.data_root, args.state_dir)
         backend = None
-        if args.command == "run":
+        if args.command in {"run", "advance"}:
             config = _json_file(args.model_config) if args.model_config else None
             backend = build_model_backend(config)
             supports = getattr(backend, "supports", None)
@@ -84,6 +94,18 @@ def main(argv=None):
         )
         if args.command == "run":
             result = loop.execute(_json_file(args.task_file))
+        elif args.command == "advance":
+            verification_task = (
+                _json_file(args.verification_task_file)
+                if args.verification_task_file
+                else None
+            )
+            result = AutoUpdateLoopCoordinator(loop).advance(
+                _json_file(args.task_file),
+                verification_task=verification_task,
+                minimum_improvement=args.minimum_improvement,
+                require_nonempty_exclusion_evidence=args.require_nonempty_exclusion_evidence,
+            )
         elif args.command == "review":
             result = loop.review(
                 args.run_id,
@@ -98,6 +120,8 @@ def main(argv=None):
                 minimum_improvement=args.minimum_improvement,
                 require_nonempty_exclusion_evidence=args.require_nonempty_exclusion_evidence,
             )
+        elif args.command == "auto-status":
+            result = AutoUpdateLoopCoordinator(loop).status(args.run_id)
         else:
             result = loop.status(args.run_id)
     except Exception as exc:
