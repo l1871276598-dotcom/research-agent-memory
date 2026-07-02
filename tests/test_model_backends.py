@@ -84,6 +84,19 @@ class ModelBackendTests(unittest.TestCase):
     def test_factory_defaults_to_codex_and_accepts_openai_compatible_config(self):
         default = build_model_backend()
         self.assertEqual(default.backend_id, "codex")
+        self.assertTrue(default.supports("chat"))
+        self.assertTrue(default.supports("review"))
+        default.executor = lambda messages: "bounded result"
+        self.assertEqual(
+            default.complete([{"role": "user", "content": "task"}]),
+            {"content": "bounded result", "tool_calls": []},
+        )
+        with self.assertRaisesRegex(ValueError, "does not accept tools"):
+            default.complete(
+                [{"role": "user", "content": "task"}],
+                tools=[{"type": "function"}],
+            )
+
         configured = build_model_backend(
             {
                 "backend": "openai_compatible",

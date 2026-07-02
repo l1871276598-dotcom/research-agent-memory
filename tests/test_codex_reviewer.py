@@ -95,7 +95,7 @@ class CodexReviewerTests(unittest.TestCase):
         thread_call = next(call for call in client.calls if call[0] == "thread/start")
         self.assertTrue(thread_call[1]["ephemeral"])
         self.assertEqual(thread_call[1]["approvalPolicy"], "never")
-        self.assertEqual(thread_call[1]["sandbox"], "readOnly")
+        self.assertEqual(thread_call[1]["sandbox"], "read-only")
         turn_call = next(call for call in client.calls if call[0] == "turn/start")
         self.assertEqual(turn_call[1]["sandboxPolicy"], {"type": "readOnly"})
         self.assertIn("Do not call tools", turn_call[1]["input"][0]["text"])
