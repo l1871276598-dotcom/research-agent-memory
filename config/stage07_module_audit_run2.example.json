@@ -24,11 +24,11 @@
     },
     {
       "id": "fail_closed",
-      "description": "verify fail-closed behavior for invalid scope or events",
+      "description": "map invalid scope or event cases to their rejecting code paths",
       "required_terms": [
-        "fail-closed"
+        "fail-closed evidence map"
       ],
-      "strategy": "For module audits, verify fail-closed behavior before treating a capability as available or safe."
+      "strategy": "For module audits, produce a fail-closed evidence map that links each invalid or ineligible case to the rejecting code path before treating a capability as available or safe."
     },
     {
       "id": "restricted",

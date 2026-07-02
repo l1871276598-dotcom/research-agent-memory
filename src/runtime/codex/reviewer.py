@@ -105,7 +105,7 @@ class CodexConversationReviewer:
                         "cwd": str(Path(directory)),
                         "ephemeral": True,
                         "approvalPolicy": "never",
-                        "sandbox": "readOnly",
+                        "sandbox": "read-only",
                     },
                     timeout=min(self.timeout, 15.0),
                 )

@@ -136,7 +136,7 @@ class HealthCheck:
             self.codex(),
             self.item(
                 "codex_oauth",
-                "ok" if auth_exists else ("warn" if codex_required else "optional"),
+                ("ok" if auth_exists else "warn") if codex_required else "optional",
                 str(self.codex_home / "auth.json"),
                 "Sign in with the Codex CLI." if codex_required and not auth_exists else "",
             ),

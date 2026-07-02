@@ -1,14 +1,18 @@
 import argparse
 import json
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 from src.learning_loop import LearningLoop
 from src.memory import db_init, index_store, init_store
@@ -87,6 +91,40 @@ def task(run_id, target, *, workspace="personal", query=None, criteria=None):
 
 
 class LearningLoopTests(unittest.TestCase):
+    def test_cli_initializes_empty_data_root(self):
+        with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as state:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools" / "learning_loop.py"),
+                    "--data-root",
+                    data,
+                    "--state-dir",
+                    state,
+                    "--work-root",
+                    str(ROOT),
+                    "status",
+                    "--run-id",
+                    "missing-run",
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotIn("请先执行", result.stderr)
+            self.assertTrue(Path(data, ".research-agent-root").is_file())
+
+    def test_cli_script_starts_without_pythonpath(self):
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "learning_loop.py"), "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def setUp(self):
         self.data = tempfile.TemporaryDirectory()
         self.state = tempfile.TemporaryDirectory()
@@ -122,6 +160,13 @@ class LearningLoopTests(unittest.TestCase):
         self.assertEqual(first["state"], "review_pending")
         self.assertEqual(first["score"], 1 / 3)
         self.assertEqual(len(first["candidate_ids"]), 2)
+        first_run_path = Path(first["artifacts"]["run.json"])
+        first_run_bytes = first_run_path.read_bytes()
+
+        pending_replay = loop.execute(task("run-one", "module_one.py"))
+        self.assertEqual(pending_replay["candidate_ids"], first["candidate_ids"])
+        self.assertEqual(first_run_path.read_bytes(), first_run_bytes)
+        self.assertEqual(backend.calls, 1)
 
         store = MemoryStore(self.data.name)
         self.assertEqual(
@@ -282,6 +327,21 @@ class LearningLoopTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "different review decision"):
             loop.review("review-replay", candidate_id, "reject")
+
+    def test_prompt_requires_explicit_active_strategy_application(self):
+        messages = LearningLoop._prompt(
+            task("prompt-check", "module_one.py"),
+            {
+                "text": "id: principle-1\ncontent: Produce a named evidence map.",
+                "sources": ["principle-1"],
+            },
+            "module source",
+        )
+
+        self.assertIn(
+            "Apply every supplied active-memory strategy explicitly",
+            messages[0]["content"],
+        )
 
 
 if __name__ == "__main__":

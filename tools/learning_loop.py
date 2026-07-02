@@ -7,8 +7,13 @@ import json
 import sys
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+for path in (ROOT, ROOT / "src"):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
 from src.learning_loop import LearningLoop
-from src.memory import db_init, index_store
+from src.memory import db_init, index_store, init_store
 from src.models import build_model_backend
 
 
@@ -20,6 +25,7 @@ def _json_file(path):
 
 
 def _prepare_memory(data_root, state_dir):
+    init_store(data_root)
     values = argparse.Namespace(root=data_root, state_dir=state_dir)
     db_init(values)
     index_store(

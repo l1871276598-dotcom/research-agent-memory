@@ -275,9 +275,10 @@ class LearningLoop:
         )
         system = (
             "You are executing a bounded LAOS learning-loop task. Use only the supplied "
-            "inputs and active-memory context. Cite concrete evidence. When memory is used, "
-            "include an exact `Memory used:` section listing its memory IDs. Do not claim "
-            "that rejected or unavailable memory was used.\n\n"
+            "inputs and active-memory context. Apply every supplied active-memory strategy "
+            "explicitly, including naming each requested analysis method or artifact. Cite "
+            "concrete evidence. When memory is used, include an exact `Memory used:` section "
+            "listing its memory IDs. Do not claim that rejected or unavailable memory was used.\n\n"
             "ACTIVE MEMORY CONTEXT\n"
             + (context["text"] or "(none)")
         )
@@ -450,6 +451,14 @@ class LearningLoop:
         validate_task(task)
         run = self._create_or_load(task)
         run_id = task["run_id"]
+        if run.get("state") in {
+            "completed",
+            "review_pending",
+            "reviewed",
+            "verified",
+            "verification_failed",
+        }:
+            return self.status(run_id)
 
         try:
             context_path = self._artifact(run_id, "context.json")
