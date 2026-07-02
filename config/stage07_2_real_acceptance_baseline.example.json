@@ -1,0 +1,50 @@
+{
+  "run_id": "stage07-2-work-baseline",
+  "task_id": "stage07-2-work-baseline",
+  "type": "repository.module_audit",
+  "title": "Audit Context Builder for Stage 07.2 real acceptance",
+  "instruction": "Audit the module for reliability and cite concrete code evidence for every conclusion.",
+  "query": "module audit idempotency fail-closed recovery restricted context",
+  "workspace": "work",
+  "project": "stage07-2-real-acceptance",
+  "confidentiality": "internal",
+  "inputs": [
+    "src/context/builder.py"
+  ],
+  "minimum_score": 1.0,
+  "context_limit": 8000,
+  "criteria": [
+    {
+      "id": "idempotency",
+      "description": "verify deterministic or idempotent behavior",
+      "required_terms": [
+        "idempotency"
+      ],
+      "strategy": "For module audits, explicitly verify idempotency or deterministic replay behavior and cite the governing identity or deduplication mechanism."
+    },
+    {
+      "id": "fail_closed",
+      "description": "map invalid or ineligible cases to their rejecting code paths",
+      "required_terms": [
+        "fail-closed evidence map"
+      ],
+      "strategy": "For module audits, produce a fail-closed evidence map that links each invalid or ineligible case to the rejecting code path before treating a capability as available or safe."
+    },
+    {
+      "id": "restricted",
+      "description": "verify restricted information cannot enter exported context",
+      "required_terms": [
+        "restricted"
+      ],
+      "strategy": "For context and bridge audits, explicitly verify that restricted information is excluded before model invocation."
+    },
+    {
+      "id": "recovery_ledger",
+      "description": "document recovery replay coverage for interrupted steps",
+      "required_terms": [
+        "recovery replay ledger"
+      ],
+      "strategy": "For module audits, provide a recovery replay ledger that maps interrupted steps to their durable artifacts before claiming the flow is resilient."
+    }
+  ]
+}

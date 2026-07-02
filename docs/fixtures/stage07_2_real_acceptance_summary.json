@@ -1,0 +1,215 @@
+{
+  "artifacts": {
+    "baseline": {
+      "context.json": {
+        "relative_path": "stage07-2-work-baseline/context.json",
+        "sha256": "4b41ff3fb641077bd9dec90dfaa6ca7da3964882526c0745f75c782009b4feca"
+      },
+      "evidence.json": {
+        "relative_path": "stage07-2-work-baseline/evidence.json",
+        "sha256": "b8aa7e1fca24dedde2c214df27c0523554dab333cb9d8e074d625bbdf384976f"
+      },
+      "memory_rules.md": {
+        "relative_path": "stage07-2-work-baseline/memory_rules.md",
+        "sha256": "37fb3aab76ec508e561372908c45396065eb0799c5329196f9fad38b8aad73b8"
+      },
+      "outcome.json": {
+        "relative_path": "stage07-2-work-baseline/outcome.json",
+        "sha256": "c6cd463da84b90ff9e19d41fca145c94db994738ebef5c6d3b72063a0414d593"
+      },
+      "policy_suggestions.md": {
+        "relative_path": "stage07-2-work-baseline/policy_suggestions.md",
+        "sha256": "7dbe90e2607dc3f583a7fddb6ad383a9a03226ed415644b09ef0c75040817467"
+      },
+      "reflection.md": {
+        "relative_path": "stage07-2-work-baseline/reflection.md",
+        "sha256": "19f1239ac6078defdf0eae3bda7148bc69650256bfffb5b55c0cafc8842d64a9"
+      },
+      "result.md": {
+        "relative_path": "stage07-2-work-baseline/result.md",
+        "sha256": "80db6a201c8bb92664ee7d47824d795c0ff4d35c0b0f8afb051175ddc595ef30"
+      },
+      "review_decisions.json": {
+        "relative_path": "stage07-2-work-baseline/review_decisions.json",
+        "sha256": "942274abc3f948a39e3bb6b67b228a9e77c82ac6edc092c29e86167d5d3ec217"
+      },
+      "run.json": {
+        "relative_path": "stage07-2-work-baseline/run.json",
+        "sha256": "85e6b7fa4fd109a0e7d2259b2b71d1e3a4516f584fd4c182d55f780f2c4ec8ba"
+      }
+    },
+    "verification": {
+      "comparison.json": {
+        "relative_path": "stage07-2-work-verification/comparison.json",
+        "sha256": "8f186ce2ad5a81ad51bf046ff328fd6e5c69b42f0aca010f891349fdbe9ce587"
+      },
+      "comparison.md": {
+        "relative_path": "stage07-2-work-verification/comparison.md",
+        "sha256": "c3ff69bf43ba2f71169793c4889f6562bae78007ebc2edf87c7f9b124cffd485"
+      },
+      "context.json": {
+        "relative_path": "stage07-2-work-verification/context.json",
+        "sha256": "e92ad8fe309c626fda91265dd15d383850b77e381cf58e38769ffe4bdad6f2cd"
+      },
+      "evidence.json": {
+        "relative_path": "stage07-2-work-verification/evidence.json",
+        "sha256": "bc22e6d710db1a05d96efcb0f45b4ae6e5a4569bfd6744d7490a13c21ecbfeb6"
+      },
+      "outcome.json": {
+        "relative_path": "stage07-2-work-verification/outcome.json",
+        "sha256": "59a457c708221f0d9740a7f75aea21a1f944a6c3f0a63950608a53872a32123a"
+      },
+      "policy_suggestions.md": {
+        "relative_path": "stage07-2-work-verification/policy_suggestions.md",
+        "sha256": "fe7a5d8ce2975afd8e09b8016cf533ed93767e342d4430cc1f08f600db7669a8"
+      },
+      "reflection.md": {
+        "relative_path": "stage07-2-work-verification/reflection.md",
+        "sha256": "8c5e52f91a429ef56f2985a9cb4cedb0f8e7539c4cf816f8015f88e1bfa0d737"
+      },
+      "result.md": {
+        "relative_path": "stage07-2-work-verification/result.md",
+        "sha256": "c22bfc37ec8961c92e534ff18f3ec6938dcac1466cc0d18f7428680bbecef0ba"
+      },
+      "run.json": {
+        "relative_path": "stage07-2-work-verification/run.json",
+        "sha256": "e903ec7a830b67c933fa366880418de7c206e4d8c65368727d73d9b096637ac2"
+      }
+    }
+  },
+  "backend_type": "codex",
+  "baseline": {
+    "active_memory_before_review": [],
+    "awaiting_review_replay_same_candidate_ids": true,
+    "awaiting_review_replay_same_history": true,
+    "awaiting_review_replay_same_state": true,
+    "candidate_ids": [
+      "principle-20260702-bdf1d61d",
+      "principle-20260702-8e057f3c"
+    ],
+    "run_id": "stage07-2-work-baseline",
+    "score": 0.5,
+    "state": "awaiting_review"
+  },
+  "branch": "codex/stage-07-2-real-loop-acceptance",
+  "codex_version": "codex-cli 0.142.5",
+  "date_utc": "2026-07-02T08:13:12+00:00",
+  "head": "a6170abc6309086fbe6ab5081b1fc039778773be",
+  "health": {
+    "blocking": [],
+    "checks": [
+      {
+        "detail": "3.14.6",
+        "fix": "Use Python 3.10 or newer.",
+        "name": "python",
+        "status": "ok"
+      },
+      {
+        "detail": "<local-data-root>",
+        "fix": "Initialize the LAOS data root.",
+        "name": "data_root",
+        "status": "ok"
+      },
+      {
+        "detail": "<local-state-dir>",
+        "fix": "Choose a writable state directory.",
+        "name": "state_dir",
+        "status": "ok"
+      },
+      {
+        "detail": "3.53.2",
+        "fix": "Use a Python build with SQLite FTS5.",
+        "name": "sqlite_fts5",
+        "status": "ok"
+      },
+      {
+        "detail": "codex",
+        "fix": "",
+        "name": "model_backend",
+        "status": "ok"
+      },
+      {
+        "detail": "codex-cli 0.142.5",
+        "fix": "",
+        "name": "codex_cli",
+        "status": "ok"
+      },
+      {
+        "detail": "<codex-home>/auth.json",
+        "fix": "",
+        "name": "codex_oauth",
+        "status": "ok"
+      },
+      {
+        "detail": "not installed",
+        "fix": "Install the optional MCP SDK only when serving LAOS over MCP.",
+        "name": "mcp_sdk",
+        "status": "optional"
+      },
+      {
+        "detail": "missing",
+        "fix": "Restore or rebuild the damaged database.",
+        "name": "database:sessions.sqlite",
+        "status": "ok"
+      },
+      {
+        "detail": "missing",
+        "fix": "Restore or rebuild the damaged database.",
+        "name": "database:conversation_review.sqlite",
+        "status": "ok"
+      },
+      {
+        "detail": "missing",
+        "fix": "Restore or rebuild the damaged database.",
+        "name": "database:procedure_proposals.sqlite",
+        "status": "ok"
+      },
+      {
+        "detail": "missing",
+        "fix": "Restore or rebuild the damaged database.",
+        "name": "database:bridge_events.sqlite",
+        "status": "ok"
+      }
+    ],
+    "healthy": true
+  },
+  "no_candidate": {
+    "candidate_ids": [],
+    "run_id": "stage07-2-no-candidate",
+    "state": "verified",
+    "verification_reason": "no_update_required"
+  },
+  "origin_main": "a6170abc6309086fbe6ab5081b1fc039778773be",
+  "review": {
+    "accept_state": "review_pending",
+    "accepted_candidate_id": "principle-20260702-bdf1d61d",
+    "active_memory_after_review": [
+      "principle-20260702-bdf1d61d"
+    ],
+    "reject_state": "reviewed",
+    "rejected_candidate_id": "principle-20260702-8e057f3c",
+    "restricted_candidate_id": "principle-20260702-3bc28da4"
+  },
+  "verification": {
+    "comparison_checks": {
+      "accepted_strategy_attributed": true,
+      "accepted_strategy_injected": true,
+      "minimum_improvement": true,
+      "rejected_strategy_challenged": true,
+      "rejected_strategy_excluded": true,
+      "restricted_memory_challenged": true,
+      "restricted_memory_excluded": true,
+      "second_run_not_worse": true
+    },
+    "context_sources": [
+      "principle-20260702-bdf1d61d"
+    ],
+    "run_id": "stage07-2-work-verification",
+    "score": 1.0,
+    "score_delta": 0.5,
+    "state": "verified",
+    "used_memory_ids": [
+      "principle-20260702-bdf1d61d"
+    ]
+  }
+}
