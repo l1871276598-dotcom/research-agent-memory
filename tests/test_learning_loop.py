@@ -231,6 +231,63 @@ class LearningLoopTests(unittest.TestCase):
         self.assertTrue((run_dir / "memory_rules.md").is_file())
         self.assertFalse(any(path.suffix == ".tmp" for path in run_dir.iterdir()))
 
+    def test_nonempty_rejected_and_restricted_matches_are_excluded(self):
+        backend = ImprovingBackend()
+        loop = LearningLoop(self.data.name, self.state.name, self.work.name, backend)
+        first = loop.execute(task("adversarial-one", "module_one.py", workspace="work"))
+        accepted_id, rejected_id = first["candidate_ids"]
+        loop.review("adversarial-one", accepted_id, "accept")
+        loop.review("adversarial-one", rejected_id, "reject")
+
+        restricted = CandidateStore(self.data.name, self.state.name).create(
+            {
+                "type": "principle",
+                "title": "Restricted fail-closed recovery strategy",
+                "scope": "global",
+                "workspace": "work",
+                "confidentiality": "restricted",
+                "source": "test",
+                "content": "fail-closed recovery module audit restricted strategy",
+                "action": "create",
+                "confidence": "confirmed",
+                "source_id": "test:restricted:stage07-adversarial",
+                "evidence": ["test"],
+                "source_refs": ["test:stage07-adversarial"],
+                "tags": ["fail-closed", "recovery"],
+            }
+        )
+        restricted_id = restricted["candidate_id"]
+        ReviewGate(self.data.name, self.state.name).review(
+            "accept", restricted_id, workspace="work"
+        )
+
+        second_task = task(
+            "adversarial-two",
+            "module_two.py",
+            workspace="work",
+            query="fail-closed idempotency recovery module audit",
+        )
+        second_task["baseline_run_id"] = "adversarial-one"
+        second = loop.execute(second_task)
+        context = json.loads(
+            Path(second["artifacts"]["context.json"]).read_text(encoding="utf-8")
+        )
+        self.assertIn(accepted_id, context["sources"])
+        self.assertNotIn(rejected_id, context["sources"])
+        self.assertNotIn(restricted_id, context["sources"])
+
+        comparison = loop.compare(
+            "adversarial-one",
+            "adversarial-two",
+            minimum_improvement=0.2,
+            require_nonempty_exclusion_evidence=True,
+        )
+        self.assertTrue(comparison["passed"])
+        self.assertEqual(comparison["rejected_match_ids"], [rejected_id])
+        self.assertEqual(comparison["restricted_match_ids"], [restricted_id])
+        self.assertEqual(comparison["rejected_in_context"], [])
+        self.assertEqual(comparison["restricted_sources"], [])
+
     def test_interrupted_execution_resumes_without_partial_artifacts(self):
         backend = FailingOnceBackend()
         loop = LearningLoop(self.data.name, self.state.name, self.work.name, backend)

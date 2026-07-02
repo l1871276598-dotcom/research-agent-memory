@@ -604,13 +604,21 @@ class LearningLoop:
         )
         return self.status(run_id)
 
-    def compare(self, first_run_id, second_run_id, minimum_improvement=0.2):
+    def compare(
+        self,
+        first_run_id,
+        second_run_id,
+        minimum_improvement=0.2,
+        require_nonempty_exclusion_evidence=False,
+    ):
         if (
             isinstance(minimum_improvement, bool)
             or not isinstance(minimum_improvement, (int, float))
             or minimum_improvement < 0
         ):
             raise ValueError("minimum_improvement must be a non-negative number")
+        if not isinstance(require_nonempty_exclusion_evidence, bool):
+            raise ValueError("require_nonempty_exclusion_evidence must be a boolean")
         self._load_run(first_run_id)
         second = self._load_run(second_run_id)
         first_outcome = _read_json(self._artifact(first_run_id, "outcome.json"))
@@ -628,6 +636,35 @@ class LearningLoop:
         accepted_in_context = [item for item in accepted if item in context_sources]
         accepted_in_result = [item for item in accepted_in_context if item in second_result]
         rejected_in_context = [item for item in rejected if item in context_sources]
+        query = second["task"]["query"].casefold()
+        query_terms = {term for term in query.replace("_", " ").split() if term}
+
+        def matches(record):
+            if record.get("workspace") != second["task"]["workspace"]:
+                return False
+            project = second["task"].get("project")
+            record_project = record.get("project")
+            if project is None and record_project is not None:
+                return False
+            if project is not None and record_project not in (None, project):
+                return False
+            values = []
+            for field in ("title", "content", "tags"):
+                value = record.get(field, "")
+                values.extend(value if isinstance(value, list) else [value])
+            haystack = " ".join(str(value) for value in values).casefold()
+            return any(term in haystack for term in query_terms)
+
+        rejected_matches = [
+            item for item in rejected if matches(self.memory_store.get(item))
+        ]
+        restricted_matches = [
+            record["id"]
+            for record in self.memory_store.records()
+            if record.get("status") == "active"
+            and record.get("confidentiality") == "restricted"
+            and matches(record)
+        ]
         restricted_sources = []
         for source_id in context_sources:
             record = self.memory_store.get(source_id)
@@ -642,6 +679,13 @@ class LearningLoop:
             "restricted_memory_excluded": not restricted_sources,
             "second_run_not_worse": second_outcome["failed_count"] <= first_outcome["failed_count"],
         }
+        if require_nonempty_exclusion_evidence:
+            checks.update(
+                {
+                    "rejected_strategy_challenged": bool(rejected_matches),
+                    "restricted_memory_challenged": bool(restricted_matches),
+                }
+            )
         passed = all(checks.values())
         comparison = {
             "schema_version": 1,
@@ -656,7 +700,10 @@ class LearningLoop:
             "accepted_in_context": accepted_in_context,
             "accepted_in_result": accepted_in_result,
             "rejected_in_context": rejected_in_context,
+            "rejected_match_ids": rejected_matches,
             "restricted_sources": restricted_sources,
+            "restricted_match_ids": restricted_matches,
+            "require_nonempty_exclusion_evidence": require_nonempty_exclusion_evidence,
             "checks": checks,
             "passed": passed,
             "provenance": {

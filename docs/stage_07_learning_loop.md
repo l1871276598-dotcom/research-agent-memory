@@ -57,6 +57,7 @@ task resumes missing steps and reuses stable candidate source IDs. Reusing a
   "confidentiality": "personal",
   "inputs": ["src/context/builder.py"],
   "minimum_score": 1.0,
+  "context_limit": 8000,
   "criteria": [
     {
       "id": "fail_closed",
@@ -168,10 +169,41 @@ Stage 07 passes only when all checks are true:
 A completed workflow with no measured improvement is recorded as
 `verification_failed`, not as success.
 
+## Stage 07.1 — non-empty exclusion acceptance
+
+A basic empty-list assertion can pass even when no rejected or restricted record
+was relevant to the second task. Stage 07.1 adds an adversarial acceptance mode
+that proves both exclusion paths with real, query-relevant records in the same
+workspace and project scope.
+
+```bash
+python3 tools/learning_loop.py \
+  --data-root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --work-root "$REPO_ROOT" \
+  compare \
+  --first-run stage07-context-audit-1 \
+  --second-run stage07-projector-audit-2 \
+  --minimum-improvement 0.2 \
+  --require-nonempty-exclusion-evidence
+```
+
+When the flag is enabled, `comparison.json` must contain non-empty
+`rejected_match_ids` and `restricted_match_ids`, while `rejected_in_context` and
+`restricted_sources` remain empty. The comparison also records these explicit
+checks:
+
+- `rejected_strategy_challenged`
+- `restricted_memory_challenged`
+- `rejected_strategy_excluded`
+- `restricted_memory_excluded`
+
+This mode does not weaken workspace, project, confidentiality, or Review Gate
+rules. It only strengthens acceptance evidence.
+
 ## CI acceptance coverage
 
-The integration test uses two module-audit tasks and a deterministic fake model
-to verify:
+The integration suite uses deterministic module-audit tasks to verify:
 
 - no automatic active-memory mutation
 - stable candidate IDs and replay deduplication
@@ -179,6 +211,7 @@ to verify:
 - accepted strategy injection and attribution
 - rejected strategy isolation
 - restricted-memory exclusion
+- non-empty rejected and restricted challenge evidence
 - interruption recovery without partial artifacts
 - evidence-to-candidate-to-review-to-memory provenance
 - measured first-run versus second-run improvement

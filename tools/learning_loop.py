@@ -58,6 +58,7 @@ def _parser():
     compare.add_argument("--first-run", required=True)
     compare.add_argument("--second-run", required=True)
     compare.add_argument("--minimum-improvement", type=float, default=0.2)
+    compare.add_argument("--require-nonempty-exclusion-evidence", action="store_true")
 
     status = commands.add_parser("status")
     status.add_argument("--run-id", required=True)
@@ -95,6 +96,7 @@ def main(argv=None):
                 args.first_run,
                 args.second_run,
                 minimum_improvement=args.minimum_improvement,
+                require_nonempty_exclusion_evidence=args.require_nonempty_exclusion_evidence,
             )
         else:
             result = loop.status(args.run_id)
