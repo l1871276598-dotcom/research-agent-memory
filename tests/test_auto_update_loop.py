@@ -114,6 +114,17 @@ class AutoUpdateLoopTests(unittest.TestCase):
         self.assertNotIn("active_memory_ids", result)
         self.assertNotIn("verification_run_id", result)
 
+    def test_awaiting_review_replay_is_idempotent(self):
+        backend = Backend()
+        _, coordinator = self.build(backend)
+        baseline = make_task("awaiting-review", "one.py")
+        pending = coordinator.advance(baseline)
+        replay = coordinator.advance(baseline)
+        self.assertEqual(replay["state"], "awaiting_review")
+        self.assertEqual(replay["state_history"], pending["state_history"])
+        self.assertEqual(replay["candidate_ids"], pending["candidate_ids"])
+        self.assertEqual(backend.calls, 1)
+
     def test_interrupted_baseline_resumes_idempotently(self):
         backend = Backend(fail_on=1)
         _, coordinator = self.build(backend)
@@ -143,12 +154,39 @@ class AutoUpdateLoopTests(unittest.TestCase):
         self.assertEqual(result["state"], "verified")
         self.assertEqual(backend.calls, 3)
 
+    def test_changed_verification_task_is_rejected_after_schedule(self):
+        backend = Backend(fail_on=2)
+        loop, coordinator = self.build(backend)
+        baseline = make_task("verify-change-one", "one.py")
+        pending = coordinator.advance(baseline)
+        accepted, rejected = pending["candidate_ids"]
+        loop.review("verify-change-one", accepted, "accept")
+        loop.review("verify-change-one", rejected, "reject")
+        verification = make_task("verify-change-two", "two.py", "verify-change-one")
+        with self.assertRaisesRegex(RuntimeError, "interruption"):
+            coordinator.advance(baseline, verification_task=verification)
+
+        changed = make_task("verify-change-two", "two.py", "verify-change-one")
+        changed["title"] = "Changed verification task"
+        with self.assertRaisesRegex(ValueError, "verification task changed"):
+            coordinator.advance(baseline, verification_task=changed)
+
     def test_no_candidate_is_no_update_success(self):
-        _, coordinator = self.build(PassingBackend())
+        loop, coordinator = self.build(PassingBackend())
+        before = MemoryStore(self.data.name).active_relevant(
+            "idempotency fail-closed recovery audit",
+            workspace="personal",
+        )
         result = coordinator.advance(make_task("no-update", "one.py"))
+        after = MemoryStore(self.data.name).active_relevant(
+            "idempotency fail-closed recovery audit",
+            workspace="personal",
+        )
         self.assertEqual(result["state"], "verified")
         self.assertEqual(result["verification_reason"], "no_update_required")
         self.assertEqual(result["candidate_ids"], [])
+        self.assertEqual(before, [])
+        self.assertEqual(after, [])
 
 
 if __name__ == "__main__":

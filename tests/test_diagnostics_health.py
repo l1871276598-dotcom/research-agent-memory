@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -14,6 +15,16 @@ from memory import init_store
 
 
 class DiagnosticsHealthTests(unittest.TestCase):
+    def test_check_health_cli_starts_without_pythonpath(self):
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "check_health.py"), "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_optional_module_probe_is_safe(self):
         self.assertIsInstance(module_available("missing_parent.child"), bool)
 

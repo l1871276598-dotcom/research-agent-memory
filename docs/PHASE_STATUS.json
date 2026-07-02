@@ -1,5 +1,5 @@
 {
-  "version": "v0.8.1-development",
+  "version": "v0.8.1",
   "schema_version": 3,
   "release_readiness": "passed",
   "laos_kernel": "implemented",
@@ -19,8 +19,10 @@
   "stage_07_architecture_audit": "passed",
   "stage_07_learning_loop": "passed",
   "stage_07_1_nonempty_safety_acceptance": "passed",
+  "stage_07_2_real_loop_acceptance": "passed",
   "loop_contract": "passed",
   "automatic_update_loop_coordinator": "passed",
+  "automatic_update_loop_real_acceptance": "passed",
   "stage_08_local_security_audit": "passed",
   "stage_09_release_review": "passed",
   "review_operator_identity_verification": "not_implemented",

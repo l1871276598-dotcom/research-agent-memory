@@ -129,7 +129,7 @@ raw evidence
 
 ## 当前版本状态
 
-- 当前软件版本：v0.8.0
+- 当前软件版本：v0.8.1
 - SQLite schema：v3
 - 默认检索模式：lexical
 - 主要支持平台：macOS
@@ -156,6 +156,7 @@ raw evidence
 - Bridge Event Inbox、Session Projector、自动候选审查和崩溃恢复
 - MCP stdio 与回环 Streamable HTTP 服务
 - 可选显式 `laos_capture_checkpoint` 工具和实机验证流程
+- 自动更新 Loop：真实 Codex baseline → review gate → verification → comparison 闭环验收
 - `doctor` 健康检查
 - GitHub Actions 在 push / pull_request 运行测试、compileall 和 whitespace 检查
 
@@ -165,7 +166,6 @@ raw evidence
 - 浏览器侧无损对话事件采集源
 - 完整统一 Runtime 与默认 Combined Context
 - 长会话 Context Compactor 默认接线
-- 轻量 Loop Engineering 的任务结果闭环
 - ChatGPT 附件导入
 - PDF/DOCX 深度结构化解析
 - Link Understanding Agent / provider
@@ -277,3 +277,75 @@ python3 tools/mcp_checkpoint_trial.py serve --state-dir "$STATE_DIR"
 ```
 
 详细流程见 `docs/mcp_checkpoint_validation.md`。
+
+自动更新 Loop 真实验收最小入口：
+
+```bash
+python3 tools/learning_loop.py \
+  --data-root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --work-root "$REPO_ROOT" \
+  advance \
+  --task-file config/stage07_2_real_acceptance_baseline.example.json
+```
+
+```bash
+python3 tools/learning_loop.py \
+  --data-root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --work-root "$REPO_ROOT" \
+  auto-status \
+  --run-id stage07-2-work-baseline
+```
+
+人工 Review Gate 仍然是强制边界。接受或拒绝候选必须通过现有 `review` 命令完成，自动协调器不会替你做决定：
+
+```bash
+python3 tools/learning_loop.py \
+  --data-root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --work-root "$REPO_ROOT" \
+  review \
+  --run-id stage07-2-work-baseline \
+  --candidate-id <accepted-candidate-id> \
+  --action accept \
+  --reason "Reusable fail-closed audit strategy"
+```
+
+```bash
+python3 tools/learning_loop.py \
+  --data-root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --work-root "$REPO_ROOT" \
+  review \
+  --run-id stage07-2-work-baseline \
+  --candidate-id <rejected-candidate-id> \
+  --action reject \
+  --reason "Too specific to this acceptance fixture"
+```
+
+提交 verification task 并生成 comparison：
+
+```bash
+python3 tools/learning_loop.py \
+  --data-root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --work-root "$REPO_ROOT" \
+  advance \
+  --task-file config/stage07_2_real_acceptance_baseline.example.json \
+  --verification-task-file config/stage07_2_real_acceptance_verification.example.json \
+  --require-nonempty-exclusion-evidence
+```
+
+```bash
+python3 tools/learning_loop.py \
+  --data-root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --work-root "$REPO_ROOT" \
+  compare \
+  --first-run stage07-2-work-baseline \
+  --second-run stage07-2-work-verification \
+  --require-nonempty-exclusion-evidence
+```
+
+完整 Stage 07.2 真实环境结果、受限 fixture 写法和脱敏证据摘要见 `docs/stage_07_2_real_loop_acceptance.md`。
