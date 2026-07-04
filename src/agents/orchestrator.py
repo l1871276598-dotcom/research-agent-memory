@@ -10,7 +10,17 @@ from .base import BaseAgent
 
 
 _WORKSPACE_CHOICES = frozenset(WORKSPACE_CHOICES)
-_LEGACY_CONTEXT_FREE_TASKS = frozenset({"import.file", "import.chatgpt", "memory.review"})
+_LEGACY_CONTEXT_FREE_TASKS = frozenset(
+    {
+        "import.file",
+        "import.chatgpt",
+        "memory.review",
+        "loop.reflect",
+        "loop.suggest-policies",
+        "loop.generate-candidate",
+        "loop.coordinate",
+    }
+)
 
 
 def _input(agent, task, allowed=None):

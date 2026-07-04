@@ -4,7 +4,11 @@ import sys
 from pathlib import Path
 
 import memory_tools
+from agents.candidate_generator import LowRiskCandidateAgent
+from agents.coordinator import LoopCoordinatorAgent
 from agents.orchestrator import ContextAgent, ImportAgent, MemoryAgent, ReviewAgent, SearchAgent
+from agents.policy import PolicyAgent
+from agents.reflection import ReflectionAgent
 from agents.registry import AgentRegistry
 from context.builder import ContextBuilder
 from memory.candidate import CandidateStore
@@ -23,6 +27,9 @@ def build_application(root, state_dir=None):
     store = MemoryStore(root)
     candidates = CandidateStore(root, state_dir)
     core = MemoryCore(store, candidates)
+    reflection = ReflectionAgent(candidates.state_dir)
+    policy = PolicyAgent(root, candidates.state_dir)
+    generator = LowRiskCandidateAgent(core, candidates.state_dir)
     agents = [
         ImportAgent(root, memory_tools),
         MemoryAgent(core),
@@ -32,8 +39,18 @@ def build_application(root, state_dir=None):
             default_workspace="personal",
         ),
         ContextAgent(ContextBuilder(store)),
+        reflection,
+        policy,
+        generator,
+        LoopCoordinatorAgent(
+            root,
+            candidates.state_dir,
+            reflection,
+            policy,
+            generator,
+        ),
     ]
-    config = Path(__file__).with_name("agents") / "registry.yaml"
+    config = Path(__file__).with_name("agents") / "registry-v0.9.yaml"
     return Orchestrator(AgentRegistry.from_config(config, agents))
 
 
