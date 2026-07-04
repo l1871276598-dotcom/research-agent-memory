@@ -1,7 +1,7 @@
 {
   "version": "v0.9.0-development",
   "schema_version": 3,
-  "release_readiness": "in_progress",
+  "release_readiness": "passed",
   "v0.8_release_readiness": "passed",
   "laos_kernel": "implemented",
   "five_agent_registry": "implemented",
@@ -75,7 +75,7 @@
   "stage_15_major_findings_fixed": 5,
   "stage_15_minor_findings": 0,
   "stage_15_cleanup_probe_removed": "implemented",
-  "stage_16_v0.9_release": "not_started",
+  "stage_16_v0.9_release": "passed",
   "review_operator_identity_verification": "not_implemented",
   "mcp": "not_implemented",
   "owner_agent_authentication": "not_implemented",
