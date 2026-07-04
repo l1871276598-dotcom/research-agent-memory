@@ -4,8 +4,11 @@ import sys
 from pathlib import Path
 
 import memory_tools
+from agents.candidate_generator import LowRiskCandidateAgent
+from agents.coordinator import LoopCoordinatorAgent
 from agents.orchestrator import ContextAgent, ImportAgent, MemoryAgent, ReviewAgent, SearchAgent
-from agents.reflection import ConversationReviewAgent
+from agents.policy import PolicyAgent
+from agents.reflection import ConversationReviewAgent, ReflectionAgent
 from agents.reflection_record import ReflectionRecordAgent
 from agents.registry import AgentRegistry
 from context.builder import ContextBuilder
@@ -28,6 +31,11 @@ def build_application(root, state_dir=None, model_backend=None):
     store = MemoryStore(root)
     candidates = CandidateStore(root, state_dir)
     core = MemoryCore(store, candidates)
+
+    reflection = ReflectionAgent(candidates.state_dir)
+    policy = PolicyAgent(root, candidates.state_dir)
+    generator = LowRiskCandidateAgent(core, candidates.state_dir)
+
     backend = model_backend or build_model_backend()
     if not callable(getattr(backend, "review", None)):
         raise ValueError("model backend does not support conversation review")
@@ -37,6 +45,7 @@ def build_application(root, state_dir=None, model_backend=None):
         ReviewStateStore(candidates.state_dir),
         procedure_proposals=ProcedureProposalStore(candidates.state_dir),
     )
+
     agents = [
         ImportAgent(root, memory_tools),
         MemoryAgent(core),
@@ -46,10 +55,20 @@ def build_application(root, state_dir=None, model_backend=None):
             default_workspace="personal",
         ),
         ContextAgent(ContextBuilder(store)),
+        reflection,
+        policy,
+        generator,
+        LoopCoordinatorAgent(
+            root,
+            candidates.state_dir,
+            reflection,
+            policy,
+            generator,
+        ),
         ConversationReviewAgent(review_service),
         ReflectionRecordAgent(review_coordinator),
     ]
-    config = Path(__file__).with_name("agents") / "runtime_registry.yaml"
+    config = Path(__file__).with_name("agents") / "registry-v0.9.yaml"
     return Orchestrator(AgentRegistry.from_config(config, agents))
 
 

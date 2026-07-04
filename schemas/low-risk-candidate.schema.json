@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/low-risk-candidate.schema.json",
+  "title": "LAOS Low-risk Candidate Generation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "request_id",
+    "policy_id",
+    "policy_text",
+    "workspace",
+    "project",
+    "minimum_independent_evidence",
+    "evidence_run_ids",
+    "evidence_fingerprints",
+    "candidate_id",
+    "candidate_path",
+    "status",
+    "applied"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "contract_id": {"const": "laos.low-risk-candidate.v1"},
+    "request_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "policy_id": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
+    "policy_text": {"type": "string", "minLength": 1},
+    "workspace": {"enum": ["personal", "work"]},
+    "project": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "minLength": 1}
+      ]
+    },
+    "minimum_independent_evidence": {"const": 3},
+    "evidence_run_ids": {
+      "type": "array",
+      "minItems": 3,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+    },
+    "evidence_fingerprints": {
+      "type": "array",
+      "minItems": 3,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    },
+    "candidate_id": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "minLength": 1}
+      ]
+    },
+    "candidate_path": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "minLength": 1}
+      ]
+    },
+    "status": {"enum": ["pending_creation", "candidate"]},
+    "applied": {"const": false}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"status": {"const": "pending_creation"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "candidate_id": {"type": "null"},
+          "candidate_path": {"type": "null"}
+        }
+      },
+      "else": {
+        "properties": {
+          "candidate_id": {"type": "string", "minLength": 1},
+          "candidate_path": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  ]
+}

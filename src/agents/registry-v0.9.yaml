@@ -1,0 +1,15 @@
+{
+  "agents": [
+    {"id": "import_agent", "class": "ImportAgent", "handles": ["import.file", "import.chatgpt"]},
+    {"id": "memory_agent", "class": "MemoryAgent", "handles": ["memory.create"]},
+    {"id": "search_agent", "class": "SearchAgent", "handles": ["memory.search"]},
+    {"id": "review_agent", "class": "ReviewAgent", "handles": ["memory.review"]},
+    {"id": "context_agent", "class": "ContextAgent", "handles": ["context.build"]},
+    {"id": "reflection_agent", "class": "ReflectionAgent", "handles": ["loop.reflect"]},
+    {"id": "policy_agent", "class": "PolicyAgent", "handles": ["loop.suggest-policies"]},
+    {"id": "low_risk_candidate_agent", "class": "LowRiskCandidateAgent", "handles": ["loop.generate-candidate"]},
+    {"id": "loop_coordinator_agent", "class": "LoopCoordinatorAgent", "handles": ["loop.coordinate"]},
+    {"id": "conversation_review_agent", "class": "ConversationReviewAgent", "handles": ["reflection.prepare", "reflection.apply"]},
+    {"id": "reflection_record_agent", "class": "ReflectionRecordAgent", "handles": ["reflection.record"]}
+  ]
+}

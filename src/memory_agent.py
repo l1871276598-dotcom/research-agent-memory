@@ -6,7 +6,6 @@ import re
 import shutil
 import sys
 import tempfile
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,15 +23,42 @@ else:
 
 
 SCHEMA_VERSION = 1
+LOOP_CONTRACT_VERSION = 2
+LOOP_CONTRACT_ID = "laos.loop-run.v2"
 DEFAULT_MAX_CHARS = 8000
 DEFAULT_MAX_TASK_CHARS = 20_000
 DEFAULT_MAX_RESULT_CHARS = 60_000
 DEFAULT_MAX_CANDIDATE_CHARS = 80_000
 LOOP_REVIEW_PLACEHOLDER = "Pending human or agent review."
 RUN_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+POLICY_ID_PATTERN = re.compile(r"[0-9a-f]{16}")
 POLICY_LINE_PATTERN = re.compile(
     r"- \[([ xX])\] (.+) <!-- policy_id: ([0-9a-f]{16}) -->"
 )
+LOOP_V2_REQUIRED_KEYS = {
+    "schema_version",
+    "contract_version",
+    "contract_id",
+    "run_id",
+    "idempotency_key",
+    "task_sha256",
+    "result_sha256",
+    "outcome",
+    "candidate_ids",
+    "generated_candidate_ids",
+    "approved_policy_ids",
+    "policy_suggestion_ids",
+    "reflection_path",
+    "policy_suggestions_path",
+    "reflection_status",
+    "policy_status",
+    "candidate_status",
+    "review_required",
+    "approved_policy_count",
+    "status",
+}
+LOOP_V2_PARTITION_KEYS = {"workspace", "project"}
 
 
 class AgentError(ValueError):
@@ -150,7 +176,9 @@ def _candidate_content(task, result):
     return f"Original task:\n{task}\n\nCompleted task result:\n{result}"
 
 
-def _candidate_args(root, state, task, result):
+def _candidate_args(root, state, task, result, workspace=None, project=None):
+    workspace = workspace or "personal"
+    project = project.strip() if isinstance(project, str) else None
     task_text = " ".join(task.split())
     task_hash = hashlib.sha256(task.encode("utf-8")).hexdigest()
     result_hash = hashlib.sha256(result.encode("utf-8")).hexdigest()
@@ -163,14 +191,14 @@ def _candidate_args(root, state, task, result):
         max_iterations=2,
         type="session",
         title=f"Task result: {task_text[:80]}",
-        scope="global",
-        workspace="personal",
-        confidentiality="personal",
+        scope="project" if project else "global",
+        workspace=workspace,
+        confidentiality="personal" if workspace == "personal" else "internal",
         source="memory-agent",
         confidence="inferred",
         content=_candidate_content(task, result),
         target_id=None,
-        project=None,
+        project=project,
         context_id=None,
         source_id=None,
         source_path=None,
@@ -203,30 +231,57 @@ def _validate_finalize_input(
         raise AgentError("candidate_too_large", "Candidate memory exceeds the allowed size.")
 
 
-def _validate_loop_input(outcome, error, reflection, policy_suggestions):
+def _validate_loop_input(
+    outcome,
+    error,
+    reflection,
+    policy_suggestions,
+    root_cause,
+    next_change,
+    workspace,
+    project,
+):
     if outcome is None and any(
-        value is not None for value in (error, reflection, policy_suggestions)
+        value is not None
+        for value in (
+            error,
+            reflection,
+            policy_suggestions,
+            root_cause,
+            next_change,
+        )
     ):
         raise AgentError(
             "conflicting_input", "Loop Engineering fields require an outcome."
         )
     if outcome not in {None, "pass", "fail"}:
         raise AgentError("invalid_arguments", "Invalid command arguments.")
-    if error is not None and not isinstance(error, str):
-        raise AgentError("invalid_arguments", "Invalid command arguments.")
-    if reflection is not None and not isinstance(reflection, str):
+    if any(
+        value is not None and not isinstance(value, str)
+        for value in (error, reflection, root_cause, next_change)
+    ):
         raise AgentError("invalid_arguments", "Invalid command arguments.")
     if policy_suggestions is not None and (
         not isinstance(policy_suggestions, (list, tuple))
         or any(not isinstance(item, str) for item in policy_suggestions)
     ):
         raise AgentError("invalid_arguments", "Invalid command arguments.")
+    if workspace is not None and workspace not in memory.WORKSPACE_CHOICES:
+        raise AgentError("invalid_arguments", "Invalid command arguments.")
+    if project is not None and (
+        not isinstance(project, str) or not project.strip()
+    ):
+        raise AgentError("invalid_arguments", "Invalid command arguments.")
 
 
-def _reflection_text(task, result, outcome, error, reflection):
+def _reflection_text(
+    task, result, outcome, error, reflection, root_cause=None, next_change=None
+):
     supplied = reflection if reflection and reflection.strip() else LOOP_REVIEW_PLACEHOLDER
     worked = supplied if outcome == "pass" else LOOP_REVIEW_PLACEHOLDER
     failed = supplied if outcome == "fail" else LOOP_REVIEW_PLACEHOLDER
+    cause = root_cause if root_cause and root_cause.strip() else LOOP_REVIEW_PLACEHOLDER
+    change = next_change if next_change and next_change.strip() else LOOP_REVIEW_PLACEHOLDER
     return (
         "# Reflection\n\n"
         f"## Task\n\n{task}\n\n"
@@ -235,8 +290,8 @@ def _reflection_text(task, result, outcome, error, reflection):
         f"## Error Evidence\n\n{error if error and error.strip() else 'None'}\n\n"
         f"## What Worked\n\n{worked}\n\n"
         f"## What Failed\n\n{failed}\n\n"
-        f"## Root Cause\n\n{LOOP_REVIEW_PLACEHOLDER}\n\n"
-        f"## Next Change\n\n{LOOP_REVIEW_PLACEHOLDER}\n"
+        f"## Root Cause\n\n{cause}\n\n"
+        f"## Next Change\n\n{change}\n"
     )
 
 
@@ -244,16 +299,23 @@ def _normalized_policy(value):
     return " ".join(value.split())
 
 
+def _normalized_policies(policy_suggestions):
+    policies = []
+    seen = set()
+    for item in policy_suggestions or []:
+        normalized = _normalized_policy(item)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            policies.append(normalized)
+    return policies
+
+
 def _policy_id(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
 def _policy_suggestions_text(policy_suggestions):
-    policies = [
-        normalized
-        for normalized in (_normalized_policy(item) for item in policy_suggestions or [])
-        if normalized
-    ]
+    policies = _normalized_policies(policy_suggestions)
     if not policies:
         return (
             "# Policy Suggestions\n\n"
@@ -265,6 +327,40 @@ def _policy_suggestions_text(policy_suggestions):
         for policy in policies
     )
     return "\n".join(lines) + "\n"
+
+
+def _loop_input_digest(
+    task,
+    result,
+    outcome,
+    error,
+    reflection,
+    policy_suggestions,
+    root_cause=None,
+    next_change=None,
+    workspace=None,
+    project=None,
+):
+    payload = {
+        "task": task,
+        "result": result,
+        "outcome": outcome,
+        "error": error,
+        "reflection": reflection,
+        "policy_suggestions": _normalized_policies(policy_suggestions),
+    }
+    if root_cause is not None:
+        payload["root_cause"] = root_cause
+    if next_change is not None:
+        payload["next_change"] = next_change
+    if workspace is not None:
+        payload["workspace"] = workspace
+    if project is not None:
+        payload["project"] = project.strip()
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _loop_runs_dir(state, create):
@@ -293,66 +389,173 @@ def _loop_runs_dir(state, create):
     return runs
 
 
-def _create_loop_run(state, task, result, outcome, error, reflection, policy_suggestions):
+def _is_loop_contract_v2(run_data):
+    return (
+        isinstance(run_data, dict)
+        and run_data.get("schema_version") == SCHEMA_VERSION
+        and run_data.get("contract_version") == LOOP_CONTRACT_VERSION
+        and run_data.get("contract_id") == LOOP_CONTRACT_ID
+    )
+
+
+def _loop_run_payload(state, run_dir, run_id, reused):
+    return {
+        "run_id": run_id,
+        "path": run_dir.relative_to(state).as_posix(),
+        "reused": reused,
+    }
+
+
+def _reuse_loop_run(state, run_dir, run_id, idempotency_key):
+    _, run_data, _ = _load_loop_run(state, run_id)
+    if not _is_loop_contract_v2(run_data) or run_data.get(
+        "idempotency_key"
+    ) != idempotency_key:
+        raise AgentError(
+            "loop_idempotency_conflict",
+            "Loop Engineering idempotency key conflicts with an existing run.",
+        )
+    return _loop_run_payload(state, run_dir, run_id, True), run_dir, run_data
+
+
+def _create_loop_run(
+    state,
+    task,
+    result,
+    outcome,
+    error,
+    reflection,
+    policy_suggestions,
+    root_cause=None,
+    next_change=None,
+    workspace=None,
+    project=None,
+):
     runs = _loop_runs_dir(state, create=True)
+    idempotency_key = _loop_input_digest(
+        task,
+        result,
+        outcome,
+        error,
+        reflection,
+        policy_suggestions,
+        root_cause,
+        next_change,
+        workspace,
+        project,
+    )
+    run_id = idempotency_key[:32]
+    run_dir = runs / run_id
+    if run_dir.exists():
+        return _reuse_loop_run(state, run_dir, run_id, idempotency_key)
+
     staging = None
     try:
-        for _ in range(10):
-            run_id = uuid.uuid4().hex
-            run_dir = runs / run_id
-            if not run_dir.exists():
-                break
-        else:
-            raise OSError("unique run identifier could not be created")
         staging = Path(tempfile.mkdtemp(prefix=f".tmp-{run_id}-", dir=runs))
+        normalized_policies = _normalized_policies(policy_suggestions)
+        candidate_status = "pending" if result.strip() else "not_generated"
         run_data = {
             "schema_version": SCHEMA_VERSION,
+            "contract_version": LOOP_CONTRACT_VERSION,
+            "contract_id": LOOP_CONTRACT_ID,
             "run_id": run_id,
+            "idempotency_key": idempotency_key,
             "task_sha256": hashlib.sha256(task.encode("utf-8")).hexdigest(),
             "result_sha256": hashlib.sha256(result.encode("utf-8")).hexdigest(),
             "outcome": outcome,
             "candidate_ids": [],
+            "generated_candidate_ids": [],
+            "approved_policy_ids": [],
+            "policy_suggestion_ids": [_policy_id(item) for item in normalized_policies],
             "reflection_path": "reflection.md",
             "policy_suggestions_path": "policy_suggestions.md",
+            "reflection_status": "completed",
+            "policy_status": "review_required",
+            "candidate_status": candidate_status,
             "review_required": True,
             "approved_policy_count": 0,
             "status": "waiting_for_human",
         }
+        if workspace is not None or project is not None:
+            run_data["workspace"] = workspace or "personal"
+            run_data["project"] = project.strip() if isinstance(project, str) else None
         memory.atomic_write_text(
             staging / "run.json",
             json.dumps(run_data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         )
         memory.atomic_write_text(
             staging / "reflection.md",
-            _reflection_text(task, result, outcome, error, reflection),
+            _reflection_text(
+                task,
+                result,
+                outcome,
+                error,
+                reflection,
+                root_cause,
+                next_change,
+            ),
         )
         memory.atomic_write_text(
             staging / "policy_suggestions.md",
-            _policy_suggestions_text(policy_suggestions),
+            _policy_suggestions_text(normalized_policies),
         )
-        os.replace(staging, run_dir)
+        try:
+            os.replace(staging, run_dir)
+        except OSError:
+            if run_dir.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+                staging = None
+                return _reuse_loop_run(state, run_dir, run_id, idempotency_key)
+            raise
+    except AgentError:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+        raise
     except Exception as exc:
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
         raise AgentError(
             "loop_write_failed", "Loop Engineering run could not be created."
         ) from exc
-    return {
-        "run_id": run_id,
-        "path": run_dir.relative_to(state).as_posix(),
-    }, run_dir
+    return _loop_run_payload(state, run_dir, run_id, False), run_dir, run_data
+
+
+def _read_run_json(run_dir):
+    return json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+
+
+def _write_run_json(run_dir, run_data):
+    memory.atomic_write_text(
+        run_dir / "run.json",
+        json.dumps(run_data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
 
 
 def _link_loop_candidate(run_dir, candidate_id):
-    run_path = run_dir / "run.json"
-    run_data = json.loads(run_path.read_text(encoding="utf-8"))
-    if run_data.get("candidate_ids") != []:
-        raise ValueError("loop run already has candidate linkage")
+    run_data = _read_run_json(run_dir)
+    current = run_data.get("candidate_ids")
+    generated = run_data.get("generated_candidate_ids", current)
+    if current == [candidate_id] and generated == [candidate_id]:
+        return
+    if current != [] or generated != []:
+        raise ValueError("loop run already has different candidate linkage")
     run_data["candidate_ids"] = [candidate_id]
-    memory.atomic_write_text(
-        run_path,
-        json.dumps(run_data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-    )
+    if _is_loop_contract_v2(run_data):
+        run_data["generated_candidate_ids"] = [candidate_id]
+        run_data["candidate_status"] = "generated"
+    _write_run_json(run_dir, run_data)
+
+
+def _mark_loop_candidate_not_generated(run_dir):
+    run_data = _read_run_json(run_dir)
+    if not _is_loop_contract_v2(run_data):
+        return
+    if run_data.get("candidate_ids") or run_data.get("generated_candidate_ids"):
+        return
+    if run_data.get("candidate_status") == "not_generated":
+        return
+    run_data["candidate_status"] = "not_generated"
+    _write_run_json(run_dir, run_data)
 
 
 def _rollback_loop_link(root, state, run_dir, candidate_path, journal_before):
@@ -399,29 +602,64 @@ def finalize_memory(
     error=None,
     reflection=None,
     policy_suggestions=None,
+    root_cause=None,
+    next_change=None,
+    workspace=None,
+    project=None,
 ):
     _validate_finalize_input(
         task, result, max_task_chars, max_result_chars, max_candidate_chars
     )
-    _validate_loop_input(outcome, error, reflection, policy_suggestions)
+    _validate_loop_input(
+        outcome,
+        error,
+        reflection,
+        policy_suggestions,
+        root_cause,
+        next_change,
+        workspace,
+        project,
+    )
     root, state = _validated_paths(root, state_dir)
     loop_run = None
     run_dir = None
+    run_data = None
     if outcome is not None:
-        loop_run, run_dir = _create_loop_run(
-            state, task, result, outcome, error, reflection, policy_suggestions
+        loop_run, run_dir, run_data = _create_loop_run(
+            state,
+            task,
+            result,
+            outcome,
+            error,
+            reflection,
+            policy_suggestions,
+            root_cause,
+            next_change,
+            workspace,
+            project,
         )
     artifacts = []
-    if result.strip():
-        journal_path = memory_distill._journal_path(root)
-        journal_before = (
-            journal_path.read_text(encoding="utf-8")
-            if run_dir is not None and journal_path.exists()
-            else None
-        )
+    candidate_status = run_data.get("candidate_status") if run_data else None
+    should_distill = bool(result.strip()) and not (
+        loop_run is not None
+        and loop_run["reused"]
+        and candidate_status in {"generated", "not_generated"}
+    )
+    if should_distill:
+        journal_before = None
         try:
+            journal_path = memory_distill._journal_path(root)
+            if run_dir is not None and journal_path.exists():
+                journal_before = journal_path.read_text(encoding="utf-8")
             summary = memory_distill.apply_candidate(
-                _candidate_args(root, state, task, result)
+                _candidate_args(
+                    root,
+                    state,
+                    task,
+                    result,
+                    workspace=workspace,
+                    project=project,
+                )
             )
             relative_path = summary.get("path")
             if relative_path:
@@ -456,6 +694,8 @@ def finalize_memory(
                         "path": relative_path,
                     }
                 )
+            elif run_dir is not None:
+                _mark_loop_candidate_not_generated(run_dir)
         except AgentError:
             raise
         except Exception as exc:
@@ -484,6 +724,88 @@ def finalize_memory(
     return payload
 
 
+def _is_string_list(value):
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _valid_loop_run_v1(run_data, run_id):
+    return (
+        run_data.get("schema_version") == SCHEMA_VERSION
+        and "contract_id" not in run_data
+        and "contract_version" not in run_data
+        and run_data.get("run_id") == run_id
+        and run_data.get("outcome") in {"pass", "fail"}
+        and run_data.get("reflection_path") == "reflection.md"
+        and run_data.get("policy_suggestions_path") == "policy_suggestions.md"
+        and run_data.get("status") in {"waiting_for_human", "completed"}
+        and run_data.get("review_required") is True
+        and _is_string_list(run_data.get("candidate_ids"))
+        and isinstance(run_data.get("approved_policy_count"), int)
+        and run_data.get("approved_policy_count") >= 0
+    )
+
+
+def _valid_loop_run_v2(run_data, run_id):
+    keys = set(run_data) if isinstance(run_data, dict) else set()
+    partition_keys = keys & LOOP_V2_PARTITION_KEYS
+    candidate_ids = run_data.get("candidate_ids")
+    generated_ids = run_data.get("generated_candidate_ids")
+    approved_ids = run_data.get("approved_policy_ids")
+    suggestion_ids = run_data.get("policy_suggestion_ids")
+    status = run_data.get("status")
+    policy_status = run_data.get("policy_status")
+    candidate_status = run_data.get("candidate_status")
+    workspace = run_data.get("workspace", "personal")
+    project = run_data.get("project")
+    if not (
+        _is_loop_contract_v2(run_data)
+        and LOOP_V2_REQUIRED_KEYS <= keys
+        and keys <= LOOP_V2_REQUIRED_KEYS | LOOP_V2_PARTITION_KEYS
+        and (not partition_keys or partition_keys == LOOP_V2_PARTITION_KEYS)
+        and workspace in memory.WORKSPACE_CHOICES
+        and (
+            project is None
+            or isinstance(project, str)
+            and bool(project.strip())
+        )
+        and run_data.get("run_id") == run_id
+        and isinstance(run_data.get("idempotency_key"), str)
+        and SHA256_PATTERN.fullmatch(run_data["idempotency_key"]) is not None
+        and isinstance(run_data.get("task_sha256"), str)
+        and SHA256_PATTERN.fullmatch(run_data["task_sha256"]) is not None
+        and isinstance(run_data.get("result_sha256"), str)
+        and SHA256_PATTERN.fullmatch(run_data["result_sha256"]) is not None
+        and run_data.get("outcome") in {"pass", "fail"}
+        and run_data.get("reflection_path") == "reflection.md"
+        and run_data.get("policy_suggestions_path") == "policy_suggestions.md"
+        and run_data.get("reflection_status") == "completed"
+        and status in {"waiting_for_human", "completed"}
+        and policy_status in {"review_required", "completed"}
+        and candidate_status in {"pending", "generated", "not_generated"}
+        and run_data.get("review_required") is True
+        and _is_string_list(candidate_ids)
+        and _is_string_list(generated_ids)
+        and candidate_ids == generated_ids
+        and _is_string_list(approved_ids)
+        and _is_string_list(suggestion_ids)
+        and all(POLICY_ID_PATTERN.fullmatch(item) is not None for item in approved_ids)
+        and all(POLICY_ID_PATTERN.fullmatch(item) is not None for item in suggestion_ids)
+        and set(approved_ids).issubset(set(suggestion_ids))
+        and isinstance(run_data.get("approved_policy_count"), int)
+        and run_data.get("approved_policy_count") == len(approved_ids)
+    ):
+        return False
+    if candidate_status == "generated" and not candidate_ids:
+        return False
+    if candidate_status in {"pending", "not_generated"} and candidate_ids:
+        return False
+    if status == "waiting_for_human" and policy_status != "review_required":
+        return False
+    if status == "completed" and policy_status != "completed":
+        return False
+    return True
+
+
 def _load_loop_run(state, run_id):
     if not isinstance(run_id, str) or RUN_ID_PATTERN.fullmatch(run_id) is None:
         raise AgentError("invalid_run_id", "Run identifier is invalid.")
@@ -502,21 +824,18 @@ def _load_loop_run(state, run_id):
         if any(path.is_symlink() or not path.is_file() for path in paths.values()):
             raise AgentError("invalid_loop_run", "Loop Engineering run is incomplete.")
         run_data = json.loads(paths["run"].read_text(encoding="utf-8"))
+        paths["reflection"].read_text(encoding="utf-8")
         policy_text = paths["policies"].read_text(encoding="utf-8")
     except AgentError:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise AgentError("invalid_loop_run", "Loop Engineering run is invalid.") from exc
-    if (
-        not isinstance(run_data, dict)
-        or run_data.get("schema_version") != SCHEMA_VERSION
-        or run_data.get("run_id") != run_id
-        or run_data.get("outcome") not in {"pass", "fail"}
-        or run_data.get("reflection_path") != "reflection.md"
-        or run_data.get("policy_suggestions_path") != "policy_suggestions.md"
-        or run_data.get("status") not in {"waiting_for_human", "completed"}
-        or run_data.get("review_required") is not True
-    ):
+    valid = (
+        _valid_loop_run_v2(run_data, run_id)
+        if isinstance(run_data, dict) and "contract_id" in run_data
+        else _valid_loop_run_v1(run_data, run_id)
+    )
+    if not valid:
         raise AgentError("invalid_loop_run", "Loop Engineering run is invalid.")
     return paths, run_data, policy_text
 
@@ -586,6 +905,9 @@ def approve_policies(root, state_dir=None, run_id=None, confirmed=False):
         completed = dict(run_data)
         completed["status"] = "completed"
         completed["approved_policy_count"] = len(checked)
+        if _is_loop_contract_v2(completed):
+            completed["approved_policy_ids"] = [policy_id for policy_id, _ in checked]
+            completed["policy_status"] = "completed"
         operations = []
         if added:
             operations.append((rules_path, rules_text))
@@ -634,6 +956,10 @@ def build_parser():
     finalize.add_argument("--outcome", choices=("pass", "fail"))
     finalize.add_argument("--error")
     finalize.add_argument("--reflection")
+    finalize.add_argument("--root-cause")
+    finalize.add_argument("--next-change")
+    finalize.add_argument("--workspace", choices=memory.WORKSPACE_CHOICES)
+    finalize.add_argument("--project")
     finalize.add_argument("--policy-suggestion", action="append", dest="policy_suggestions")
 
     approve = subparsers.add_parser(
@@ -718,6 +1044,10 @@ def main(argv=None):
                 error=args.error,
                 reflection=args.reflection,
                 policy_suggestions=args.policy_suggestions,
+                root_cause=args.root_cause,
+                next_change=args.next_change,
+                workspace=args.workspace,
+                project=args.project,
             )
         else:
             payload = approve_policies(

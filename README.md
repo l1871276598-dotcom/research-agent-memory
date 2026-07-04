@@ -1,255 +1,154 @@
 # Local Agent Operating System (LAOS)
 
-本仓库是 **Local Agent Operating System（LAOS）** 的本地优先实现。它的目标不是只“记住”信息，而是把知识、项目、经验、规则和上下文统一到一个可持续演化的本地系统中，让 GPT、Codex、Claude、本地模型以及未来 Agent 能持续学习并复用过去成果。
+LAOS 是一个本地优先、可审计、人工审核受控的 Agent 记忆与学习层。它把结构化记忆、项目上下文、任务结果、反思、策略候选、会话审查和可复用原则统一到本地文件与可重建索引中，供 GPT、Codex、Claude、本地模型和其他 Agent 复用。
 
-当前代码仍处于 **Memory Core 阶段**：已经具备本地结构化记忆、SQLite FTS5 检索、ChatGPT ZIP 手动导入、Trusted Memory Loop、人工审核闸门和 Context Pack 输出能力。完整 LAOS 的 Orchestrator Agent、Agent Registry、Link Understanding Agent、Rule / Reflection / Evolution Agent 等仍属于后续路线图。
+## 当前版本
 
-真实记忆、真实 ChatGPT ZIP、真实聊天记录、未发表资料、PDF、SQLite、日志、缓存、API key、密码、SSH 私钥和 token 不得提交到 GitHub。GitHub 只保存代码、Schema、模板、测试和文档；Markdown 记忆、raw 原始证据和稳定文本副本保存在用户选择的数据目录；活动 SQLite、WAL/SHM、缓存和日志必须保存在本地 state 目录。
+- 开发版本：`v0.9.0-development`
+- 目标发布版本：`v0.9.0`
+- SQLite schema：`v3`
+- Python：`3.11+`
+- 主要验证平台：macOS、Ubuntu、Windows
+- 运行边界：本地、可信操作者、命令行或受控本地服务
 
-## 核心定位
+`v0.9.0` 尚未打 tag、合并或正式发布。当前分支用于 Draft PR 审查；合并、tag、GitHub Release 和部署仍需单独确认。
 
-LAOS 的最高目标是构建 **Agent 的本地学习层**：
+## v0.9 已实现能力
 
-```text
-输入资料 / 任务结果
-→ 结构化沉淀
-→ 候选记忆
-→ 质量检查
-→ 人工审核
-→ 长期记忆更新
-→ Context Pack 编译
-→ Agent 调用复用
-→ 任务结果反哺
-```
+### Memory Core 与安全边界
 
-它不是普通 memory database，也不是单一 Agent 框架，而是一个以本地记忆为核心资源、以可插拔 Agent 为能力单元、以审核机制为安全边界的本地 Agent 操作系统。
+- Markdown / JSONL 权威数据源与可重建 SQLite FTS5 索引
+- ChatGPT 官方 ZIP 手动导入与手动文件归档
+- 结构化记忆、workspace / project / confidentiality / 时间有效性
+- candidate-only 创建与统一 Review Gate
+- restricted 内容默认不进入搜索、Context Pack 或外部调用上下文
+- Trusted Memory Loop、写前校验、事务回滚、重建索引和 durable journal
 
-## 最高架构公约
+### 统一 11 Agent JSON CLI
 
-1. **Memory Core 是唯一可信知识源**：长期知识、项目状态、经验和规则必须通过标准接口进入 Memory Core。
-2. **所有长期记忆更新必须经过 Review Gate**：任何 Agent 都不能绕过人工审核直接写入 active memory。
-3. **所有能力优先以 Agent 形式存在**：新增需求优先新增或替换 Agent，而不是重构核心系统。
-4. **Orchestrator 只调度，不承载业务逻辑**：总控 Agent 负责理解需求、选择 Agent、组装 Context Pack 和收集结果。
-5. **Context Pack 必须最小化**：按任务、项目、可信度、时间有效性和保密等级筛选，不全量灌入上下文。
-6. **restricted 内容永不导出**：搜索、Context Pack 和外部 Agent 调用默认排除 restricted。
-7. **外部系统通过 Adapter 接入**：文献、网页、GitHub、Gmail、Zotero/EndNote 等不内置进 Memory Core。
+`src/laos.py` 通过一个精确注册表提供：
 
-## 目标架构
+- Import Agent
+- Memory Agent
+- Search Agent
+- Review Agent
+- Context Agent
+- Deterministic Reflection Agent
+- Policy Agent
+- Low-risk Candidate Agent
+- Loop Coordinator Agent
+- Conversation Review Agent
+- Reflection Record Agent
 
-```text
-User
-  │
-  ▼
-Orchestrator Agent
-  │
-  ▼
-Agent Registry
-  │
-  ├── Import Agent
-  ├── Memory Agent
-  ├── Project Agent
-  ├── Rule Agent
-  ├── Reflection Agent
-  ├── Context Agent
-  ├── Search Agent
-  ├── Review Agent
-  ├── Quality Agent
-  ├── Link Understanding Agent
-  ├── Code / Codex Bridge Agent
-  ├── External Adapter Agent
-  └── Evolution Agent
-```
+Orchestrator 只负责上下文准备、精确路由和结果校验，不承载审核或持久化业务逻辑。
 
-### Orchestrator Agent
-
-唯一总控和 Router。负责理解需求、判断任务类型、读取相关记忆、选择合适 Agent / Skill、组装最小 Context Pack、收集执行结果，并把结果转成候选记忆或反思候选。
-
-### Agent Registry
-
-所有 Agent 的注册中心。未来新增需求时，优先注册一个新 Agent，而不是修改 Orchestrator 或重构核心。
-
-### Memory Agent
-
-维护长期记忆生命周期：
+### 确定性学习链
 
 ```text
-raw evidence
-→ candidate
-→ active knowledge / experience / rule / project state
-→ deprecated / conflict / archived
+finalize
+→ loop.reflect
+→ loop.suggest-policies
+→ loop.generate-candidate
+→ Review Gate
 ```
 
-### Import Agent
+已实现：
 
-负责导入 ChatGPT ZIP、手动文件、本地文件夹和未来外部来源。导入只生成 raw evidence 或候选，不直接激活长期记忆。
+- 幂等 Loop run v2 合约
+- v1 与早期 v2 兼容读取
+- 结构化 `root_cause` 与 `next_change` 证据
+- 确定性 Reflection artifact
+- Policy 精确去重和显式相反指令冲突检测
+- 固定三条独立 task/result 指纹阈值
+- workspace / project 分区证据聚合
+- 两阶段 candidate recovery
+- 轻量 `loop.coordinate` 编排
 
-### Link Understanding Agent
+### 会话反思与模型后端
 
-负责把 GitHub、网页、帖子、论文、PDF、YouTube、Notion、Google Docs 等链接转换为任何模型都能读取的标准 Markdown / JSON 上下文。Hermes、Browser、Firecrawl、Jina Reader、Playwright 等都只是它的 provider。
+- Conversation Review prepare / apply
+- 周期性 `reflection.record`
+- 可插拔 ModelBackend registry
+- Codex backend
+- OpenAI-compatible backend
+- Review state、procedure proposal 和 session 状态
 
-### Project Agent
+### Runtime、Bridge 与 MCP checkpoint
 
-维护每个项目的持续状态、阶段、TODO、风险、决策和下一步，使项目成为可持续演化对象。
-
-### Rule Agent
-
-从成功、失败、修正和反思中提炼可复用规则。规则必须先成为 rule candidate，再经 Review Gate 审核后进入长期记忆。
-
-### Reflection Agent
-
-从任务执行结果中生成 reflection candidate，例如失败原因、复用经验、下次避免方式和可晋升规则。
-
-### Context Agent
-
-根据任务动态编译最小 Context Pack，供 GPT、Codex、Claude、本地模型或其他 Agent 使用。
-
-### Search Agent
-
-隐藏底层检索实现。当前为 SQLite FTS5 lexical search，未来可扩展 tag、knowledge graph、embedding 和 hybrid search。
-
-### Review Agent
-
-所有长期记忆更新的安全闸门。负责 candidate 的 accept、reject、merge、support、supersede、conflict 等审核动作。
-
-### Quality Agent
-
-负责去重、冲突检测、来源校验、敏感性继承、可信度检查和状态流转检查。
-
-### Code / Codex Bridge Agent
-
-未来统一连接 Codex、Claude Code、Cursor、OpenHands 等代码执行或审查工具。
-
-### External Adapter Agent
-
-外部工具接入层。文献系统不作为内置主线，只保留 external adapter，例如未来需要时接 Zotero、EndNote、本地论文库或其他资料源。
-
-### Evolution Agent
-
-观察整个 LAOS 的使用情况，发现重复工作、低质量规则、无人调用的 Agent、架构漂移和可优化点，只提出 evolution candidate，不直接修改系统。
-
-## 当前版本状态
-
-- 当前软件版本：v0.8.1
-- SQLite schema：v3
-- 默认检索模式：lexical
-- 主要支持平台：macOS
-- 支持的 Python：3.11 或更高版本
-- 默认不需要 Codex CLI、语义模型、云 API 或付费 API
-
-## 当前已实现能力
-
-- 初始化本地数据目录
-- 添加、验证和导出结构化 Markdown 记忆
-- `profile`、`context`、`principle`、`project`、`decision`、`procedure`、`session` 和 `context_transition`
-- workspace、project、confidentiality 和时间有效性过滤
-- SQLite FTS5 schema v3 派生索引
-- 结构化记忆与文档的统一 lexical 检索
-- ChatGPT 官方 ZIP 本地手动导入
-- 手动文件 raw 归档和稳定 text sidecar
-- 文档元数据覆盖
-- Trusted Memory Loop：确定性 `ADD` / `UPDATE` / `DEPRECATE` / `NOOP` / `REVIEW_REQUIRED`，写前校验、人工闸门、自动重索引、写后验证和 durable resume journal
-- Agent Context Pack JSON/Markdown 输出
-- lexical 检索评测框架
-- `semantic` / `hybrid` 模式接口的显式 lexical 回退
-- 可插拔 ModelBackend、Codex 与 OpenAI-compatible 后端
-- Agent Runtime、Tool Registry、SessionStore 和 Procedure 生命周期
-- Bridge Event Inbox、Session Projector、自动候选审查和崩溃恢复
+- Agent Runtime、Tool Registry 和 SessionStore
+- Procedure 生命周期与 curator 流程
+- Bridge Event Inbox、projector 和 crash recovery
 - MCP stdio 与回环 Streamable HTTP 服务
-- 可选显式 `laos_capture_checkpoint` 工具和实机验证流程
-- 自动更新 Loop：真实 Codex baseline → review gate → verification → comparison 闭环验收
-- `doctor` 健康检查
-- GitHub Actions 在 push / pull_request 运行测试、compileall 和 whitespace 检查
+- 显式 `laos_capture_checkpoint` 工具及验证流程
+- 自动更新 Loop 的真实 baseline → review → verification → comparison 验收入口
 
-## 尚未完成或尚未验证的能力
+MCP checkpoint 是显式工具通道，不是浏览器侧被动、无损或自动对话采集。真实 ChatGPT 五轮写入验收仍受当前账户能力限制。
 
-- 真实 ChatGPT MCP checkpoint 五轮实测与正式定级
-- 浏览器侧无损对话事件采集源
-- 完整统一 Runtime 与默认 Combined Context
-- 长会话 Context Compactor 默认接线
-- ChatGPT 附件导入
-- PDF/DOCX 深度结构化解析
-- Link Understanding Agent / provider
-- owner/agent 身份认证与多 Agent 授权
-- 内置文献管理、文献矩阵自动填充和 Zotero / EndNote 同步已移出路线；后续如有需要，仅通过外部接口或 Adapter 集成
-- 真实本地向量 embedding
-- 真实语义相似度检索
-- 真实 lexical + semantic 混合排序
+## 硬性安全边界
 
-MCP checkpoint 已具备代码和验证框架，但当前 Plus 部署不具备完成写入型实测的账户能力，因此不作为正式自动快照通道，也不能描述为被动或无损对话采集。
+1. Agent 只能创建 `candidate`，不能直接写入 `active` memory。
+2. `active` 只能通过 Review Gate 产生。
+3. Reflection、Policy、Candidate、Coordinator 和会话审查流程都不会自动接受候选。
+4. `loop.coordinate` 不执行任务、不后台监听、不自动重试。
+5. Policy Agent 不自动修改提示词、代码、Agent 行为或 `memory_rules.md`。
+6. 三条证据必须来自不同 task/result 指纹，并属于同一 workspace 与 project 分区。
+7. MCP、HTTP 和 Bridge 服务只适用于本地可信操作者；当前没有多用户认证和能力授权。
+8. 真实记忆、数据库、PDF、日志、缓存、凭据和受限资料不得提交到 GitHub。
 
-## 不作为内置主线的能力
+## 不属于 v0.9 的能力
 
-以下能力不进入 Memory Core 主线，未来需要时通过 External Adapter Agent 接入：
+- 浏览器侧被动、无损 ChatGPT 对话采集
+- 自动 policy approval
+- 自动 candidate accept 或 active-memory promotion
+- 无人值守后台重试或自主任务执行
+- 语义冲突自动解决
+- 真实向量数据库和 embedding 检索
+- 多用户认证与 owner/agent 授权
+- GUI、Web 前端或桌面应用
+- 大型自主 Coordinator / Meta Planner
+- 内置文献管理系统扩展
 
-- 文献矩阵自动填充
-- Zotero / EndNote 同步
-- 内置 PDF/DOCX 深度文献系统
-- GUI
-- 大型分布式多 Agent 自主协商系统
-- 云数据库
-- 常驻后台监听服务
+文献、Zotero、EndNote、网页和其他外部来源后续只通过 Adapter 或外部接口接入，不进入 Memory Core 主线。
 
-## 当前数据目录布局
+## 数据与状态目录
 
-`init` 当前仍会创建以下数据目录和文件：
+权威数据目录由用户指定，例如：
 
 ```text
 ResearchAgent/
 ├── memory/
-│   ├── profile/
-│   ├── contexts/
-│   ├── transitions/
-│   ├── principles/
-│   ├── projects/
-│   ├── decisions/
-│   ├── procedures/
-│   └── sessions/
 ├── imports/
-│   ├── chatgpt/
-│   │   └── conversations/
-│   ├── manual/
-│   │   ├── raw/
-│   │   └── text/
-│   └── document_metadata.json
-├── literature/
-│   ├── inbox/
-│   ├── pdf/
-│   ├── notes/
-│   ├── journals/
-│   └── literature_matrix.csv
 ├── manuscripts/
-│   ├── current/
-│   ├── evidence/
-│   └── archive/
 ├── exports/
-│   ├── database_snapshots/
-│   ├── import_reports/
-│   └── index_manifest.json
 └── backups/
 ```
 
-`literature/` 是旧版本兼容和历史残留目录，不再作为内置文献系统主线。未来应迁移为 External Adapter 输出目录，并可在后续版本中进一步移除或降级。
-
-本地 state 目录至少包含：
+本地派生状态目录例如：
 
 ```text
 ~/Library/Application Support/ResearchAgent/
 ├── memory.sqlite
 ├── sessions.sqlite
 ├── bridge_events.sqlite
-└── review_state.sqlite
+├── review_state.sqlite
+└── loop_engineering/
+    ├── runs/
+    └── generated_candidates/
 ```
 
-SQLite、WAL、SHM、锁、缓存和日志都属于可重建的本地派生状态，不应放在 iCloud 数据目录。
+SQLite、WAL/SHM、缓存、日志和 Loop runtime artifacts 不应放入 iCloud 数据目录，也不应提交到 GitHub。
 
 ## 快速开始
 
 ```bash
-REPO_ROOT="/path/to/laos-v0.8"
+REPO_ROOT="/path/to/research-agent-memory"
 DATA_ROOT="$HOME/Library/Mobile Documents/com~apple~CloudDocs/ResearchAgent"
 STATE_DIR="$HOME/Library/Application Support/ResearchAgent"
+
 cd "$REPO_ROOT"
 ```
+
+推荐本地初始化：
 
 ```bash
 python3 tools/setup_local.py \
@@ -259,13 +158,130 @@ python3 tools/setup_local.py \
   --workspace personal
 ```
 
-运行完整测试：
+也可以手动初始化核心数据与索引：
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 src/memory.py init --root "$DATA_ROOT"
+python3 src/memory.py db-init \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR"
+python3 src/memory.py validate --root "$DATA_ROOT"
+python3 src/memory.py index --root "$DATA_ROOT" --state-dir "$STATE_DIR"
+python3 src/memory.py doctor --root "$DATA_ROOT" --state-dir "$STATE_DIR"
 ```
 
-MCP checkpoint 验证：
+## LAOS JSON CLI
+
+CLI 接受 `--task-json` 或 UTF-8 `--task-file`。成功时输出单行规范 JSON；失败时输出安全错误 JSON 并返回非零退出码。
+
+### 创建候选记忆
+
+```bash
+python3 src/laos.py \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --task-json '{"type":"memory.create","input":{"type":"principle","title":"最少代码","scope":"global","workspace":"personal","confidentiality":"personal","source":"manual:user_confirmed","confidence":"confirmed","content":"使用尽可能少的代码实现相同功能。"}}'
+```
+
+该命令只创建 `candidate`。记录输出中的 `candidate_id` 后，使用 Review Gate 显式审核：
+
+```bash
+python3 src/laos.py \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --task-json '{"type":"memory.review","workspace":"personal","input":{"action":"accept","candidate_id":"CANDIDATE_ID"}}'
+```
+
+work candidate 必须显式使用顶层 `"workspace":"work"`。workspace 或 project 不匹配时审核失败。
+
+### 搜索和 Context Pack
+
+```bash
+python3 src/laos.py \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --task-json '{"type":"memory.search","input":{"query":"最少代码","workspace":"personal"}}'
+```
+
+```bash
+python3 src/laos.py \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --task-json '{"type":"context.build","input":{"query":"最少代码","workspace":"personal"}}'
+```
+
+## 最终 `loop.coordinate` 示例
+
+`loop.coordinate` 接收已经完成的任务证据；它不会执行 JSON 中描述的任务。
+
+```bash
+cat > /tmp/laos-loop-task.json <<'JSON'
+{
+  "type": "loop.coordinate",
+  "input": {
+    "task": "验证迁移流程",
+    "result": "迁移在写入前因版本不匹配而停止",
+    "outcome": "fail",
+    "error": "目标版本不匹配",
+    "reflection": "预检查成功阻止了不安全写入",
+    "root_cause": "流程缺少目标版本预检查",
+    "next_change": "迁移前必须验证目标版本",
+    "workspace": "personal"
+  }
+}
+JSON
+
+python3 src/laos.py \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --task-file /tmp/laos-loop-task.json
+```
+
+预期行为：
+
+- 创建或复用一个幂等 Loop run
+- 创建一个待审核 session candidate（结果非空时）
+- 生成 `reflection_result.json`
+- 生成 `policy_candidates.json` 与 `policy_review.md`
+- 评估当前 workspace/project 中相同策略的独立证据数量
+- 单次证据不会生成 principle candidate
+- 三条不同 task/result 指纹后才生成待审核 principle candidate
+- 输出保持 `requires_review: true` 和 `applied: false`
+
+重复完全相同的请求会复用同一 run，不会增加独立证据。
+
+必填字段：
+
+- `task`
+- `result`
+- `outcome`: `pass` 或 `fail`
+- `workspace`: `personal` 或 `work`
+
+可选字段：
+
+- `error`
+- `reflection`
+- `root_cause`
+- `next_change`
+- `project`
+
+任何 approval、activation 或阈值覆盖字段都会被拒绝。
+
+## 会话反思任务
+
+`reflection.prepare` 和 `reflection.apply` 用于显式会话审查；`reflection.record` 用于受控周期记录。通过 `--model-config` 可选择 OpenAI-compatible backend；未指定时使用默认 Codex backend。
+
+```bash
+python3 src/laos.py \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --model-config config/model_backend.example.json \
+  --task-json '{"type":"reflection.record","workspace":"personal","input":{"session_id":"session-1","messages":[{"role":"user","content":"记录代码最少原则"}]}}'
+```
+
+生成的长期候选仍必须经过 Review Gate。
+
+## MCP checkpoint 验证
 
 ```bash
 python3 -m pip install -r requirements-mcp.txt
@@ -276,9 +292,9 @@ python3 tools/mcp_checkpoint_trial.py prepare \
 python3 tools/mcp_checkpoint_trial.py serve --state-dir "$STATE_DIR"
 ```
 
-详细流程见 `docs/mcp_checkpoint_validation.md`。
+详细流程见 `docs/mcp_checkpoint_validation.md`。该流程不等同于浏览器侧自动对话采集。
 
-自动更新 Loop 真实验收最小入口：
+## 自动更新 Loop 真实验收入口
 
 ```bash
 python3 tools/learning_loop.py \
@@ -298,54 +314,104 @@ python3 tools/learning_loop.py \
   --run-id stage07-2-work-baseline
 ```
 
-人工 Review Gate 仍然是强制边界。接受或拒绝候选必须通过现有 `review` 命令完成，自动协调器不会替你做决定：
+人工接受或拒绝候选仍通过显式 `review` 命令完成；自动协调器不会替代审核者。
 
-```bash
-python3 tools/learning_loop.py \
-  --data-root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR" \
-  --work-root "$REPO_ROOT" \
-  review \
-  --run-id stage07-2-work-baseline \
-  --candidate-id <accepted-candidate-id> \
-  --action accept \
-  --reason "Reusable fail-closed audit strategy"
+完整流程见 `docs/stage_07_2_real_loop_acceptance.md`。
+
+## Loop artifacts
+
+每个确定性学习 run 位于：
+
+```text
+<state-dir>/loop_engineering/runs/<run_id>/
 ```
 
-```bash
-python3 tools/learning_loop.py \
-  --data-root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR" \
-  --work-root "$REPO_ROOT" \
-  review \
-  --run-id stage07-2-work-baseline \
-  --candidate-id <rejected-candidate-id> \
-  --action reject \
-  --reason "Too specific to this acceptance fixture"
+可能包含：
+
+```text
+run.json
+reflection.md
+policy_suggestions.md
+reflection_result.json
+policy_candidates.json
+policy_review.md
 ```
 
-提交 verification task 并生成 comparison：
+低风险 candidate generation 状态位于：
 
-```bash
-python3 tools/learning_loop.py \
-  --data-root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR" \
-  --work-root "$REPO_ROOT" \
-  advance \
-  --task-file config/stage07_2_real_acceptance_baseline.example.json \
-  --verification-task-file config/stage07_2_real_acceptance_verification.example.json \
-  --require-nonempty-exclusion-evidence
+```text
+<state-dir>/loop_engineering/generated_candidates/<request_id>.json
 ```
 
+这些文件是本地运行与审计产物，不是 active memory。
+
+## 导入
+
+ChatGPT 官方 ZIP 仅支持用户手动下载后本地导入：
+
 ```bash
-python3 tools/learning_loop.py \
-  --data-root "$DATA_ROOT" \
-  --state-dir "$STATE_DIR" \
-  --work-root "$REPO_ROOT" \
-  compare \
-  --first-run stage07-2-work-baseline \
-  --second-run stage07-2-work-verification \
-  --require-nonempty-exclusion-evidence
+python3 src/memory_tools.py import-chatgpt \
+  --zip "$HOME/Downloads/chatgpt-export.zip" \
+  --root "$DATA_ROOT" \
+  --dry-run
+
+python3 src/memory_tools.py import-chatgpt \
+  --zip "$HOME/Downloads/chatgpt-export.zip" \
+  --root "$DATA_ROOT"
 ```
 
-完整 Stage 07.2 真实环境结果、受限 fixture 写法和脱敏证据摘要见 `docs/stage_07_2_real_loop_acceptance.md`。
+手动文件导入：
+
+```bash
+python3 src/memory_tools.py import-manual \
+  --path "$HOME/Downloads/note.txt" \
+  --root "$DATA_ROOT" \
+  --dry-run
+
+python3 src/memory_tools.py import-manual \
+  --path "$HOME/Downloads/note.txt" \
+  --root "$DATA_ROOT"
+```
+
+PDF/DOCX 等二进制文件只归档 raw；当前不会进行深度结构化解析或全文索引。
+
+## 本地验证
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 -m compileall -q src
+git diff --check
+git diff --cached --check
+```
+
+最终集成后的实际测试数量和远程 CI 状态记录在 `docs/progress/2026-07-04-stage-16-v09-release-review.md`。远程检查未完成时，不应声称 CI 全绿。
+
+## 发布门禁
+
+```text
+Stage 16 release review
+→ integrate latest origin/main
+→ resolve conflicts
+→ full local validation
+→ push feature branch
+→ Draft PR CI
+→ human review
+→ merge confirmation
+→ v0.9.0 tag / GitHub Release confirmation
+```
+
+Draft PR、合并、tag 和正式 release 是不同 Gate。创建 Draft PR 不等于已经发布。
+
+## 文档
+
+- 当前阶段状态：`docs/PHASE_STATUS.json`
+- v0.9 架构与安全审查：`docs/progress/2026-07-04-stage-15-v09-architecture-security-audit.md`
+- v0.9 发布审查：`docs/progress/2026-07-04-stage-16-v09-release-review.md`
+- MCP checkpoint：`docs/mcp_checkpoint_validation.md`
+- 自动更新 Loop：`docs/stage_07_2_real_loop_acceptance.md`
+- Trusted Memory Loop：`docs/TRUSTED_MEMORY_LOOP.md`
+- Schema：`schemas/`
+
+## 许可证
+
+MIT License。

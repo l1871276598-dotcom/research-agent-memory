@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/loop-run.schema.json",
+  "title": "LAOS Loop Run Contract v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_version",
+    "contract_id",
+    "run_id",
+    "idempotency_key",
+    "task_sha256",
+    "result_sha256",
+    "outcome",
+    "candidate_ids",
+    "generated_candidate_ids",
+    "approved_policy_ids",
+    "policy_suggestion_ids",
+    "reflection_path",
+    "policy_suggestions_path",
+    "reflection_status",
+    "policy_status",
+    "candidate_status",
+    "review_required",
+    "approved_policy_count",
+    "status"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "contract_version": {
+      "const": 2
+    },
+    "contract_id": {
+      "const": "laos.loop-run.v2"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "task_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "result_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "outcome": {
+      "enum": [
+        "pass",
+        "fail"
+      ]
+    },
+    "workspace": {
+      "enum": [
+        "personal",
+        "work"
+      ]
+    },
+    "project": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "minLength": 1
+        }
+      ]
+    },
+    "candidate_ids": {
+      "$ref": "#/$defs/stringIds"
+    },
+    "generated_candidate_ids": {
+      "$ref": "#/$defs/stringIds"
+    },
+    "approved_policy_ids": {
+      "$ref": "#/$defs/policyIds"
+    },
+    "policy_suggestion_ids": {
+      "$ref": "#/$defs/policyIds"
+    },
+    "reflection_path": {
+      "const": "reflection.md"
+    },
+    "policy_suggestions_path": {
+      "const": "policy_suggestions.md"
+    },
+    "reflection_status": {
+      "const": "completed"
+    },
+    "policy_status": {
+      "enum": [
+        "review_required",
+        "completed"
+      ]
+    },
+    "candidate_status": {
+      "enum": [
+        "pending",
+        "generated",
+        "not_generated"
+      ]
+    },
+    "review_required": {
+      "const": true
+    },
+    "approved_policy_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "status": {
+      "enum": [
+        "waiting_for_human",
+        "completed"
+      ]
+    }
+  },
+  "$defs": {
+    "stringIds": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "policyIds": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{16}$"
+      },
+      "uniqueItems": true
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "anyOf": [
+          {
+            "required": [
+              "workspace"
+            ]
+          },
+          {
+            "required": [
+              "project"
+            ]
+          }
+        ]
+      },
+      "then": {
+        "required": [
+          "workspace",
+          "project"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "candidate_status": {
+            "const": "generated"
+          }
+        },
+        "required": [
+          "candidate_status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "candidate_ids": {
+            "minItems": 1
+          },
+          "generated_candidate_ids": {
+            "minItems": 1
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "candidate_ids": {
+            "maxItems": 0
+          },
+          "generated_candidate_ids": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "waiting_for_human"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "policy_status": {
+            "const": "review_required"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "policy_status": {
+            "const": "completed"
+          }
+        }
+      }
+    }
+  ]
+}

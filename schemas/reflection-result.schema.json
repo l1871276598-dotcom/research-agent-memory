@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/reflection-result.schema.json",
+  "title": "LAOS Reflection Result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "run_id",
+    "source_reflection_sha256",
+    "reflection"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "contract_id": {
+      "const": "laos.reflection-result.v1"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "source_reflection_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "reflection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "outcome",
+        "what_happened",
+        "what_worked",
+        "what_failed",
+        "likely_cause",
+        "reusable_lesson",
+        "evidence",
+        "unknown_fields"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "outcome": {
+          "enum": [
+            "pass",
+            "fail"
+          ]
+        },
+        "what_happened": {
+          "type": "string",
+          "minLength": 1
+        },
+        "what_worked": {
+          "type": "string",
+          "minLength": 1
+        },
+        "what_failed": {
+          "type": "string",
+          "minLength": 1
+        },
+        "likely_cause": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reusable_lesson": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "value"
+            ],
+            "properties": {
+              "kind": {
+                "enum": [
+                  "task",
+                  "result",
+                  "error",
+                  "worked",
+                  "failed",
+                  "root_cause",
+                  "next_change"
+                ]
+              },
+              "value": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "unknown_fields": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "what_happened",
+              "what_worked",
+              "what_failed",
+              "likely_cause",
+              "reusable_lesson"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
