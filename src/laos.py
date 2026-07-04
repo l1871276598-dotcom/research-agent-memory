@@ -22,6 +22,9 @@ from reflection import ConversationReviewCoordinator, ConversationReviewService,
 from review.gate import ReviewGate
 
 
+_INVALID_MEMORY_ROOT_MESSAGE = "请先执行：python3 src/memory.py init --root PATH"
+
+
 class JsonArgumentParser(argparse.ArgumentParser):
     def error(self, message):
         raise ValueError("invalid arguments")
@@ -88,6 +91,15 @@ def _write_json(stream, value):
     stream.write("\n")
 
 
+def _request_error_code(error):
+    message = str(error)
+    if message == _INVALID_MEMORY_ROOT_MESSAGE:
+        return "invalid_memory_root"
+    if message == "memory store validation failed":
+        return "memory_store_validation_failed"
+    return "request_failed"
+
+
 def main(argv=None):
     try:
         args = _parser().parse_args(argv)
@@ -102,10 +114,15 @@ def main(argv=None):
             )
             backend = build_model_backend(model_config)
         result = build_application(args.root, args.state_dir, backend).run(task)
-    except Exception:
+    except Exception as error:
         _write_json(
             sys.stderr,
-            {"error": {"code": "request_failed", "message": "Request failed."}},
+            {
+                "error": {
+                    "code": _request_error_code(error),
+                    "message": "Request failed.",
+                }
+            },
         )
         return 1
     _write_json(sys.stdout, result)
