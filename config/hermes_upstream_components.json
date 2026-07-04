@@ -1,0 +1,174 @@
+{
+  "schema_version": 1,
+  "upstream": "NousResearch/hermes-agent",
+  "branch": "main",
+  "last_reviewed_commit": "01bf61c865c31d47be6cd4cfcc3ecef1a28aba0b",
+  "policy": {
+    "vendor_full_repository": false,
+    "run_external_hermes": false,
+    "copy_only_needed_code": true,
+    "preserve_license_notice": true,
+    "manual_review_before_port": true,
+    "excluded_feature_numbers": [12, 21]
+  },
+  "components": [
+    {
+      "number": 1,
+      "id": "agent_runtime",
+      "status": "integrated",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["run_agent.py", "agent/agent_init.py", "agent/agent_runtime_helpers.py"],
+      "laos_paths": ["src/runtime/agent.py", "src/orchestrator/"]
+    },
+    {
+      "number": 2,
+      "id": "model_backends",
+      "status": "foundation_integrated",
+      "port_mode": "native_interface",
+      "upstream_paths": ["agent/codex_runtime.py", "agent/model_metadata.py"],
+      "laos_paths": ["src/models/", "config/model_backend.example.json"],
+      "notes": "Codex is the default backend, not a core dependency. OpenAI-compatible APIs are supported and provider-specific adapters can be registered later."
+    },
+    {
+      "number": 3,
+      "id": "codex_runtime",
+      "status": "integrated",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["agent/codex_runtime.py", "agent/codex_responses_adapter.py", "agent/transports/codex_app_server.py", "agent/transports/codex_app_server_session.py", "agent/transports/codex_event_projector.py"],
+      "laos_paths": ["src/runtime/codex/"]
+    },
+    {
+      "number": 4,
+      "id": "tool_system",
+      "status": "integrated",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["tools/registry.py", "toolsets.py", "model_tools.py"],
+      "laos_paths": ["src/tooling/"]
+    },
+    {
+      "number": 5,
+      "id": "long_term_memory",
+      "status": "integrated",
+      "port_mode": "selective_copy",
+      "upstream_paths": ["agent/memory_manager.py", "agent/memory_provider.py"],
+      "laos_paths": ["src/memory/", "src/review/"]
+    },
+    {
+      "number": 6,
+      "id": "automatic_memory_extraction",
+      "status": "integrated",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["agent/background_review.py"],
+      "laos_paths": ["src/reflection/", "src/agents/reflection.py", "src/agents/reflection_record.py", "src/bridge/projector.py"],
+      "notes": "Bridge assistant turns and checkpoints enter idempotent threshold review. Assistant-only assertions are not evidence of user facts, and all outputs remain candidates."
+    },
+    {
+      "number": 7,
+      "id": "skill_system",
+      "status": "integrated_as_procedures",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["tools/skill_manager_tool.py", "agent/skill_commands.py"],
+      "laos_paths": ["src/procedures/"]
+    },
+    {
+      "number": 8,
+      "id": "skill_auto_update",
+      "status": "integrated_as_candidates",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["agent/background_review.py", "tools/skill_manager_tool.py"],
+      "laos_paths": ["src/reflection/coordinator.py", "src/procedures/proposals.py"]
+    },
+    {
+      "number": 9,
+      "id": "curator",
+      "status": "integrated",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["agent/curator.py"],
+      "laos_paths": ["src/procedures/catalog.py", "src/procedures/curator_plan.py", "src/procedures/curator_runner.py", "src/procedures/curator_apply.py"]
+    },
+    {
+      "number": 10,
+      "id": "context_management",
+      "status": "partial",
+      "port_mode": "selective_copy",
+      "upstream_paths": ["agent/context_compressor.py", "agent/memory_manager.py"],
+      "laos_paths": ["src/context/", "src/memory/provider.py"]
+    },
+    {
+      "number": 11,
+      "id": "sessions",
+      "status": "integrated",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["hermes_state.py", "hermes_cli/active_sessions.py"],
+      "laos_paths": ["src/sessions/", "src/bridge/inbox.py", "src/bridge/projector.py", "src/bridge/mcp_checkpoint.py", "tools/session_cli.py"],
+      "notes": "Finalized bridge messages are projected into branch-specific SQLite sessions with stable identities, ordering, replay protection, crash recovery, and explicit MCP checkpoint receipts."
+    },
+    {
+      "number": 13,
+      "id": "subagents_and_kanban",
+      "status": "integrated",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["tools/delegate_tool.py", "hermes_cli/kanban_db.py"],
+      "laos_paths": ["src/delegation/"]
+    },
+    {
+      "number": 14,
+      "id": "message_gateways",
+      "status": "foundation_integrated",
+      "port_mode": "selective_copy",
+      "upstream_paths": ["gateway/platforms/base.py", "gateway/"],
+      "laos_paths": ["src/message_io/", "src/bridge/", "src/protocol_host.py", "tools/bridge_server.py", "tools/serve_laos.py", "tools/mcp_checkpoint_trial.py", "tools/checkpoint_validation.py", "config/bridge_scope.example.json"],
+      "notes": "The web bridge supports authenticated event ingestion. MCP checkpoint remains an optional explicit tool path and is not adopted as the formal automatic snapshot channel for the current Plus deployment."
+    },
+    {
+      "number": 15,
+      "id": "execution_environments",
+      "status": "integrated_core",
+      "port_mode": "selective_copy",
+      "upstream_paths": ["tools/environments/"],
+      "laos_paths": ["src/runners/"]
+    },
+    {
+      "number": 16,
+      "id": "mcp",
+      "status": "experimental_checkpoint_only",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["mcp_serve.py", "tools/mcp_client.py", "tools/mcp_oauth.py"],
+      "laos_paths": ["src/tool_facade.py", "src/protocol_host.py", "src/bridge/mcp_checkpoint.py", "tools/serve_laos.py", "tools/mcp_checkpoint_trial.py", "tools/checkpoint_validation.py", "requirements-mcp.txt"],
+      "notes": "Supports stdio and loopback Streamable HTTP with a bounded trial workflow. Current deployment cannot complete the write test, so MCP is not classified as automatic or lossless conversation capture."
+    },
+    {
+      "number": 17,
+      "id": "plugins",
+      "status": "integrated",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["hermes_cli/plugins.py", "plugins/"],
+      "laos_paths": ["src/extensions/"]
+    },
+    {
+      "number": 18,
+      "id": "security",
+      "status": "integrated_core",
+      "port_mode": "selective_copy",
+      "upstream_paths": ["tools/approval.py", "agent/tool_guardrails.py", "agent/memory_manager.py"],
+      "laos_paths": ["src/safety/", "src/context/", "src/memory/render.py", "src/bridge/service.py"],
+      "notes": "Bridge ingestion is localhost-only, token authenticated, source allowlisted, payload bounded, and fail-closed for unmapped accounts. MCP checkpoint HTTP binds only to loopback and requires a reviewed tunnel or remote proxy."
+    },
+    {
+      "number": 19,
+      "id": "profiles",
+      "status": "integrated",
+      "port_mode": "copy_then_adapt",
+      "upstream_paths": ["hermes_constants.py", "scripts/profile-tui.py"],
+      "laos_paths": ["src/profiles/", "config/bridge_scope.example.json"]
+    },
+    {
+      "number": 20,
+      "id": "deployment_and_updates",
+      "status": "integrated",
+      "port_mode": "reference_and_adapt",
+      "upstream_paths": ["hermes_cli/doctor.py", "hermes_cli/update.py", "scripts/install.sh"],
+      "laos_paths": ["src/diagnostics/", "tools/setup_local.py", "tools/check_health.py", "tools/check_hermes_updates.py"]
+    }
+  ]
+}

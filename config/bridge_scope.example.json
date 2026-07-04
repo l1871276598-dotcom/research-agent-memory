@@ -1,0 +1,16 @@
+{
+  "allowed_sources": ["chatgpt-web"],
+  "default": {
+    "workspace": "personal",
+    "confidentiality": "personal",
+    "profile": "personal"
+  },
+  "mappings": {
+    "chatgpt-web:replace-with-anonymized-account-id": {
+      "workspace": "work",
+      "project": "laos",
+      "confidentiality": "internal",
+      "profile": "laos-work"
+    }
+  }
+}

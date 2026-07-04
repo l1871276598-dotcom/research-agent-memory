@@ -1,6 +1,6 @@
 # Local Agent Operating System (LAOS)
 
-LAOS 是一个本地优先、可审计、人工审核受控的 Agent 记忆与学习层。它把结构化记忆、项目上下文、任务结果、反思、策略候选和可复用原则统一到本地文件与可重建索引中，供 GPT、Codex、Claude、本地模型和其他 Agent 复用。
+LAOS 是一个本地优先、可审计、人工审核受控的 Agent 记忆与学习层。它把结构化记忆、项目上下文、任务结果、反思、策略候选、会话审查和可复用原则统一到本地文件与可重建索引中，供 GPT、Codex、Claude、本地模型和其他 Agent 复用。
 
 ## 当前版本
 
@@ -8,61 +8,103 @@ LAOS 是一个本地优先、可审计、人工审核受控的 Agent 记忆与�
 - 目标发布版本：`v0.9.0`
 - SQLite schema：`v3`
 - Python：`3.11+`
-- 主要验证平台：macOS
-- 运行边界：本地、可信操作者、命令行
+- 主要验证平台：macOS、Ubuntu、Windows
+- 运行边界：本地、可信操作者、命令行或受控本地服务
 
-`v0.9.0` 尚未在本仓库中打 tag、合并或正式发布。当前分支通过 Stage 16 发布审查后，可推送并创建 Draft PR；合并、tag 和正式 release 仍需单独确认。
+`v0.9.0` 尚未打 tag、合并或正式发布。当前分支用于 Draft PR 审查；合并、tag、GitHub Release 和部署仍需单独确认。
 
 ## v0.9 已实现能力
+
+### Memory Core 与安全边界
 
 - Markdown / JSONL 权威数据源与可重建 SQLite FTS5 索引
 - ChatGPT 官方 ZIP 手动导入与手动文件归档
 - 结构化记忆、workspace / project / confidentiality / 时间有效性
 - candidate-only 创建与统一 Review Gate
 - restricted 内容默认不进入搜索、Context Pack 或外部调用上下文
-- 九 Agent 精确注册表与只负责路由的 Orchestrator
-- 规范 JSON CLI：`src/laos.py`
-- 幂等 Loop run v2 合约与旧 v1 / 早期 v2 兼容读取
-- 确定性 Reflection Agent
-- 确定性 Policy Agent：精确去重、显式相反指令冲突检测
-- 固定三条独立证据阈值的低风险 principle candidate 生成
-- workspace / project 分区证据聚合
-- 轻量 Loop Coordinator：
+- Trusted Memory Loop、写前校验、事务回滚、重建索引和 durable journal
+
+### 统一 11 Agent JSON CLI
+
+`src/laos.py` 通过一个精确注册表提供：
+
+- Import Agent
+- Memory Agent
+- Search Agent
+- Review Agent
+- Context Agent
+- Deterministic Reflection Agent
+- Policy Agent
+- Low-risk Candidate Agent
+- Loop Coordinator Agent
+- Conversation Review Agent
+- Reflection Record Agent
+
+Orchestrator 只负责上下文准备、精确路由和结果校验，不承载审核或持久化业务逻辑。
+
+### 确定性学习链
 
 ```text
 finalize
-→ reflect
-→ suggest policies
-→ evaluate low-risk candidate generation
+→ loop.reflect
+→ loop.suggest-policies
+→ loop.generate-candidate
+→ Review Gate
 ```
 
-- 本地运行产物路径、符号链接、证据链和 Review Gate 安全检查
-- GitHub Actions 与本地完整回归验证
+已实现：
 
-## 安全边界
+- 幂等 Loop run v2 合约
+- v1 与早期 v2 兼容读取
+- 结构化 `root_cause` 与 `next_change` 证据
+- 确定性 Reflection artifact
+- Policy 精确去重和显式相反指令冲突检测
+- 固定三条独立 task/result 指纹阈值
+- workspace / project 分区证据聚合
+- 两阶段 candidate recovery
+- 轻量 `loop.coordinate` 编排
 
-LAOS v0.9 保持以下硬边界：
+### 会话反思与模型后端
+
+- Conversation Review prepare / apply
+- 周期性 `reflection.record`
+- 可插拔 ModelBackend registry
+- Codex backend
+- OpenAI-compatible backend
+- Review state、procedure proposal 和 session 状态
+
+### Runtime、Bridge 与 MCP checkpoint
+
+- Agent Runtime、Tool Registry 和 SessionStore
+- Procedure 生命周期与 curator 流程
+- Bridge Event Inbox、projector 和 crash recovery
+- MCP stdio 与回环 Streamable HTTP 服务
+- 显式 `laos_capture_checkpoint` 工具及验证流程
+- 自动更新 Loop 的真实 baseline → review → verification → comparison 验收入口
+
+MCP checkpoint 是显式工具通道，不是浏览器侧被动、无损或自动对话采集。真实 ChatGPT 五轮写入验收仍受当前账户能力限制。
+
+## 硬性安全边界
 
 1. Agent 只能创建 `candidate`，不能直接写入 `active` memory。
 2. `active` 只能通过 Review Gate 产生。
-3. Reflection、Policy、Candidate 和 Coordinator Agent 都不会自动接受候选。
-4. Coordinator 不执行任务、不后台监听、不自动重试。
+3. Reflection、Policy、Candidate、Coordinator 和会话审查流程都不会自动接受候选。
+4. `loop.coordinate` 不执行任务、不后台监听、不自动重试。
 5. Policy Agent 不自动修改提示词、代码、Agent 行为或 `memory_rules.md`。
-6. 三条证据必须来自不同的 task/result 指纹，并且属于同一 workspace 与 project 分区。
-7. 真实记忆、数据库、PDF、日志、缓存、凭据和受限资料不得提交到 GitHub。
-
-当前未实现操作者身份认证、owner/agent 身份认证和多用户授权，因此不要把 `src/laos.py` 暴露为不受信任的 HTTP、MCP、多用户或无人值守服务。
+6. 三条证据必须来自不同 task/result 指纹，并属于同一 workspace 与 project 分区。
+7. MCP、HTTP 和 Bridge 服务只适用于本地可信操作者；当前没有多用户认证和能力授权。
+8. 真实记忆、数据库、PDF、日志、缓存、凭据和受限资料不得提交到 GitHub。
 
 ## 不属于 v0.9 的能力
 
-- 后台 watcher 或常驻自动更新服务
-- 自主任务执行与自动重试
+- 浏览器侧被动、无损 ChatGPT 对话采集
 - 自动 policy approval
 - 自动 candidate accept 或 active-memory promotion
+- 无人值守后台重试或自主任务执行
 - 语义冲突自动解决
-- 向量数据库与真实 embedding 检索
-- MCP 服务
-- GUI、Web 或桌面应用
+- 真实向量数据库和 embedding 检索
+- 多用户认证与 owner/agent 授权
+- GUI、Web 前端或桌面应用
 - 大型自主 Coordinator / Meta Planner
 - 内置文献管理系统扩展
 
@@ -81,17 +123,20 @@ ResearchAgent/
 └── backups/
 ```
 
-本地派生状态目录保存 SQLite、Loop artifacts、缓存和日志，例如：
+本地派生状态目录例如：
 
 ```text
 ~/Library/Application Support/ResearchAgent/
 ├── memory.sqlite
+├── sessions.sqlite
+├── bridge_events.sqlite
+├── review_state.sqlite
 └── loop_engineering/
     ├── runs/
     └── generated_candidates/
 ```
 
-SQLite、WAL/SHM、缓存和 Loop runtime artifacts 不应放入 iCloud 数据目录，也不应提交到 GitHub。
+SQLite、WAL/SHM、缓存、日志和 Loop runtime artifacts 不应放入 iCloud 数据目录，也不应提交到 GitHub。
 
 ## 快速开始
 
@@ -103,27 +148,31 @@ STATE_DIR="$HOME/Library/Application Support/ResearchAgent"
 cd "$REPO_ROOT"
 ```
 
-初始化数据目录和 SQLite：
+推荐本地初始化：
+
+```bash
+python3 tools/setup_local.py \
+  --data-root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --profile personal \
+  --workspace personal
+```
+
+也可以手动初始化核心数据与索引：
 
 ```bash
 python3 src/memory.py init --root "$DATA_ROOT"
 python3 src/memory.py db-init \
   --root "$DATA_ROOT" \
   --state-dir "$STATE_DIR"
-```
-
-验证、索引、搜索和健康检查：
-
-```bash
 python3 src/memory.py validate --root "$DATA_ROOT"
 python3 src/memory.py index --root "$DATA_ROOT" --state-dir "$STATE_DIR"
-python3 src/memory.py search "代码最少" --root "$DATA_ROOT" --state-dir "$STATE_DIR"
 python3 src/memory.py doctor --root "$DATA_ROOT" --state-dir "$STATE_DIR"
 ```
 
 ## LAOS JSON CLI
 
-CLI 接受 `--task-json` 或 UTF-8 `--task-file`，成功时输出单行规范 JSON，失败时输出安全错误 JSON 并返回非零退出码。
+CLI 接受 `--task-json` 或 UTF-8 `--task-file`。成功时输出单行规范 JSON；失败时输出安全错误 JSON 并返回非零退出码。
 
 ### 创建候选记忆
 
@@ -161,11 +210,9 @@ python3 src/laos.py \
   --task-json '{"type":"context.build","input":{"query":"最少代码","workspace":"personal"}}'
 ```
 
-## v0.9 最终 Loop Coordinator 示例
+## 最终 `loop.coordinate` 示例
 
-`loop.coordinate` 接收的是已经完成的任务证据；它不会执行 JSON 中描述的任务。
-
-创建任务文件：
+`loop.coordinate` 接收已经完成的任务证据；它不会执行 JSON 中描述的任务。
 
 ```bash
 cat > /tmp/laos-loop-task.json <<'JSON'
@@ -183,11 +230,7 @@ cat > /tmp/laos-loop-task.json <<'JSON'
   }
 }
 JSON
-```
 
-运行 Coordinator：
-
-```bash
 python3 src/laos.py \
   --root "$DATA_ROOT" \
   --state-dir "$STATE_DIR" \
@@ -200,14 +243,14 @@ python3 src/laos.py \
 - 创建一个待审核 session candidate（结果非空时）
 - 生成 `reflection_result.json`
 - 生成 `policy_candidates.json` 与 `policy_review.md`
-- 评估相同策略在当前 workspace/project 中的独立证据数量
+- 评估当前 workspace/project 中相同策略的独立证据数量
 - 单次证据不会生成 principle candidate
-- 同一策略达到三条不同 task/result 指纹后，才生成一个待 Review Gate 审核的 principle candidate
+- 三条不同 task/result 指纹后才生成待审核 principle candidate
 - 输出保持 `requires_review: true` 和 `applied: false`
 
-重复完全相同的请求会复用同一 run，不会增加独立证据。要达到三条证据阈值，必须来自真实不同的任务与结果证据。
+重复完全相同的请求会复用同一 run，不会增加独立证据。
 
-Coordinator 允许的必填字段：
+必填字段：
 
 - `task`
 - `result`
@@ -224,9 +267,60 @@ Coordinator 允许的必填字段：
 
 任何 approval、activation 或阈值覆盖字段都会被拒绝。
 
+## 会话反思任务
+
+`reflection.prepare` 和 `reflection.apply` 用于显式会话审查；`reflection.record` 用于受控周期记录。通过 `--model-config` 可选择 OpenAI-compatible backend；未指定时使用默认 Codex backend。
+
+```bash
+python3 src/laos.py \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --model-config config/model_backend.example.json \
+  --task-json '{"type":"reflection.record","workspace":"personal","input":{"session_id":"session-1","messages":[{"role":"user","content":"记录代码最少原则"}]}}'
+```
+
+生成的长期候选仍必须经过 Review Gate。
+
+## MCP checkpoint 验证
+
+```bash
+python3 -m pip install -r requirements-mcp.txt
+python3 tools/mcp_checkpoint_trial.py prepare \
+  --data-root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --workspace personal
+python3 tools/mcp_checkpoint_trial.py serve --state-dir "$STATE_DIR"
+```
+
+详细流程见 `docs/mcp_checkpoint_validation.md`。该流程不等同于浏览器侧自动对话采集。
+
+## 自动更新 Loop 真实验收入口
+
+```bash
+python3 tools/learning_loop.py \
+  --data-root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --work-root "$REPO_ROOT" \
+  advance \
+  --task-file config/stage07_2_real_acceptance_baseline.example.json
+```
+
+```bash
+python3 tools/learning_loop.py \
+  --data-root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --work-root "$REPO_ROOT" \
+  auto-status \
+  --run-id stage07-2-work-baseline
+```
+
+人工接受或拒绝候选仍通过显式 `review` 命令完成；自动协调器不会替代审核者。
+
+完整流程见 `docs/stage_07_2_real_loop_acceptance.md`。
+
 ## Loop artifacts
 
-每个 run 位于：
+每个确定性学习 run 位于：
 
 ```text
 <state-dir>/loop_engineering/runs/<run_id>/
@@ -290,30 +384,20 @@ git diff --check
 git diff --cached --check
 ```
 
-Stage 16 发布审查基线：
-
-```text
-364 tests passed
-compileall passed
-git diff --check passed
-git diff --cached --check passed
-```
-
-远程分支尚未触发或完成 GitHub Actions 时，不应声称远程 CI 已通过。
+最终集成后的实际测试数量和远程 CI 状态记录在 `docs/progress/2026-07-04-stage-16-v09-release-review.md`。远程检查未完成时，不应声称 CI 全绿。
 
 ## 发布门禁
 
-v0.9 的发布顺序是：
-
 ```text
 Stage 16 release review
-→ local commit
+→ integrate latest origin/main
+→ resolve conflicts
+→ full local validation
 → push feature branch
-→ Draft PR
-→ remote CI
+→ Draft PR CI
 → human review
 → merge confirmation
-→ v0.9.0 tag / GitHub release confirmation
+→ v0.9.0 tag / GitHub Release confirmation
 ```
 
 Draft PR、合并、tag 和正式 release 是不同 Gate。创建 Draft PR 不等于已经发布。
@@ -323,6 +407,8 @@ Draft PR、合并、tag 和正式 release 是不同 Gate。创建 Draft PR 不�
 - 当前阶段状态：`docs/PHASE_STATUS.json`
 - v0.9 架构与安全审查：`docs/progress/2026-07-04-stage-15-v09-architecture-security-audit.md`
 - v0.9 发布审查：`docs/progress/2026-07-04-stage-16-v09-release-review.md`
+- MCP checkpoint：`docs/mcp_checkpoint_validation.md`
+- 自动更新 Loop：`docs/stage_07_2_real_loop_acceptance.md`
 - Trusted Memory Loop：`docs/TRUSTED_MEMORY_LOOP.md`
 - Schema：`schemas/`
 

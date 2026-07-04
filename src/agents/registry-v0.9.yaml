@@ -8,6 +8,8 @@
     {"id": "reflection_agent", "class": "ReflectionAgent", "handles": ["loop.reflect"]},
     {"id": "policy_agent", "class": "PolicyAgent", "handles": ["loop.suggest-policies"]},
     {"id": "low_risk_candidate_agent", "class": "LowRiskCandidateAgent", "handles": ["loop.generate-candidate"]},
-    {"id": "loop_coordinator_agent", "class": "LoopCoordinatorAgent", "handles": ["loop.coordinate"]}
+    {"id": "loop_coordinator_agent", "class": "LoopCoordinatorAgent", "handles": ["loop.coordinate"]},
+    {"id": "conversation_review_agent", "class": "ConversationReviewAgent", "handles": ["reflection.prepare", "reflection.apply"]},
+    {"id": "reflection_record_agent", "class": "ReflectionRecordAgent", "handles": ["reflection.record"]}
   ]
 }

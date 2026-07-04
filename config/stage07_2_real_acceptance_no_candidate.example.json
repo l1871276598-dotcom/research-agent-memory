@@ -1,0 +1,26 @@
+{
+  "run_id": "stage07-2-no-candidate",
+  "task_id": "stage07-2-no-candidate",
+  "type": "repository.module_audit",
+  "title": "Audit Context Builder for no-candidate real acceptance",
+  "instruction": "Audit the module for reliability and cite concrete code evidence for every conclusion.",
+  "query": "idempotency context audit",
+  "workspace": "work",
+  "project": "stage07-2-real-acceptance",
+  "confidentiality": "internal",
+  "inputs": [
+    "src/context/builder.py"
+  ],
+  "minimum_score": 1.0,
+  "context_limit": 8000,
+  "criteria": [
+    {
+      "id": "idempotency",
+      "description": "verify deterministic or idempotent behavior",
+      "required_terms": [
+        "idempotency"
+      ],
+      "strategy": "For module audits, explicitly verify idempotency or deterministic replay behavior and cite the governing identity or deduplication mechanism."
+    }
+  ]
+}
