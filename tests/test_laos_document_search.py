@@ -42,16 +42,21 @@ class LaosDocumentSearchTests(unittest.TestCase):
         metadata.extend(["---", "indexed bridge phrase"])
         path.write_text("\n".join(metadata) + "\n", encoding="utf-8")
 
-    def run_search(self, *, project=None):
+    def run_search(self, *, project=None, limit=None, top_level_workspace=False):
         task = {
             "type": "memory.search",
             "input": {
                 "query": "indexed bridge phrase",
-                "workspace": "personal",
             },
         }
+        if top_level_workspace:
+            task["workspace"] = "personal"
+        else:
+            task["input"]["workspace"] = "personal"
         if project is not None:
             task["input"]["project"] = project
+        if limit is not None:
+            task["input"]["limit"] = limit
         return subprocess.run(
             [
                 sys.executable,
@@ -94,6 +99,29 @@ class LaosDocumentSearchTests(unittest.TestCase):
                 ("project-document.md", "document"),
             },
         )
+
+    def test_search_honors_limit_without_modifying_authoritative_memory(self):
+        self.write_document("first-document.md")
+        self.write_document("second-document.md")
+        memory.index_store(
+            argparse.Namespace(root=str(self.root), state_dir=str(self.state), dry_run=False)
+        )
+        before = {
+            path.relative_to(self.root).as_posix(): path.read_bytes()
+            for path in self.root.rglob("*")
+            if path.is_file()
+        }
+
+        result = self.run_search(limit=1, top_level_workspace=True)
+
+        after = {
+            path.relative_to(self.root).as_posix(): path.read_bytes()
+            for path in self.root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(json.loads(result.stdout)["output"]["results"]), 1)
+        self.assertEqual(after, before)
 
 
 if __name__ == "__main__":
