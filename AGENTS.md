@@ -13,7 +13,7 @@
 9. Do not automatically run git commit or git push.
 10. Run existing tests after every modification.
 11. Prefer the Python standard library.
-12. Support macOS and Python 3.11 or later.
+12. The active implementation and acceptance target is macOS with Python 3.11 or later. Linux and Windows compatibility is deferred until all planned functions are implemented, integrated, and accepted on macOS; deferred platforms must not block current delivery.
 13. Commands must return a non-zero exit code when execution fails.
 14. Do not modify files outside the current task scope.
 15. Do not introduce LangChain, LangGraph, Mem0, cloud databases, or paid APIs without an explicit request.
