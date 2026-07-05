@@ -11,8 +11,13 @@ from tool_facade import LaosToolFacade
 
 
 class Application:
+    def __init__(self, results=None):
+        self.tasks = []
+        self.results = results or []
+
     def run(self, task):
-        return {"task": task}
+        self.tasks.append(task)
+        return {"task": task, "output": {"results": self.results}}
 
 
 class Sessions:
@@ -66,6 +71,46 @@ class ToolFacadeTests(unittest.TestCase):
         self.assertEqual(facade.procedure_list()[0]["status"], "candidate")
         self.assertEqual(facade.procedure_apply("p")["applied"], "p")
         self.assertEqual(facade.procedure_rollback("p")["rolled_back"], "p")
+
+    def test_memory_search_is_scoped_bounded_and_read_only(self):
+        application = Application([{"id": str(index)} for index in range(60)])
+        facade = LaosToolFacade(application)
+
+        rows = facade.memory_search("最少代码", "personal", "project-one", 2)
+
+        self.assertEqual(rows, [{"id": "0"}, {"id": "1"}])
+        self.assertEqual(
+            application.tasks,
+            [
+                {
+                    "type": "memory.search",
+                    "input": {
+                        "query": "最少代码",
+                        "workspace": "personal",
+                        "project": "project-one",
+                    },
+                }
+            ],
+        )
+        for values in [
+            ("", "personal", None, 20),
+            ("query", "invalid", None, 20),
+            ("query", "personal", "", 20),
+            ("query", "personal", None, 0),
+            ("query", "personal", None, 51),
+            ("query", "personal", None, True),
+        ]:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                facade.memory_search(*values)
+        self.assertEqual(len(application.tasks), 1)
+
+    def test_memory_search_rejects_malformed_application_output(self):
+        class MalformedApplication:
+            def run(self, task):
+                return {"output": {}}
+
+        with self.assertRaises(RuntimeError):
+            LaosToolFacade(MalformedApplication()).memory_search("query", "personal")
 
     def test_missing_service_fails_closed(self):
         facade = LaosToolFacade(Application())

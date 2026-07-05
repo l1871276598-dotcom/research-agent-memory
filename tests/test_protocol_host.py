@@ -34,6 +34,16 @@ class Facade:
     def run_task(self, task):
         return {"task": task}
 
+    def memory_search(self, query, workspace, project=None, limit=20):
+        return [
+            {
+                "query": query,
+                "workspace": workspace,
+                "project": project,
+                "limit": limit,
+            }
+        ]
+
     def capture_checkpoint(self, **values):
         return {"captured": values}
 
@@ -58,6 +68,27 @@ def mcp_modules():
 
 
 class ProtocolHostTests(unittest.TestCase):
+    def test_memory_search_tool_is_read_only_and_routes_scoped_arguments(self):
+        with mock.patch.dict(sys.modules, mcp_modules()):
+            host = build_protocol_host(Facade(checkpoint_enabled=False))
+
+        self.assertIn("laos_memory_search", host.tools)
+        tool = host.tools["laos_memory_search"]
+        result = tool("最少代码", "personal", "project-one", 5)
+        self.assertEqual(
+            result,
+            [
+                {
+                    "query": "最少代码",
+                    "workspace": "personal",
+                    "project": "project-one",
+                    "limit": 5,
+                }
+            ],
+        )
+        self.assertIn("read-only", tool.__doc__)
+        self.assertIn("configured LAOS data root", tool.__doc__)
+
     def test_checkpoint_tool_is_explicit_and_routes_all_evidence_fields(self):
         with mock.patch.dict(sys.modules, mcp_modules()):
             host = build_protocol_host(Facade())
@@ -89,6 +120,7 @@ class ProtocolHostTests(unittest.TestCase):
 
         self.assertNotIn("checkpoint", host.instructions)
         self.assertNotIn("laos_capture_checkpoint", host.tools)
+        self.assertIn("laos_memory_search", host.tools)
 
     def test_remote_server_options_are_passed_to_fastmcp(self):
         options = {

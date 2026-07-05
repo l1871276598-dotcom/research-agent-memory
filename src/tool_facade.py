@@ -16,6 +16,28 @@ class LaosToolFacade:
     def run_task(self, task):
         return self.application.run(task)
 
+    def memory_search(self, query, workspace, project=None, limit=20):
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be a non-empty string")
+        if workspace not in {"personal", "work"}:
+            raise ValueError("workspace must be personal or work")
+        if project is not None and (not isinstance(project, str) or not project.strip()):
+            raise ValueError("project must be a non-empty string")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+            raise ValueError("limit must be between 1 and 50")
+
+        values = {"query": query, "workspace": workspace}
+        if project is not None:
+            values["project"] = project
+        result = self.application.run({"type": "memory.search", "input": values})
+        try:
+            rows = result["output"]["results"]
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError("memory search returned an invalid result") from exc
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise RuntimeError("memory search returned an invalid result")
+        return rows[:limit]
+
     def capture_checkpoint(self, **values):
         if self.checkpoint_capture is None:
             raise RuntimeError("MCP checkpoint capture is unavailable")

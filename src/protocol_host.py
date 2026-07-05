@@ -20,6 +20,21 @@ def build_protocol_host(facade, *, server_options=None):
     def laos_task(task: dict) -> dict:
         return facade.run_task(task)
 
+    @host.tool()
+    def laos_memory_search(
+        query: str,
+        workspace: str,
+        project: str | None = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        """Run a read-only search against the configured LAOS data root.
+
+        The tool searches active visible memories and indexed documents only. It
+        does not accept filesystem paths, database paths, write flags, or shell
+        commands. `workspace` must be `personal` or `work`; `limit` is capped at 50.
+        """
+        return facade.memory_search(query, workspace, project, limit)
+
     if checkpoint_enabled:
 
         @host.tool()
