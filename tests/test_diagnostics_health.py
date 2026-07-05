@@ -28,6 +28,22 @@ class DiagnosticsHealthTests(unittest.TestCase):
     def test_optional_module_probe_is_safe(self):
         self.assertIsInstance(module_available("missing_parent.child"), bool)
 
+    def test_fts5_probe_closes_database_connection(self):
+        connection = mock.MagicMock()
+        with mock.patch("diagnostics.health.sqlite3.connect", return_value=connection):
+            self.assertTrue(HealthCheck.fts5())
+        connection.close.assert_called_once_with()
+
+    def test_database_probe_closes_database_connection(self):
+        connection = mock.MagicMock()
+        connection.execute.return_value.fetchone.return_value = ("ok",)
+        with tempfile.TemporaryDirectory() as state:
+            path = Path(state) / "probe.sqlite"
+            path.touch()
+            with mock.patch("diagnostics.health.sqlite3.connect", return_value=connection):
+                self.assertEqual(HealthCheck.database(path), "ok")
+        connection.close.assert_called_once_with()
+
     def test_initialized_data_root_is_detected(self):
         with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as state:
             init_store(data)

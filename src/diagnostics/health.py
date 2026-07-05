@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from contextlib import closing
 from pathlib import Path
 
 
@@ -46,7 +47,7 @@ class HealthCheck:
     @staticmethod
     def fts5():
         try:
-            with sqlite3.connect(":memory:") as connection:
+            with closing(sqlite3.connect(":memory:")) as connection:
                 connection.execute("CREATE VIRTUAL TABLE probe USING fts5(content)")
             return True
         except sqlite3.Error:
@@ -57,7 +58,7 @@ class HealthCheck:
         if not path.exists():
             return "missing"
         try:
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection:
                 return str(connection.execute("PRAGMA quick_check").fetchone()[0])
         except sqlite3.Error as exc:
             return str(exc)
