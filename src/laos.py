@@ -3,6 +3,7 @@ import json
 import sys
 from pathlib import Path
 
+import memory
 import memory_tools
 from agents.candidate_generator import LowRiskCandidateAgent
 from agents.coordinator import LoopCoordinatorAgent
@@ -33,7 +34,30 @@ class JsonArgumentParser(argparse.ArgumentParser):
 def build_application(root, state_dir=None, model_backend=None):
     store = MemoryStore(root)
     candidates = CandidateStore(root, state_dir)
-    core = MemoryCore(store, candidates)
+
+    def search_documents(query, workspace, project):
+        return memory.search_store(
+            argparse.Namespace(
+                root=str(root),
+                state_dir=str(candidates.state_dir),
+                query=query,
+                kind="document",
+                source_kind=None,
+                project=project,
+                context_id=None,
+                workspace=workspace,
+                status=None,
+                as_of=None,
+                include_unassigned=False,
+                include_restricted=False,
+                include_inactive=False,
+                limit=20,
+                json=True,
+                mode="lexical",
+            )
+        )
+
+    core = MemoryCore(store, candidates, search_documents)
 
     reflection = ReflectionAgent(candidates.state_dir)
     policy = PolicyAgent(root, candidates.state_dir)
