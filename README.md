@@ -14,7 +14,7 @@ LAOS 是一个本地优先、可审计、人工审核受控的 Agent 记忆与�
 
 当前实现、集成、验收和发布范围仅承诺 macOS。Linux 与 Windows 兼容性将在 macOS 功能完整性和集成验收完成后作为独立阶段处理，不作为当前交付门禁。
 
-`v0.9.0` 尚未合并、打 tag 或正式发布。当前功能分支已推送并创建 Draft PR #29；合并最新 `origin/main` 后的本地与远程 macOS CI 均已通过。合并、tag、GitHub Release 和部署仍需分别通过后续 Gate。
+`v0.9.0` 功能已通过 PR #29 squash merge 到 `main`，合并提交为 `c21da74d9027760a47f1d96aa626184e6616d3f1`。Stage 17 本地 508 项测试与 PR #29 两条远程 macOS CI 均已通过。`release_readiness` 仍为 `in_progress`；`v0.9.0` tag、GitHub Release 和部署尚未执行。
 
 ## v0.9 已实现能力
 
@@ -392,7 +392,7 @@ git diff --check
 git diff --cached --check
 ```
 
-当前 HEAD 的本地 macOS 集成结果记录在 `docs/progress/2026-07-05-stage-17-macos-final-integration-review.md`。PR #29 在合并最新 `origin/main` 后的两条远程 macOS CI 均已通过；版本尚未合并或发布。
+当前 HEAD 的本地 macOS 集成结果记录在 `docs/progress/2026-07-05-stage-17-macos-final-integration-review.md`。PR #29 的两条远程 macOS CI 均已通过，并已 squash merge 到 `main`（`c21da74d9027760a47f1d96aa626184e6616d3f1`）；`v0.9.0` tag、GitHub Release 和部署尚未执行。
 
 ## 发布门禁
 
