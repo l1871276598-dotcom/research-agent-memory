@@ -1,22 +1,24 @@
 # Stage 17 — macOS Final Integration Review
 
 Date: 2026-07-05
-Decision: PASS for local macOS integration
+Decision: PASS for local macOS integration; PR #29 merged
 Release target: v0.9.0
 Current repository metadata: v0.9.0-development
 Current platform scope: macOS only
-Current branch: feat/laos-memory-search-tool
-Reviewed HEAD: 716a11b98ee6b658039096c53b14aca4d1223811
+Reviewed feature branch: feat/laos-memory-search-tool
+Reviewed feature HEAD: 716a11b98ee6b658039096c53b14aca4d1223811
+PR #29 head: a25e43802258f2adf421f8b55e6e2193ca43755a
+Post-merge main HEAD: c21da74d9027760a47f1d96aa626184e6616d3f1
 
 ## Review purpose
 
-Stage 17 closes the documentation and integration gap after the earlier Stage 16 review. It covers the current HEAD additions that were not present in the Stage 16 evidence and verifies them against the active macOS-first delivery decision.
+Stage 17 closes the documentation and integration gap after the earlier Stage 16 review. It covers the feature-branch additions that were not present in the Stage 16 evidence and verifies them against the active macOS-first delivery decision.
 
-This review authorizes only the next remote-review preparation step. It does not push the branch, create or update a Draft PR, claim remote CI success, merge, tag, publish a GitHub Release, or deploy a service.
+The original Stage 17 decision authorized only remote-review preparation. The feature branch was subsequently pushed, PR #29 completed both remote macOS CI checks successfully, and PR #29 was squash merged into `main`. This review record does not authorize or claim a v0.9.0 tag, GitHub Release, or deployment.
 
 ## Incremental scope after Stage 16
 
-The review covers the following current-branch additions:
+The review covers the following feature-branch additions:
 
 - `5601378` — stable LAOS memory-root error classification
 - `217c81a` — Agent document search integration
@@ -26,7 +28,7 @@ The review covers the following current-branch additions:
 - `9f07c53` — macOS-first delivery scope and macOS CI
 - `fad8852` — explicit SQLite health-check connection closure
 - `716a11b` — fixed-scope Developer Bridge Adapter and regression coverage
-- current documentation alignment in README, ROADMAP, PHASE_STATUS, and this review record
+- documentation alignment in README, ROADMAP, PHASE_STATUS, and this review record
 
 ## Platform decision
 
@@ -109,24 +111,29 @@ The following files now agree on current scope and gates:
 - `docs/decisions/2026-07-05-macos-first-delivery-scope.md`
 - this Stage 17 review
 
-The documentation distinguishes:
+The delivery sequence completed through merge is:
 
 ```text
 local macOS integration
 → branch commit
 → branch push
-→ Draft PR macOS CI
-→ human review
-→ merge
-→ tag
-→ GitHub Release
+→ PR #29 macOS CI
+→ merge to main
 ```
 
-No earlier gate is presented as proof that a later gate passed.
+The remaining release sequence is separately gated:
+
+```text
+v0.9.0 tag
+→ GitHub Release
+→ deployment, if separately authorized
+```
+
+Completion of the merge gate does not imply completion of any release gate.
 
 ## Verification evidence
 
-A complete local validation was run after documentation alignment:
+A complete local validation was run after the original documentation alignment:
 
 ```text
 508 tests passed
@@ -147,6 +154,8 @@ The run included dedicated coverage for:
 
 No SQLite `ResourceWarning` appeared in the validation output.
 
+Remote evidence for PR #29 records two completed macOS CI checks with successful conclusions before the squash merge.
+
 ## Review findings
 
 | Severity | Count | Result |
@@ -154,16 +163,20 @@ No SQLite `ResourceWarning` appeared in the validation output.
 | Critical | 0 | PASS |
 | Major | 0 | PASS |
 | Minor | 0 | PASS |
-| Suggestion | 1 | Run the separately gated remote macOS CI before any merge or release claim |
+| Suggestion | 1 | RESOLVED — the remote-CI prerequisite was satisfied before merge |
 
 ## Gate decision
 
-Stage 17 passes local macOS integration review.
+Stage 17 passed local macOS integration review. The subsequent delivery gates also completed through the PR #29 squash merge into `main` at `c21da74d9027760a47f1d96aa626184e6616d3f1`:
 
-The repository is eligible for a documentation-alignment commit and then, only on explicit user request, branch push and Draft PR macOS CI. Until those operations occur and their evidence is reviewed:
+- `feature_branch_push` is `pushed`;
+- PR #29 is `merged`;
+- `remote_macos_ci` is `passed` with two successful checks;
+- `main_merge` is `passed`.
+
+The release gates remain open:
 
 - `release_readiness` remains `in_progress`;
-- `feature_branch_push` remains `not_pushed`;
-- `draft_pr` remains `not_created`;
-- `remote_macos_ci` remains `not_run`;
-- merge, tag, GitHub Release, and deployment remain blocked by later human gates.
+- the `v0.9.0` tag has not been created;
+- no GitHub Release has been published;
+- no deployment has been performed.
