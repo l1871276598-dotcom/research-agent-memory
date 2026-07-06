@@ -22,6 +22,12 @@ class MemoryCore:
     def get(self, memory_id):
         return self.store.get(memory_id)
 
+    def reviewable(self, workspace=None, project=None, statuses=None):
+        finder = getattr(self.store, "reviewable", None)
+        if not callable(finder):
+            raise ValueError("memory store cannot list reviewable records")
+        return finder(workspace, project, statuses)
+
     def search(self, query, workspace=None, project=None):
         results = self.store.active_relevant(query, workspace, project)
         if self.document_search is not None:

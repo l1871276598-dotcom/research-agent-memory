@@ -9,7 +9,7 @@ import memory_tools
 from agents.candidate_generator import LowRiskCandidateAgent
 from agents.coordinator import LoopCoordinatorAgent
 from agents.handoff import HandoffAgent
-from agents.orchestrator import ContextAgent, ImportAgent, MemoryAgent, ReviewAgent, SearchAgent
+from agents.orchestrator import CandidateListAgent, ContextAgent, ImportAgent, MemoryAgent, ReviewAgent, SearchAgent
 from agents.policy import PolicyAgent
 from agents.reflection import ConversationReviewAgent, ReflectionAgent
 from agents.reflection_record import ReflectionRecordAgent
@@ -25,7 +25,7 @@ from reflection import ConversationReviewCoordinator, ConversationReviewService,
 from review.gate import ReviewGate
 
 
-_INVALID_MEMORY_ROOT_MESSAGE = "请先执行：python3 src/memory.py init --root PATH"
+_INVALID_MEMORY_ROOT_MESSAGE = "\u8bf7\u5148\u6267\u884c\uff1apython3 src/memory.py init --root PATH"
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -79,6 +79,7 @@ def build_application(root, state_dir=None, model_backend=None):
         ImportAgent(root, memory_tools),
         MemoryAgent(core),
         SearchAgent(core),
+        CandidateListAgent(core),
         ReviewAgent(
             ReviewGate(root, candidates.state_dir),
             default_workspace="personal",

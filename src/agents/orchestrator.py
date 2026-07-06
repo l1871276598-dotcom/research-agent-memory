@@ -21,6 +21,7 @@ _LEGACY_CONTEXT_FREE_TASKS = frozenset(
         "loop.coordinate",
     }
 )
+_CANDIDATE_STATUSES = frozenset({"candidate", "conflicted"})
 
 
 def _input(agent, task, allowed=None):
@@ -50,6 +51,15 @@ def _task_value(task, values, name):
     if name in task:
         return task[name]
     return values.get(name)
+
+
+def _limit(values):
+    limit = values.get("limit")
+    if limit is not None and (
+        isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50
+    ):
+        raise ValueError("input.limit must be between 1 and 50")
+    return limit
 
 
 class ImportAgent(BaseAgent):
@@ -126,17 +136,99 @@ class SearchAgent(BaseAgent):
         if workspace not in _WORKSPACE_CHOICES:
             raise ValueError("input.workspace must be personal or work")
         project = _optional_text(_task_value(task, values, "project"), "project")
-        limit = values.get("limit")
-        if limit is not None and (
-            isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50
-        ):
-            raise ValueError("input.limit must be between 1 and 50")
+        limit = _limit(values)
         results = self.core.search(query, workspace, project)
         if not isinstance(results, list):
             raise ValueError("memory search result must be a list")
         if limit is not None:
             results = results[:limit]
         return self.result(task, {"results": results})
+
+
+class CandidateListAgent(BaseAgent):
+    agent_id = "candidate_list_agent"
+    handles = ["memory.candidates"]
+
+    def __init__(self, core):
+        if not callable(getattr(core, "reviewable", None)):
+            raise ValueError("memory core is invalid")
+        self.core = core
+
+    @staticmethod
+    def _statuses(values):
+        raw = values.get("statuses", values.get("status"))
+        if raw is None:
+            return None
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("input.status must be candidate or conflicted")
+        statuses = []
+        for item in raw:
+            if item == "conflict":
+                item = "conflicted"
+            if item not in _CANDIDATE_STATUSES:
+                raise ValueError("input.status must be candidate or conflicted")
+            statuses.append(item)
+        return statuses
+
+    @staticmethod
+    def _summary(record):
+        content = " ".join(str(record.get("content", "")).split())
+        preview = content[:240]
+        if len(content) > len(preview):
+            preview += "…"
+        fields = (
+            "id",
+            "type",
+            "title",
+            "status",
+            "audit_status",
+            "candidate_action",
+            "requested_action",
+            "scope",
+            "workspace",
+            "project",
+            "confidentiality",
+            "confidence",
+            "source",
+            "created",
+            "updated",
+            "reviewed_at",
+            "target_id",
+            "source_id",
+            "relative_path",
+            "tags",
+            "source_refs",
+        )
+        item = {name: record[name] for name in fields if name in record}
+        item["content_preview"] = preview
+        return item
+
+    def run(self, task, context):
+        values = _input(
+            self,
+            task,
+            {"workspace", "project", "status", "statuses", "limit"},
+        )
+        workspace = _text(_task_value(task, values, "workspace"), "workspace")
+        if workspace not in _WORKSPACE_CHOICES:
+            raise ValueError("input.workspace must be personal or work")
+        project = _optional_text(_task_value(task, values, "project"), "project")
+        limit = _limit(values)
+        results = self.core.reviewable(
+            workspace,
+            project,
+            self._statuses(values),
+        )
+        if not isinstance(results, list):
+            raise ValueError("memory candidates result must be a list")
+        if limit is not None:
+            results = results[:limit]
+        return self.result(
+            task,
+            {"results": [self._summary(record) for record in results]},
+        )
 
 
 class ReviewAgent(BaseAgent):
@@ -229,4 +321,11 @@ class ContextAgent(BaseAgent):
         return self.result(task, output)
 
 
-__all__ = ["ContextAgent", "ImportAgent", "MemoryAgent", "ReviewAgent", "SearchAgent"]
+__all__ = [
+    "CandidateListAgent",
+    "ContextAgent",
+    "ImportAgent",
+    "MemoryAgent",
+    "ReviewAgent",
+    "SearchAgent",
+]
