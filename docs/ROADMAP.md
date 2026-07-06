@@ -21,22 +21,25 @@
 - 当前路线不把大型自主 Agent、完整 Meta Planner 或多 Agent 自主协商作为交付目标。
 - 规则型协调器只负责受约束推进，不直接写 active memory，不绕过 Review Gate。
 
-## 当前 Gate：PR #29 已合并，v0.9 发布 Gate 待完成
+## 当前 Gate：v0.9.0 发布准备已通过，tag 与 GitHub Release 待创建
 
-Stage 17 本地 macOS 整合验收与后续 PR #29 合并证据记录在：
+Stage 17 本地 macOS 整合验收、合并证据和发布准备记录在：
 
 ```text
 docs/progress/2026-07-05-stage-17-macos-final-integration-review.md
+docs/progress/2026-07-06-v0.9.0-release-preparation.md
 ```
 
 当前 Gate 状态：
 
 - 508 项本地测试通过。
+- 最新 `main` 的远程 macOS CI 已通过同一 508 项测试。
 - compileall 与 Git diff 检查通过。
 - Critical、Major 和 Minor 发现均为 0。
-- 功能分支已推送，PR #29 的两条远程 macOS CI 均已通过。
-- PR #29 已 squash merge 到 `main`，最新 `origin/main` 为 `c21da74d9027760a47f1d96aa626184e6616d3f1`。
-- `release_readiness` 仍为 `in_progress`；`v0.9.0` tag、GitHub Release 和部署仍需后续人工 Gate。
+- PR #29 已 squash merge 到 `main`，PR #30 已完成合并后状态对齐。
+- 发布准备 Gate 已通过，`release_readiness` 为 `ready_for_release`。
+- `v0.9.0` tag 为 `ready_to_create`，GitHub Release 为 `pending_tag`。
+- 本次交付是本地优先源码发布，没有独立部署目标，`deployment` 为 `not_applicable`。
 
 macOS-first 决策见：
 

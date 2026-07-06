@@ -14,7 +14,7 @@ LAOS 是一个本地优先、可审计、人工审核受控的 Agent 记忆与�
 
 当前实现、集成、验收和发布范围仅承诺 macOS。Linux 与 Windows 兼容性将在 macOS 功能完整性和集成验收完成后作为独立阶段处理，不作为当前交付门禁。
 
-`v0.9.0` 功能已通过 PR #29 squash merge 到 `main`，合并提交为 `c21da74d9027760a47f1d96aa626184e6616d3f1`。Stage 17 本地 508 项测试与 PR #29 两条远程 macOS CI 均已通过。`release_readiness` 仍为 `in_progress`；`v0.9.0` tag、GitHub Release 和部署尚未执行。
+`v0.9.0` 功能已通过 PR #29 squash merge 到 `main`，PR #30 已完成合并后状态对齐。Stage 17 本地 508 项测试与最新 `main` 的远程 macOS CI 均已通过。发布准备 Gate 已通过，`release_readiness` 为 `ready_for_release`；`v0.9.0` tag 与 GitHub Release 尚待创建。本地优先源码发布不包含独立部署目标，因此 `deployment` 为 `not_applicable`。
 
 ## v0.9 已实现能力
 
@@ -392,7 +392,7 @@ git diff --check
 git diff --cached --check
 ```
 
-当前 HEAD 的本地 macOS 集成结果记录在 `docs/progress/2026-07-05-stage-17-macos-final-integration-review.md`。PR #29 的两条远程 macOS CI 均已通过，并已 squash merge 到 `main`（`c21da74d9027760a47f1d96aa626184e6616d3f1`）；`v0.9.0` tag、GitHub Release 和部署尚未执行。
+当前 HEAD 的本地 macOS 集成结果记录在 `docs/progress/2026-07-05-stage-17-macos-final-integration-review.md`。发布准备记录在 `docs/progress/2026-07-06-v0.9.0-release-preparation.md`。最新 `main` 的远程 macOS CI 已通过 508 项测试；`v0.9.0` tag 与 GitHub Release 尚待创建，独立部署不适用于本次本地优先源码发布。
 
 ## 发布门禁
 
@@ -403,6 +403,7 @@ Stage 17 local macOS integration review
 → Draft PR macOS CI
 → human review
 → merge confirmation
+→ v0.9.0 release preparation
 → v0.9.0 tag / GitHub Release confirmation
 ```
 
@@ -416,6 +417,7 @@ Stage 17 local macOS integration review
 - v0.9 架构与安全审查：`docs/progress/2026-07-04-stage-15-v09-architecture-security-audit.md`
 - v0.9 初始发布审查：`docs/progress/2026-07-04-stage-16-v09-release-review.md`
 - 当前 HEAD macOS 最终整合审查：`docs/progress/2026-07-05-stage-17-macos-final-integration-review.md`
+- v0.9.0 发布准备：`docs/progress/2026-07-06-v0.9.0-release-preparation.md`
 - MCP checkpoint：`docs/mcp_checkpoint_validation.md`
 - 自动更新 Loop：`docs/stage_07_2_real_loop_acceptance.md`
 - Trusted Memory Loop：`docs/TRUSTED_MEMORY_LOOP.md`
