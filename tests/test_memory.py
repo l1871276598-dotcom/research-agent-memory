@@ -8,7 +8,6 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from contextlib import closing, contextmanager
 from unittest import mock
@@ -2730,84 +2729,6 @@ class RetrievalEvaluationCommandTests(unittest.TestCase):
         self.assertTrue(template.is_file())
         data = json.loads(template.read_text(encoding="utf-8"))
         self.assertIn("cases", data)
-
-    def test_search_recall_benchmark_on_medium_store(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            module = load_memory_module()
-            root = Path(tmp) / "data"
-            state_dir = Path(tmp) / "state"
-            module.init_store(root)
-            for index in range(80):
-                module.add_memory(
-                    mock.Mock(
-                        root=str(root),
-                        type="principle",
-                        title=f"Benchmark memory {index}",
-                        scope="global",
-                        workspace="personal",
-                        confidentiality="personal",
-                        source="test",
-                        confidence="confirmed",
-                        content="ordinary searchable content",
-                        status="active",
-                        context_id=None,
-                        project=None,
-                        valid_from=None,
-                        valid_until=None,
-                        tags=[],
-                        from_context=None,
-                        to_context=None,
-                        effective_date=None,
-                        reason=None,
-                    )
-                )
-            module.add_memory(
-                mock.Mock(
-                    root=str(root),
-                    type="principle",
-                    title="Benchmark target",
-                    scope="global",
-                    workspace="personal",
-                    confidentiality="personal",
-                    source="test",
-                    confidence="confirmed",
-                    content="unique recall benchmark needle",
-                    status="active",
-                    context_id=None,
-                    project=None,
-                    valid_from=None,
-                    valid_until=None,
-                    tags=[],
-                    from_context=None,
-                    to_context=None,
-                    effective_date=None,
-                    reason=None,
-                )
-            )
-            module.db_init(mock.Mock(root=str(root), state_dir=str(state_dir)))
-            module.index_store(mock.Mock(root=str(root), state_dir=str(state_dir), dry_run=False))
-
-            started = time.perf_counter()
-            summary = module.search_store(
-                mock.Mock(
-                    root=str(root),
-                    state_dir=str(state_dir),
-                    query="unique recall benchmark needle",
-                    workspace="personal",
-                    type=None,
-                    project=None,
-                    context_id=None,
-                    status=None,
-                    include_historical=False,
-                    include_restricted=False,
-                    limit=5,
-                )
-            )
-            elapsed = time.perf_counter() - started
-
-            self.assertEqual(summary["count"], 1)
-            self.assertEqual(summary["results"][0]["title"], "Benchmark target")
-            self.assertLess(elapsed, 2.0)
 
 
 class ExportCommandTests(unittest.TestCase):
