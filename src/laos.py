@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import memory
+import memory_agent
 import memory_tools
 from agents.candidate_generator import LowRiskCandidateAgent
 from agents.coordinator import LoopCoordinatorAgent
@@ -118,6 +119,8 @@ def _write_json(stream, value):
 
 
 def _request_error_code(error):
+    if isinstance(error, memory_agent.AgentError):
+        return error.code
     message = str(error)
     if message == _INVALID_MEMORY_ROOT_MESSAGE:
         return "invalid_memory_root"
