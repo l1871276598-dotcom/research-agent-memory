@@ -35,6 +35,21 @@ def build_protocol_host(facade, *, server_options=None):
         """
         return facade.memory_search(query, workspace, project, limit)
 
+    @host.tool()
+    def laos_handoff_write(
+        project_slug: str,
+        content: str,
+        expected_sha256: str | None = None,
+        workspace: str = "personal",
+    ) -> dict:
+        """Write one project handoff through the LAOS handoff gate.
+
+        `project_slug` must name an active source-backed project. The tool writes
+        through staging and publishes only to `projects/<project_slug>/handoff.md`.
+        It does not write or overwrite root-level legacy handoff files.
+        """
+        return facade.handoff_write(project_slug, content, expected_sha256, workspace)
+
     if checkpoint_enabled:
 
         @host.tool()

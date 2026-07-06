@@ -7,6 +7,7 @@ import memory
 import memory_tools
 from agents.candidate_generator import LowRiskCandidateAgent
 from agents.coordinator import LoopCoordinatorAgent
+from agents.handoff import HandoffAgent
 from agents.orchestrator import ContextAgent, ImportAgent, MemoryAgent, ReviewAgent, SearchAgent
 from agents.policy import PolicyAgent
 from agents.reflection import ConversationReviewAgent, ReflectionAgent
@@ -82,6 +83,7 @@ def build_application(root, state_dir=None, model_backend=None):
             default_workspace="personal",
         ),
         ContextAgent(ContextBuilder(store)),
+        HandoffAgent(root),
         reflection,
         policy,
         generator,

@@ -5,6 +5,7 @@
     {"id": "search_agent", "class": "SearchAgent", "handles": ["memory.search"]},
     {"id": "review_agent", "class": "ReviewAgent", "handles": ["memory.review"]},
     {"id": "context_agent", "class": "ContextAgent", "handles": ["context.build"]},
+    {"id": "handoff_agent", "class": "HandoffAgent", "handles": ["handoff.write", "handoff.update"]},
     {"id": "reflection_agent", "class": "ReflectionAgent", "handles": ["loop.reflect"]},
     {"id": "policy_agent", "class": "PolicyAgent", "handles": ["loop.suggest-policies"]},
     {"id": "low_risk_candidate_agent", "class": "LowRiskCandidateAgent", "handles": ["loop.generate-candidate"]},
