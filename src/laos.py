@@ -3,6 +3,7 @@ import json
 import sys
 from pathlib import Path
 
+import memory
 import memory_tools
 from agents.candidate_generator import LowRiskCandidateAgent
 from agents.coordinator import LoopCoordinatorAgent
@@ -22,6 +23,9 @@ from reflection import ConversationReviewCoordinator, ConversationReviewService,
 from review.gate import ReviewGate
 
 
+_INVALID_MEMORY_ROOT_MESSAGE = "请先执行：python3 src/memory.py init --root PATH"
+
+
 class JsonArgumentParser(argparse.ArgumentParser):
     def error(self, message):
         raise ValueError("invalid arguments")
@@ -30,7 +34,30 @@ class JsonArgumentParser(argparse.ArgumentParser):
 def build_application(root, state_dir=None, model_backend=None):
     store = MemoryStore(root)
     candidates = CandidateStore(root, state_dir)
-    core = MemoryCore(store, candidates)
+
+    def search_documents(query, workspace, project):
+        return memory.search_store(
+            argparse.Namespace(
+                root=str(root),
+                state_dir=str(candidates.state_dir),
+                query=query,
+                kind="document",
+                source_kind=None,
+                project=project,
+                context_id=None,
+                workspace=workspace,
+                status=None,
+                as_of=None,
+                include_unassigned=False,
+                include_restricted=False,
+                include_inactive=False,
+                limit=20,
+                json=True,
+                mode="lexical",
+            )
+        )
+
+    core = MemoryCore(store, candidates, search_documents)
 
     reflection = ReflectionAgent(candidates.state_dir)
     policy = PolicyAgent(root, candidates.state_dir)
@@ -88,6 +115,15 @@ def _write_json(stream, value):
     stream.write("\n")
 
 
+def _request_error_code(error):
+    message = str(error)
+    if message == _INVALID_MEMORY_ROOT_MESSAGE:
+        return "invalid_memory_root"
+    if message == "memory store validation failed":
+        return "memory_store_validation_failed"
+    return "request_failed"
+
+
 def main(argv=None):
     try:
         args = _parser().parse_args(argv)
@@ -102,10 +138,15 @@ def main(argv=None):
             )
             backend = build_model_backend(model_config)
         result = build_application(args.root, args.state_dir, backend).run(task)
-    except Exception:
+    except Exception as error:
         _write_json(
             sys.stderr,
-            {"error": {"code": "request_failed", "message": "Request failed."}},
+            {
+                "error": {
+                    "code": _request_error_code(error),
+                    "message": "Request failed.",
+                }
+            },
         )
         return 1
     _write_json(sys.stdout, result)

@@ -9,15 +9,7 @@ permissions:
 
 jobs:
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
-          - macos-latest
-
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-latest
 
     env:
       PYTHONUTF8: "1"
@@ -34,12 +26,12 @@ jobs:
         shell: bash
         run: |
           set +e
-          python -m unittest discover -s tests -v > "test-output-${{ runner.os }}.log" 2>&1
+          python -m unittest discover -s tests -v > "test-output-macOS.log" 2>&1
           status=$?
           if [ "$status" -ne 0 ]; then
-            tail -n 220 "test-output-${{ runner.os }}.log"
+            tail -n 220 "test-output-macOS.log"
           else
-            cat "test-output-${{ runner.os }}.log"
+            cat "test-output-macOS.log"
           fi
           exit "$status"
 
@@ -47,8 +39,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-output-${{ runner.os }}
-          path: test-output-${{ runner.os }}.log
+          name: test-output-macOS
+          path: test-output-macOS.log
 
       - run: python -m compileall -q src tests
       - run: git diff --check

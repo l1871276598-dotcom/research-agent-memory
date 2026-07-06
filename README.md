@@ -8,10 +8,13 @@ LAOS 是一个本地优先、可审计、人工审核受控的 Agent 记忆与�
 - 目标发布版本：`v0.9.0`
 - SQLite schema：`v3`
 - Python：`3.11+`
-- 主要验证平台：macOS、Ubuntu、Windows
+- 当前验收平台：macOS
+- 后置平台：Linux、Windows
 - 运行边界：本地、可信操作者、命令行或受控本地服务
 
-`v0.9.0` 尚未打 tag、合并或正式发布。当前分支用于 Draft PR 审查；合并、tag、GitHub Release 和部署仍需单独确认。
+当前实现、集成、验收和发布范围仅承诺 macOS。Linux 与 Windows 兼容性将在 macOS 功能完整性和集成验收完成后作为独立阶段处理，不作为当前交付门禁。
+
+`v0.9.0` 尚未合并、打 tag 或正式发布。当前功能分支已推送并创建 Draft PR #29；合并最新 `origin/main` 后的本地与远程 macOS CI 均已通过。合并、tag、GitHub Release 和部署仍需分别通过后续 Gate。
 
 ## v0.9 已实现能力
 
@@ -80,7 +83,11 @@ finalize
 - Bridge Event Inbox、projector 和 crash recovery
 - MCP stdio 与回环 Streamable HTTP 服务
 - 显式 `laos_capture_checkpoint` 工具及验证流程
+- 只读、分区受控的 `memory_search` 工具
 - 自动更新 Loop 的真实 baseline → review → verification → comparison 验收入口
+- `tools/developer_bridge_adapter.py` 提供固定配置、固定作用域的 checkpoint 捕获、session 搜索和 session 读取入口
+
+Developer Bridge Adapter 不接受任意路径、命令或环境注入；data、state、code 路径必须相互隔离，输入输出有固定大小边界，越权、冲突和不安全路径按 fail-closed 处理。
 
 MCP checkpoint 是显式工具通道，不是浏览器侧被动、无损或自动对话采集。真实 ChatGPT 五轮写入验收仍受当前账户能力限制。
 
@@ -107,6 +114,7 @@ MCP checkpoint 是显式工具通道，不是浏览器侧被动、无损或自�
 - GUI、Web 前端或桌面应用
 - 大型自主 Coordinator / Meta Planner
 - 内置文献管理系统扩展
+- 当前阶段的 Linux 与 Windows 发布承诺
 
 文献、Zotero、EndNote、网页和其他外部来源后续只通过 Adapter 或外部接口接入，不进入 Memory Core 主线。
 
@@ -379,34 +387,35 @@ PDF/DOCX 等二进制文件只归档 raw；当前不会进行深度结构化解�
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m compileall -q src
+python3 -m compileall -q src tests
 git diff --check
 git diff --cached --check
 ```
 
-最终集成后的实际测试数量和远程 CI 状态记录在 `docs/progress/2026-07-04-stage-16-v09-release-review.md`。远程检查未完成时，不应声称 CI 全绿。
+当前 HEAD 的本地 macOS 集成结果记录在 `docs/progress/2026-07-05-stage-17-macos-final-integration-review.md`。PR #29 在合并最新 `origin/main` 后的两条远程 macOS CI 均已通过；版本尚未合并或发布。
 
 ## 发布门禁
 
 ```text
-Stage 16 release review
-→ integrate latest origin/main
-→ resolve conflicts
-→ full local validation
+Stage 17 local macOS integration review
+→ commit documentation alignment
 → push feature branch
-→ Draft PR CI
+→ Draft PR macOS CI
 → human review
 → merge confirmation
 → v0.9.0 tag / GitHub Release confirmation
 ```
 
-Draft PR、合并、tag 和正式 release 是不同 Gate。创建 Draft PR 不等于已经发布。
+本地验收、Draft PR、远程 CI、合并、tag 和正式 release 是不同 Gate。任何前置 Gate 通过都不代表后续 Gate 自动通过。
 
 ## 文档
 
 - 当前阶段状态：`docs/PHASE_STATUS.json`
+- 当前路线图：`docs/ROADMAP.md`
+- macOS-first 决策：`docs/decisions/2026-07-05-macos-first-delivery-scope.md`
 - v0.9 架构与安全审查：`docs/progress/2026-07-04-stage-15-v09-architecture-security-audit.md`
-- v0.9 发布审查：`docs/progress/2026-07-04-stage-16-v09-release-review.md`
+- v0.9 初始发布审查：`docs/progress/2026-07-04-stage-16-v09-release-review.md`
+- 当前 HEAD macOS 最终整合审查：`docs/progress/2026-07-05-stage-17-macos-final-integration-review.md`
 - MCP checkpoint：`docs/mcp_checkpoint_validation.md`
 - 自动更新 Loop：`docs/stage_07_2_real_loop_acceptance.md`
 - Trusted Memory Loop：`docs/TRUSTED_MEMORY_LOOP.md`

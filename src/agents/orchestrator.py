@@ -120,15 +120,22 @@ class SearchAgent(BaseAgent):
         self.core = core
 
     def run(self, task, context):
-        values = _input(self, task, {"query", "workspace", "project"})
+        values = _input(self, task, {"query", "workspace", "project", "limit"})
         query = _text(values.get("query"), "input.query")
         workspace = _text(_task_value(task, values, "workspace"), "workspace")
         if workspace not in _WORKSPACE_CHOICES:
             raise ValueError("input.workspace must be personal or work")
         project = _optional_text(_task_value(task, values, "project"), "project")
+        limit = values.get("limit")
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50
+        ):
+            raise ValueError("input.limit must be between 1 and 50")
         results = self.core.search(query, workspace, project)
         if not isinstance(results, list):
             raise ValueError("memory search result must be a list")
+        if limit is not None:
+            results = results[:limit]
         return self.result(task, {"results": results})
 
 

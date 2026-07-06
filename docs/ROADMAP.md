@@ -15,10 +15,34 @@
 
 ## 当前发布范围
 
-- `v0.8.1` 的当前目标是本地记忆核心、Review Gate、Learning Loop 和自动更新 Loop 的真实验收。
+- 当前版本为 `v0.9.0-development`，目标发布版本为 `v0.9.0`。
+- 当前实现、集成、验收和发布范围仅承诺 macOS 与 Python 3.11 或更高版本；Linux 和 Windows 兼容性后置到独立阶段。
 - 文献系统不再作为内置路线阶段推进；未来如有需要，只通过 External Adapter 接口接入。
 - 当前路线不把大型自主 Agent、完整 Meta Planner 或多 Agent 自主协商作为交付目标。
 - 规则型协调器只负责受约束推进，不直接写 active memory，不绕过 Review Gate。
+
+## 当前 Gate：Stage 17 macOS 最终整合审查
+
+当前 HEAD 的本地 macOS 整合验收已通过，证据记录在：
+
+```text
+docs/progress/2026-07-05-stage-17-macos-final-integration-review.md
+```
+
+当前 Gate 状态：
+
+- 508 项本地测试通过。
+- compileall 与 Git diff 检查通过。
+- Critical、Major 和 Minor 发现均为 0。
+- 远程 macOS CI 尚未运行。
+- 当前分支尚未推送，Draft PR 尚未创建。
+- 合并、tag、GitHub Release 和部署仍需后续人工 Gate。
+
+macOS-first 决策见：
+
+```text
+docs/decisions/2026-07-05-macos-first-delivery-scope.md
+```
 
 ## Phase 0：仓库初始化和执行约束
 
