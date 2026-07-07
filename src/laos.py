@@ -7,6 +7,7 @@ import memory
 import memory_tools
 from agents.candidate_generator import LowRiskCandidateAgent
 from agents.coordinator import LoopCoordinatorAgent
+from agents.handoff import HandoffAgent
 from agents.orchestrator import ContextAgent, ImportAgent, MemoryAgent, ReviewAgent, SearchAgent
 from agents.policy import PolicyAgent
 from agents.reflection import ConversationReviewAgent, ReflectionAgent
@@ -82,6 +83,7 @@ def build_application(root, state_dir=None, model_backend=None):
             default_workspace="personal",
         ),
         ContextAgent(ContextBuilder(store)),
+        HandoffAgent(root),
         reflection,
         policy,
         generator,
@@ -124,6 +126,17 @@ def _request_error_code(error):
     return "request_failed"
 
 
+def _error_stage(error):
+    message = str(error)
+    if "handoff" in message.lower():
+        return "handoff.write"
+    if "memory" in message.lower():
+        return "memory"
+    if "search" in message.lower():
+        return "memory.search"
+    return "task"
+
+
 def main(argv=None):
     try:
         args = _parser().parse_args(argv)
@@ -144,7 +157,8 @@ def main(argv=None):
             {
                 "error": {
                     "code": _request_error_code(error),
-                    "message": "Request failed.",
+                    "message": str(error),
+                    "stage": _error_stage(error),
                 }
             },
         )

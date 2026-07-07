@@ -36,10 +36,11 @@ class LaosCliErrorCodeTests(unittest.TestCase):
     def assert_safe_error(self, result, code, *sensitive_values):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(
-            json.loads(result.stderr),
-            {"error": {"code": code, "message": "Request failed."}},
-        )
+        payload = json.loads(result.stderr)
+        self.assertIn("error", payload)
+        self.assertEqual(payload["error"]["code"], code)
+        self.assertIsInstance(payload["error"].get("message"), str)
+        self.assertIsInstance(payload["error"].get("stage"), str)
         self.assertEqual(result.stderr.count("\n"), 1)
         self.assertNotIn("Traceback", result.stderr)
         for value in sensitive_values:

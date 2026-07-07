@@ -38,6 +38,30 @@ class LaosToolFacade:
             raise RuntimeError("memory search returned an invalid result")
         return rows[:limit]
 
+    def handoff_write(self, project_slug, content, expected_sha256=None, workspace="personal"):
+        if not isinstance(project_slug, str) or not project_slug.strip():
+            raise ValueError("project_slug must be a non-empty string")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("content must be a non-empty string")
+        if expected_sha256 is not None and (not isinstance(expected_sha256, str) or not expected_sha256.strip()):
+            raise ValueError("expected_sha256 must be a non-empty string")
+        if workspace not in {"personal", "work"}:
+            raise ValueError("workspace must be personal or work")
+
+        values = {"project_slug": project_slug, "content": content}
+        if expected_sha256 is not None:
+            values["expected_sha256"] = expected_sha256
+        result = self.application.run(
+            {"type": "handoff.write", "workspace": workspace, "input": values}
+        )
+        try:
+            output = result["output"]
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError("handoff write returned an invalid result") from exc
+        if not isinstance(output, dict) or output.get("project_slug") != project_slug:
+            raise RuntimeError("handoff write returned an invalid result")
+        return output
+
     def capture_checkpoint(self, **values):
         if self.checkpoint_capture is None:
             raise RuntimeError("MCP checkpoint capture is unavailable")

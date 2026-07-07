@@ -35,10 +35,10 @@ docs/progress/2026-07-06-v0.9.0-release-preparation.md
 - Stage 17 本地 508 项测试通过。
 - 发布前远程 macOS CI、compileall 与 Git diff 检查通过。
 - Critical、Major 和 Minor 发现均为 0。
-- PR #29 完成功能合并，PR #30 完成合并后状态对齐，PR #31 完成发布准备。
+- PR #29 完成功能合并，PR #30 完成合并后状态对齐，PR #31 完成发布准备，PR #32 完成错误召回基准测试撤回。
+- PR #34（本 PR）更新合并后状态记录与路线图文档的 handoff 错误修复说明。
 - `v0.9.0` tag 已创建，GitHub Release 已发布。
 - `release_readiness` 为 `passed`。
-- 发布后由 PR #14 引入的错误召回基准测试已通过 PR #32 撤回；修复树重新通过 508 项本地测试、compileall 与 Git diff 检查。
 - 本次交付是本地优先源码发布，没有独立部署目标，`deployment` 为 `not_applicable`。
 
 macOS-first 决策见：

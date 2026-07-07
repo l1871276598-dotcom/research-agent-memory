@@ -13,7 +13,7 @@ LAOS 是一个本地优先、可审计、人工审核受控的 Agent 记忆与�
 
 当前实现、集成、验收和发布范围仅承诺 macOS。Linux 与 Windows 兼容性将在 macOS 功能完整性和集成验收完成后作为独立阶段处理，不作为当前交付门禁。
 
-`v0.9.0` 已作为 GitHub 正式源码版本发布：tag 已创建，GitHub Release 已发布，`release_readiness` 为 `passed`。Stage 17 本地 508 项测试与发布前远程 macOS CI 均已通过；发布后由错误召回基准测试导致的 `main` CI 回归已通过 PR #32 撤回，并重新通过 508 项本地验证。本地优先源码发布不包含独立部署目标，因此 `deployment` 为 `not_applicable`。
+`v0.9.0` 功能已通过 PR #29 squash merge 到 `main`，合并提交为 `c21da74d9027760a47f1d96aa626184e6616d3f1`。Stage 17 本地 508 项测试与 PR #29 两条远程 macOS CI 均已通过。`v0.9.0` tag 与 GitHub Release 已创建并发布（参见 `docs/progress/2026-07-06-v0.9.0-release-preparation.md`）；`release_readiness` 为 `passed`，`deployment` 为 `not_applicable`。发布后由错误召回基准测试导致的 `main` CI 回归已通过 PR #32 撤回，并重新通过 508 项本地验证。
 
 ## v0.9 已实现能力
 
