@@ -2748,14 +2748,11 @@ class PipelineTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 error = json.loads(result.stderr)
                 self.assertEqual(
-                    error,
-                    {
-                        "error": {
-                            "code": "request_failed",
-                            "message": "Request failed.",
-                        }
-                    },
+                    error["error"]["code"],
+                    "request_failed",
                 )
+                self.assertIsInstance(error["error"].get("message"), str)
+                self.assertIsInstance(error["error"].get("stage"), str)
                 self.assertEqual(result.stderr.count("\n"), 1)
                 self.assertEqual(result.stdout, "")
                 self.assertNotIn("Traceback", result.stderr)
