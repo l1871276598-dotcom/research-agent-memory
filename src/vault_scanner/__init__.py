@@ -3,7 +3,9 @@ from .scanner import scan_file
 from .indexer import Indexer, PARSER_VERSION, export_receipt_records
 from .parser import (QuarantineError, extract_wikilinks, parse_frontmatter,
                      validate_frontmatter)
+from . import vault_writer  # Phase 2 candidate creation
 
 __all__ = ["reconcile_manifest", "scan_file", "Indexer", "PARSER_VERSION",
            "export_receipt_records", "parse_frontmatter",
-           "extract_wikilinks", "QuarantineError", "validate_frontmatter"]
+           "extract_wikilinks", "QuarantineError", "validate_frontmatter",
+           "vault_writer"]
