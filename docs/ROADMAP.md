@@ -15,28 +15,31 @@
 
 ## 当前发布范围
 
-- 当前版本为 `v0.9.0-development`，目标发布版本为 `v0.9.0`。
+- 当前正式版本为 `v0.9.0`。
 - 当前实现、集成、验收和发布范围仅承诺 macOS 与 Python 3.11 或更高版本；Linux 和 Windows 兼容性后置到独立阶段。
 - 文献系统不再作为内置路线阶段推进；未来如有需要，只通过 External Adapter 接口接入。
 - 当前路线不把大型自主 Agent、完整 Meta Planner 或多 Agent 自主协商作为交付目标。
 - 规则型协调器只负责受约束推进，不直接写 active memory，不绕过 Review Gate。
 
-## 当前 Gate：PR #29 已合并，v0.9 发布 Gate 待完成
+## 当前 Gate：v0.9.0 正式源码发布已完成
 
-Stage 17 本地 macOS 整合验收与后续 PR #29 合并证据记录在：
+Stage 17 本地 macOS 整合验收、发布准备与正式发布记录在：
 
 ```text
 docs/progress/2026-07-05-stage-17-macos-final-integration-review.md
+docs/progress/2026-07-06-v0.9.0-release-preparation.md
 ```
 
 当前 Gate 状态：
 
-- 508 项本地测试通过。
-- compileall 与 Git diff 检查通过。
+- Stage 17 本地 508 项测试通过。
+- 发布前远程 macOS CI、compileall 与 Git diff 检查通过。
 - Critical、Major 和 Minor 发现均为 0。
-- 功能分支已推送，PR #29 的两条远程 macOS CI 均已通过。
-- PR #29 已 squash merge 到 `main`，最新 `origin/main` 为 `c21da74d9027760a47f1d96aa626184e6616d3f1`。
-- `release_readiness` 仍为 `in_progress`；`v0.9.0` tag、GitHub Release 和部署仍需后续人工 Gate。
+- PR #29 完成功能合并，PR #30 完成合并后状态对齐，PR #31 完成发布准备，PR #32 完成错误召回基准测试撤回。
+- PR #34（本 PR）更新合并后状态记录与路线图文档的 handoff 错误修复说明。
+- `v0.9.0` tag 已创建，GitHub Release 已发布。
+- `release_readiness` 为 `passed`。
+- 本次交付是本地优先源码发布，没有独立部署目标，`deployment` 为 `not_applicable`。
 
 macOS-first 决策见：
 

@@ -4,8 +4,7 @@ LAOS 是一个本地优先、可审计、人工审核受控的 Agent 记忆与�
 
 ## 当前版本
 
-- 开发版本：`v0.9.0-development`
-- 目标发布版本：`v0.9.0`
+- 当前正式版本：`v0.9.0`
 - SQLite schema：`v3`
 - Python：`3.11+`
 - 当前验收平台：macOS
@@ -14,7 +13,7 @@ LAOS 是一个本地优先、可审计、人工审核受控的 Agent 记忆与�
 
 当前实现、集成、验收和发布范围仅承诺 macOS。Linux 与 Windows 兼容性将在 macOS 功能完整性和集成验收完成后作为独立阶段处理，不作为当前交付门禁。
 
-`v0.9.0` 功能已通过 PR #29 squash merge 到 `main`，合并提交为 `c21da74d9027760a47f1d96aa626184e6616d3f1`。Stage 17 本地 508 项测试与 PR #29 两条远程 macOS CI 均已通过。`release_readiness` 仍为 `in_progress`；`v0.9.0` tag、GitHub Release 和部署尚未执行。
+`v0.9.0` 功能已通过 PR #29 squash merge 到 `main`，合并提交为 `c21da74d9027760a47f1d96aa626184e6616d3f1`。Stage 17 本地 508 项测试与 PR #29 两条远程 macOS CI 均已通过。`v0.9.0` tag 与 GitHub Release 已创建并发布（参见 `docs/progress/2026-07-06-v0.9.0-release-preparation.md`）；`release_readiness` 为 `passed`，`deployment` 为 `not_applicable`。发布后由错误召回基准测试导致的 `main` CI 回归已通过 PR #32 撤回，并重新通过 508 项本地验证。
 
 ## v0.9 已实现能力
 
@@ -392,7 +391,7 @@ git diff --check
 git diff --cached --check
 ```
 
-当前 HEAD 的本地 macOS 集成结果记录在 `docs/progress/2026-07-05-stage-17-macos-final-integration-review.md`。PR #29 的两条远程 macOS CI 均已通过，并已 squash merge 到 `main`（`c21da74d9027760a47f1d96aa626184e6616d3f1`）；`v0.9.0` tag、GitHub Release 和部署尚未执行。
+当前 HEAD 的本地 macOS 集成结果记录在 `docs/progress/2026-07-05-stage-17-macos-final-integration-review.md`，正式发布记录在 `docs/progress/2026-07-06-v0.9.0-release-preparation.md`。`v0.9.0` tag 与 GitHub Release 已创建并发布；发布后 `main` 的错误召回基准测试已撤回，当前本地完整验证为 508 项通过。独立部署不适用于本次本地优先源码发布。
 
 ## 发布门禁
 
@@ -403,10 +402,12 @@ Stage 17 local macOS integration review
 → Draft PR macOS CI
 → human review
 → merge confirmation
+→ v0.9.0 release preparation
 → v0.9.0 tag / GitHub Release confirmation
+→ released
 ```
 
-本地验收、Draft PR、远程 CI、合并、tag 和正式 release 是不同 Gate。任何前置 Gate 通过都不代表后续 Gate 自动通过。
+本地验收、Draft PR、远程 CI、合并、tag 和正式 release 是不同 Gate。`v0.9.0` 的全部源码发布 Gate 已完成；后续代码变更继续按独立 PR 与 CI 门禁处理。
 
 ## 文档
 
@@ -416,6 +417,7 @@ Stage 17 local macOS integration review
 - v0.9 架构与安全审查：`docs/progress/2026-07-04-stage-15-v09-architecture-security-audit.md`
 - v0.9 初始发布审查：`docs/progress/2026-07-04-stage-16-v09-release-review.md`
 - 当前 HEAD macOS 最终整合审查：`docs/progress/2026-07-05-stage-17-macos-final-integration-review.md`
+- v0.9.0 正式发布记录：`docs/progress/2026-07-06-v0.9.0-release-preparation.md`
 - MCP checkpoint：`docs/mcp_checkpoint_validation.md`
 - 自动更新 Loop：`docs/stage_07_2_real_loop_acceptance.md`
 - Trusted Memory Loop：`docs/TRUSTED_MEMORY_LOOP.md`
