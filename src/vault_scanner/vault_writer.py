@@ -700,3 +700,149 @@ def check_promotion_conflicts(
         "candidate_state": "conflicted",
         "reasons": reasons,
     }
+
+
+# ── Sliver 6: Atomic Promotion ─────────────────────────────────────
+
+
+def promote(
+    db_path: Path,
+    plan_id: str,
+    vault_root: Path,
+) -> dict:
+    """Execute an atomic promotion for an approved candidate.
+
+    Steps:
+      1. Load the promotion plan and verify 'active' state
+      2. Load the candidate
+      3. Run conflict checks (hash, target, symlink)
+      4. Read candidate file content
+      5. Atomic write to target path
+      6. Update candidate state to 'active'
+      7. Update plan state to 'completed'
+      8. Write promotion.completed audit event
+
+    On failure at any DB step after file write: the target file is cleaned up
+    so no partial artifact remains.
+
+    Returns a dict with promotion result.
+    """
+    # ── 1. Load plan ─────────────────────────────────────────────────
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        plan_row = conn.execute(
+            "SELECT plan_id, candidate_id, expected_candidate_hash, "
+            "target_path, state FROM promotion_plans WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+
+    if plan_row is None:
+        raise ValueError(f"Promotion plan not found: {plan_id}")
+
+    plan_state = plan_row[4]
+    if plan_state != "active":
+        raise ValueError(
+            f"Plan {plan_id} is '{plan_state}', must be 'active' for promotion"
+        )
+
+    candidate_id = plan_row[1]
+    target_path_str = plan_row[3]
+
+    # ── 2. Load candidate ────────────────────────────────────────────
+    cand = _get_candidate(db_path, candidate_id)
+    if cand is None:
+        raise ValueError(f"Candidate not found: {candidate_id}")
+
+    if cand["candidate_state"] != "approved":
+        raise ValueError(
+            f"Candidate {candidate_id} is '{cand['candidate_state']}', "
+            f"must be 'approved' for promotion"
+        )
+
+    # ── 3. Conflict check ────────────────────────────────────────────
+    conflict = check_promotion_conflicts(
+        db_path, candidate_id, vault_root, plan_id=plan_id
+    )
+    if conflict is not None:
+        reasons = "; ".join(conflict.get("reasons", ["unknown_conflict"]))
+        raise ValueError(
+            f"Promotion conflicts detected for plan {plan_id}: {reasons}"
+        )
+
+    # ── 4. Read candidate file content ───────────────────────────────
+    source_path = (vault_root / cand["relative_path"]).resolve()
+    if not source_path.exists():
+        raise FileNotFoundError(f"Candidate file not found: {source_path}")
+
+    try:
+        content = source_path.read_text(encoding="utf-8")
+    except Exception as e:
+        raise IOError(f"Failed to read candidate file: {e}") from e
+
+    # ── 5. Ensure target parent dir exists & atomic write ────────────
+    target_path = (vault_root / target_path_str).resolve()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_atomic(target_path, content)
+
+    # ── 6. DB updates (candidate + plan + audit in one transaction) ──
+    now = _now_iso()
+    file_cleaned_up = False
+
+    try:
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            # Update candidate state to active
+            conn.execute(
+                "UPDATE candidates SET candidate_state = ? WHERE candidate_id = ?",
+                ("active", candidate_id),
+            )
+            # Update plan state to completed
+            conn.execute(
+                "UPDATE promotion_plans SET state = ? WHERE plan_id = ?",
+                ("completed", plan_id),
+            )
+            # Write audit event
+            conn.execute(
+                "INSERT INTO audit_events "
+                "(event_type, candidate_id, note_id, actor, timestamp, "
+                "before_state, after_state, candidate_hash, target_path, "
+                "tool_version, plan_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("promotion.completed", candidate_id, cand["note_id"],
+                 "system", now, "approved", "active",
+                 cand.get("reviewed_hash"), target_path_str,
+                 TOOL_VERSION, plan_id),
+            )
+            conn.commit()
+    except Exception:
+        # DB write failed — rollback the file write
+        if target_path.exists():
+            target_path.unlink()
+        file_cleaned_up = True
+        raise
+
+    # ── 9. Remove source candidate file ──────────────────────────────
+    try:
+        source_path.unlink()
+    except Exception:
+        # Non-fatal: candidate is already active, file in target.
+        # Log the orphan but do not fail the promotion.
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            conn.execute(
+                "INSERT INTO audit_events "
+                "(event_type, candidate_id, note_id, actor, timestamp, "
+                "reason, tool_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("promotion.orphan_source", candidate_id, cand["note_id"],
+                 "system", _now_iso(),
+                 f"Source file not removed: {cand['relative_path']}",
+                 TOOL_VERSION),
+            )
+            conn.commit()
+
+    return {
+        "plan_id": plan_id,
+        "candidate_id": candidate_id,
+        "note_id": cand["note_id"],
+        "candidate_state": "active",
+        "target_path": target_path_str,
+        "promoted_at": now,
+    }

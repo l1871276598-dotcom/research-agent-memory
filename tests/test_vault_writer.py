@@ -848,3 +848,211 @@ class TestSliver3ReviewGate(unittest.TestCase):
         result = review_candidate(self.db_path, cand["candidate_id"],
                                   decision="approve", reviewed_by="human-tester")
         self.assertEqual(result["candidate_state"], "rejected")
+
+
+# ── Sliver 6: Atomic Promotion ──────────────────────────────────────
+
+
+class TestSliver6AtomicPromotion(unittest.TestCase):
+    """Atomic promotion: verify, write, state transition, audit, rollback."""
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp())
+        self.vault = self.temp / "vault"
+        self.laos_dir = self.vault / "0-inbox" / "laos-generated"
+        self.laos_dir.mkdir(parents=True, exist_ok=True)
+        for d in ["1-projects", "2-areas", "3-resources"]:
+            (self.vault / d).mkdir(parents=True, exist_ok=True)
+        self.db_path = self.temp / "test_index.sqlite"
+        from vault_scanner.vault_writer import init_candidate_db
+        init_candidate_db(self.db_path)
+
+    def _content(self, doc_type: str = "project") -> str:
+        return (
+            "---\nid: test-sliver6-note\n"
+            "schema_version: 1\n"
+            f"type: {doc_type}\nlifecycle: active\nsource: laos\n"
+            "created: 2026-07-07\nupdated: 2026-07-07\n---\nBody.\n"
+        )
+
+    def _create_approve_plan(self):
+        """Helper: create → approve → plan → return (candidate, plan)."""
+        from vault_scanner.vault_writer import create_candidate, review_candidate, plan_promotion
+        content = self._content()
+        cand = create_candidate(vault_root=self.vault, db_path=self.db_path,
+                                content=content, generator="test-suite",
+                                generator_version="0.1.0")
+        review_candidate(self.db_path, cand["candidate_id"],
+                         decision="approve", reviewed_by="human-tester")
+        plan = plan_promotion(self.db_path, cand["candidate_id"], self.vault)
+        return cand, plan
+
+    # ── 6a: Candidate changed after plan creation → fail closed ──────
+
+    def test_promotion_fails_if_candidate_changed(self):
+        """Candidate modified between plan creation and promote → reject."""
+        from vault_scanner.vault_writer import promote
+        cand, plan = self._create_approve_plan()
+
+        # Modify candidate file after plan creation
+        file_path = self.vault / cand["relative_path"]
+        file_path.write_text(file_path.read_text("utf-8") + "\nTampered.\n", "utf-8")
+
+        with self.assertRaises(ValueError):
+            promote(self.db_path, plan["plan_id"], vault_root=self.vault)
+
+        # Candidate state set to 'conflicted' by check_promotion_conflicts
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            row = conn.execute(
+                "SELECT candidate_state FROM candidates WHERE candidate_id = ?",
+                (cand["candidate_id"],),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], "conflicted")
+
+        # Candidate file must still exist in laos-generated/
+        self.assertTrue(file_path.exists())
+
+        # Target file must NOT exist
+        target_full = self.vault / plan["target_path"]
+        self.assertFalse(target_full.exists())
+
+        # No promotion.completed audit event
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            completed = conn.execute(
+                "SELECT event_type FROM audit_events WHERE candidate_id = ? "
+                "AND event_type = 'promotion.completed'",
+                (cand["candidate_id"],),
+            ).fetchall()
+        self.assertEqual(len(completed), 0)
+
+        # Candidate file must still exist in laos-generated/
+        self.assertTrue(file_path.exists())
+
+        # Target file must NOT exist
+        target_full = self.vault / plan["target_path"]
+        self.assertFalse(target_full.exists())
+
+        # No promotion.completed audit event
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            completed = conn.execute(
+                "SELECT event_type FROM audit_events WHERE candidate_id = ? "
+                "AND event_type = 'promotion.completed'",
+                (cand["candidate_id"],),
+            ).fetchall()
+        self.assertEqual(len(completed), 0)
+
+    # ── 6b: Target exists → fail closed (never overwrite) ────────────
+
+    def test_promotion_fails_if_target_exists(self):
+        """Promotion denied when target path already exists."""
+        from vault_scanner.vault_writer import promote
+        cand, plan = self._create_approve_plan()
+
+        # Create target file before promotion
+        target_full = self.vault / plan["target_path"]
+        target_full.write_text("existing content\n", "utf-8")
+
+        with self.assertRaises(ValueError):
+            promote(self.db_path, plan["plan_id"], vault_root=self.vault)
+
+        # Target file must be untouched
+        self.assertEqual(target_full.read_text("utf-8"), "existing content\n")
+
+        # Candidate state unchanged
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            row = conn.execute(
+                "SELECT candidate_state FROM candidates WHERE candidate_id = ?",
+                (cand["candidate_id"],),
+            ).fetchone()
+        self.assertEqual(row[0], "conflicted")
+
+    # ── 6c: Write failure → no partial file, state unchanged ─────────
+
+    def test_promotion_write_failure_leaves_no_partial(self):
+        """If promotion write fails, vault state remains consistent."""
+        from vault_scanner.vault_writer import promote
+        cand, plan = self._create_approve_plan()
+
+        # Make target directory unwritable by replacing it with a file
+        target_parent = (self.vault / plan["target_path"]).parent
+        import shutil
+        shutil.rmtree(str(target_parent))
+        target_parent.write_text("i-am-a-file-not-a-dir\n", "utf-8")
+
+        with self.assertRaises(Exception):
+            promote(self.db_path, plan["plan_id"], vault_root=self.vault)
+
+        # Candidate file must still exist in laos-generated/
+        cand_path = self.vault / cand["relative_path"]
+        self.assertTrue(cand_path.exists())
+
+        # No partial target file
+        target_full = self.vault / plan["target_path"]
+        self.assertFalse(target_full.exists())
+
+        # Candidate state unchanged
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            row = conn.execute(
+                "SELECT candidate_state FROM candidates WHERE candidate_id = ?",
+                (cand["candidate_id"],),
+            ).fetchone()
+        self.assertEqual(row[0], "approved")
+
+        # No promotion.completed audit event
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            completed = conn.execute(
+                "SELECT event_type FROM audit_events WHERE candidate_id = ? "
+                "AND event_type = 'promotion.completed'",
+                (cand["candidate_id"],),
+            ).fetchall()
+        self.assertEqual(len(completed), 0)
+
+    # ── 6d: Successful promotion ─────────────────────────────────────
+
+    def test_successful_promotion(self):
+        """Happy path: promote moves file, updates state, writes audit."""
+        from vault_scanner.vault_writer import promote
+        cand, plan = self._create_approve_plan()
+        target_path = plan["target_path"]
+        original_content = (self.vault / cand["relative_path"]).read_text("utf-8")
+
+        result = promote(self.db_path, plan["plan_id"], vault_root=self.vault)
+
+        # 1. Target file exists with correct content
+        target_full = self.vault / target_path
+        self.assertTrue(target_full.exists())
+        self.assertEqual(target_full.read_text("utf-8"), original_content)
+
+        # 2. Candidate state changed to 'active'
+        self.assertEqual(result["candidate_state"], "active")
+
+        # 3. Candidate file removed from laos-generated
+        cand_path = self.vault / cand["relative_path"]
+        self.assertFalse(cand_path.exists())
+
+        # 4. Plan state is 'completed'
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            plan_row = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()
+        self.assertIsNotNone(plan_row)
+        self.assertEqual(plan_row[0], "completed")
+
+        # 5. Audit event written
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            events = conn.execute(
+                "SELECT event_type FROM audit_events WHERE candidate_id = ? "
+                "AND event_type = 'promotion.completed'",
+                (cand["candidate_id"],),
+            ).fetchall()
+        self.assertEqual(len(events), 1)
