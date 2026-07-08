@@ -1095,6 +1095,175 @@ class TestSliver10RecoveryDecision(unittest.TestCase):
         self.assertNotIn("retry_promotion", blocked)
 
 
+# ── Sliver 11: Cleanup Orphan Source / 清理孤儿源文件 ─────────────────
+
+
+class TestSliver11CleanupOrphanSource(unittest.TestCase):
+    """Phase 3: Cleanup source candidate file after successful promotion.
+
+    RED: cleanup_orphan_source() does not exist yet.
+    """
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp())
+        self.vault = self.temp / "vault"
+        self.laos_dir = self.vault / "0-inbox" / "laos-generated"
+        self.laos_dir.mkdir(parents=True, exist_ok=True)
+        for d in ["1-projects", "2-areas", "3-resources"]:
+            (self.vault / d).mkdir(parents=True, exist_ok=True)
+        self.db_path = self.temp / "test_index.sqlite"
+        from vault_scanner.vault_writer import init_candidate_db
+        init_candidate_db(self.db_path)
+        # Helper re-exports for readability
+        self._imports = None
+
+    def _content(self, doc_type: str = "project") -> str:
+        return (
+            "---\nid: test-sliver11-note\n"
+            "schema_version: 1\n"
+            f"type: {doc_type}\nlifecycle: active\nsource: laos\n"
+            "created: 2026-07-07\nupdated: 2026-07-07\n---\nBody.\n"
+        )
+
+    def _create_completed_plan(self) -> tuple:
+        """Create candidate → approve → plan → force completed + active → return (cand, plan).
+
+        Sets DB states directly to simulate a completed promotion WITHOUT
+        running promote(), so the source candidate file still exists.
+        """
+        from vault_scanner.vault_writer import (
+            create_candidate,
+            plan_promotion,
+            review_candidate,
+        )
+        content = self._content()
+        cand = create_candidate(vault_root=self.vault, db_path=self.db_path,
+                                content=content, generator="test-suite",
+                                generator_version="0.1.0")
+        review_candidate(self.db_path, cand["candidate_id"],
+                         decision="approve", reviewed_by="human-tester")
+        plan = plan_promotion(self.db_path, cand["candidate_id"], self.vault)
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            conn.execute(
+                "UPDATE promotion_plans SET state = 'completed' WHERE plan_id = ?",
+                (plan["plan_id"],),
+            )
+            conn.execute(
+                "UPDATE candidates SET candidate_state = 'active' WHERE candidate_id = ?",
+                (cand["candidate_id"],),
+            )
+            conn.commit()
+        return cand, plan
+
+    # --- 11a: Completed plan + source exists → cleaned ---
+
+    def test_completed_plan_cleans_orphan_source(self):
+        """RED: cleanup_orphan_source() missing."""
+        from vault_scanner.vault_writer import cleanup_orphan_source  # noqa
+        cand, plan = self._create_completed_plan()
+        source_path = (self.vault / cand["relative_path"]).resolve()
+        self.assertTrue(source_path.exists(), "precondition: source exists")
+        result = cleanup_orphan_source(self.db_path, plan["plan_id"], self.vault)
+        self.assertFalse(source_path.exists(), "source should be deleted")
+        self.assertEqual(result.get("status"), "completed")
+
+    # --- 11b: Source already missing → already_clean ---
+
+    def test_source_already_missing_returns_already_clean(self):
+        """RED: cleanup_orphan_source() missing."""
+        from vault_scanner.vault_writer import cleanup_orphan_source  # noqa
+        cand, plan = self._create_completed_plan()
+        source_path = (self.vault / cand["relative_path"]).resolve()
+        source_path.unlink()
+        result = cleanup_orphan_source(self.db_path, plan["plan_id"], self.vault)
+        self.assertEqual(result.get("status"), "already_clean")
+        # Plan/candidate state unchanged
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            plan_state = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()[0]
+            cand_state = conn.execute(
+                "SELECT candidate_state FROM candidates WHERE candidate_id = ?",
+                (cand["candidate_id"],),
+            ).fetchone()[0]
+        self.assertEqual(plan_state, "completed")
+        self.assertEqual(cand_state, "active")
+
+    # --- 11c: Source path outside laos-generated → fail closed ---
+
+    def test_source_outside_laos_generated_fails_closed(self):
+        """RED: cleanup_orphan_source() missing."""
+        from vault_scanner.vault_writer import cleanup_orphan_source  # noqa
+        cand, plan = self._create_completed_plan()
+        # Place a note outside laos-generated
+        external_path = self.vault / "1-projects" / "user-note.md"
+        external_path.write_text("# User note\n", "utf-8")
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            conn.execute(
+                "UPDATE candidates SET relative_path = ? WHERE candidate_id = ?",
+                ("1-projects/user-note.md", cand["candidate_id"]),
+            )
+            conn.commit()
+        with self.assertRaises(ValueError):
+            cleanup_orphan_source(self.db_path, plan["plan_id"], self.vault)
+        self.assertTrue(external_path.exists(), "external file must not be deleted")
+
+    # --- 11d: Plan not completed → fail closed ---
+
+    def test_non_completed_plan_fails_closed(self):
+        """RED: cleanup_orphan_source() missing."""
+        from vault_scanner.vault_writer import cleanup_orphan_source  # noqa
+        from vault_scanner.vault_writer import (
+            create_candidate,
+            plan_promotion,
+            review_candidate,
+        )
+        content = self._content()
+        cand = create_candidate(vault_root=self.vault, db_path=self.db_path,
+                                content=content, generator="test-suite",
+                                generator_version="0.1.0")
+        review_candidate(self.db_path, cand["candidate_id"],
+                         decision="approve", reviewed_by="human-tester")
+        plan = plan_promotion(self.db_path, cand["candidate_id"], self.vault)
+        source_path = (self.vault / cand["relative_path"]).resolve()
+        self.assertTrue(source_path.exists(), "precondition: source exists")
+        self.assertEqual(plan["plan_state"], "planned", "precondition: plan is not completed")
+        with self.assertRaises(ValueError):
+            cleanup_orphan_source(self.db_path, plan["plan_id"], self.vault)
+        self.assertTrue(source_path.exists(), "source must not be deleted")
+
+    # --- 11e: Path traversal in DB → fail closed ---
+
+    def test_db_path_traversal_fails_closed(self):
+        """RED: cleanup_orphan_source() missing."""
+        from vault_scanner.vault_writer import cleanup_orphan_source  # noqa
+        cand, plan = self._create_completed_plan()
+        # Place a user note outside laos-generated
+        user_note = self.vault / "1-projects" / "user-note.md"
+        user_note.parent.mkdir(parents=True, exist_ok=True)
+        user_note.write_text("# User note\n", "utf-8")
+        # Tamper relative_path with .. traversal that string-prefix would allow
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            conn.execute(
+                "UPDATE candidates SET relative_path = ? WHERE candidate_id = ?",
+                ("0-inbox/laos-generated/../../1-projects/user-note.md",
+                 cand["candidate_id"]),
+            )
+            conn.commit()
+        with self.assertRaises(ValueError):
+            cleanup_orphan_source(self.db_path, plan["plan_id"], self.vault)
+        self.assertTrue(user_note.exists(), "external file must not be deleted")
+
+
 # ── Sliver 5: Conflict Detection ────────────────────────────────────
 
 

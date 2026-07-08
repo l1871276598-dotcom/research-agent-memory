@@ -833,6 +833,86 @@ def recommend_recovery_actions(inspection: dict) -> dict:
     return {"allowed_actions": allowed, "blocked_actions": blocked}
 
 
+# ── Sliver 11: Cleanup Orphan Source ─────────────────────────────────────
+
+
+def cleanup_orphan_source(
+    db_path: Path,
+    plan_id: str,
+    vault_root: Path,
+) -> dict:
+    """Delete the source candidate file after a completed promotion.
+
+    Guards:
+      - plan.state must be 'completed'
+      - candidate.state must be 'active'
+      - source path must be under 0-inbox/laos-generated/
+
+    Returns an execution result dict with 'action' and 'status'.
+    Never modifies plan.state or candidate.state.
+    """
+    # ── 1. Read plan + candidate ────────────────────────────────────
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        plan_row = conn.execute(
+            "SELECT p.state, p.candidate_id, c.candidate_state, c.relative_path "
+            "FROM promotion_plans p "
+            "LEFT JOIN candidates c ON p.candidate_id = c.candidate_id "
+            "WHERE p.plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+
+    if plan_row is None:
+        raise ValueError(f"Promotion plan not found: {plan_id}")
+
+    plan_state, candidate_id, candidate_state, relative_path = plan_row
+
+    # ── 2. Guard: plan must be completed ─────────────────────────────
+    if plan_state != "completed":
+        raise ValueError(
+            f"Plan {plan_id} is '{plan_state}', must be 'completed'"
+        )
+
+    # ── 3. Guard: candidate must be active ───────────────────────────
+    if candidate_state != "active":
+        raise ValueError(
+            f"Candidate {candidate_id} is '{candidate_state}', must be 'active'"
+        )
+
+    # ── 4. Guard: source must be under laos-generated/ ───────────────
+    if not relative_path:
+        raise ValueError(
+            f"Source path is empty, must be under {CANDIDATE_DIR}/"
+        )
+
+    source_path = (vault_root / relative_path).resolve()
+    candidate_root = (vault_root / CANDIDATE_DIR).resolve()
+
+    # Resolve → check prefix (catches .. traversal and symlink escape)
+    try:
+        source_path.relative_to(candidate_root)
+    except ValueError:
+        raise ValueError(
+            f"Source path '{relative_path}' resolves to "
+            f"'{source_path}' which is not under '{candidate_root}'"
+        )
+
+    # ── 5. Source already missing ────────────────────────────────────
+    if not source_path.exists():
+        return {"action": "cleanup_orphan_source", "status": "already_clean"}
+
+    # ── 6. Delete source ─────────────────────────────────────────────
+    source_path.unlink()
+
+    # ── 7. Write audit event ─────────────────────────────────────────
+    _write_audit_event(
+        db_path, "promotion.orphan_source.cleaned", candidate_id,
+        reason=f"Deleted orphan source: {relative_path}",
+        plan_id=plan_id,
+    )
+
+    return {"action": "cleanup_orphan_source", "status": "completed"}
+
+
 # ── Sliver 6: Atomic Promotion ─────────────────────────────────────
 
 
