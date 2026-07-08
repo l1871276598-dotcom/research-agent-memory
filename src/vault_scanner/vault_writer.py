@@ -703,6 +703,79 @@ def check_promotion_conflicts(
     }
 
 
+# ── Sliver 9: Recovery Inspection ──────────────────────────────────────
+
+
+def inspect_promotion_recovery(
+    db_path: Path,
+    plan_id: str,
+    vault_root: Path,
+) -> dict:
+    """Read-only inspection of a promotion plan's recovery state.
+
+    Returns ONLY facts — what is true about the plan, candidate, and files.
+    Does NOT return decisions (safe_to_retry, recovery_options, actions).
+
+    Never modifies DB, files, or audit events.
+    """
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        plan_row = conn.execute(
+            "SELECT p.plan_id, p.candidate_id, p.expected_candidate_hash, "
+            "p.target_path, p.state, c.candidate_state, c.reviewed_hash, "
+            "c.relative_path "
+            "FROM promotion_plans p "
+            "LEFT JOIN candidates c ON p.candidate_id = c.candidate_id "
+            "WHERE p.plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+
+    if plan_row is None:
+        return {
+            "plan_id": plan_id,
+            "plan_state": None,
+            "candidate_state": None,
+            "candidate_path_exists": None,
+            "target_path_exists": None,
+            "current_candidate_hash": None,
+            "expected_candidate_hash": None,
+        }
+
+    (
+        _, candidate_id, expected_hash, target_path_str, plan_state,
+        candidate_state, reviewed_hash, relative_path,
+    ) = plan_row
+
+    # Check candidate file existence
+    candidate_path = None
+    if relative_path:
+        candidate_path = (vault_root / relative_path).resolve()
+    candidate_path_exists = candidate_path is not None and candidate_path.exists()
+
+    # Check target file existence
+    target_path = (vault_root / target_path_str).resolve()
+    target_path_exists = target_path.exists()
+
+    # Compute current candidate hash if file exists
+    current_hash = None
+    if candidate_path_exists and candidate_path is not None:
+        try:
+            content = candidate_path.read_text(encoding="utf-8")
+            current_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        except Exception:
+            current_hash = None
+
+    return {
+        "plan_id": plan_id,
+        "candidate_id": candidate_id,
+        "plan_state": plan_state,
+        "candidate_state": candidate_state,
+        "candidate_path_exists": candidate_path_exists,
+        "target_path_exists": target_path_exists,
+        "current_candidate_hash": current_hash,
+        "expected_candidate_hash": expected_hash,
+    }
+
+
 # ── Sliver 6: Atomic Promotion ─────────────────────────────────────
 
 

@@ -824,6 +824,194 @@ class TestSliver8FailureAudit(unittest.TestCase):
         )
 
 
+
+# ── Sliver 9: Recovery Inspection / 恢复前诊断 ─────────────────────
+
+
+class TestSliver9RecoveryInspection(unittest.TestCase):
+    """Phase 3: Recovery must begin with read-only diagnostics.
+
+    RED tests: inspect_promotion_recovery() does not exist yet.
+    """
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp())
+        self.vault = self.temp / "vault"
+        self.laos_dir = self.vault / "0-inbox" / "laos-generated"
+        self.laos_dir.mkdir(parents=True, exist_ok=True)
+        for d in ["1-projects", "2-areas", "3-resources"]:
+            (self.vault / d).mkdir(parents=True, exist_ok=True)
+        self.db_path = self.temp / "test_index.sqlite"
+        from vault_scanner.vault_writer import init_candidate_db
+        init_candidate_db(self.db_path)
+
+    def _content(self, doc_type: str = "project") -> str:
+        return (
+            "---\nid: test-sliver9-note\n"
+            "schema_version: 1\n"
+            f"type: {doc_type}\nlifecycle: active\nsource: laos\n"
+            "created: 2026-07-07\nupdated: 2026-07-07\n---\nBody.\n"
+        )
+
+    def _create_approve_plan(self):
+        from vault_scanner.vault_writer import create_candidate, review_candidate, plan_promotion
+        content = self._content()
+        cand = create_candidate(vault_root=self.vault, db_path=self.db_path,
+                                content=content, generator="test-suite",
+                                generator_version="0.1.0")
+        review_candidate(self.db_path, cand["candidate_id"],
+                         decision="approve", reviewed_by="human-tester")
+        plan = plan_promotion(self.db_path, cand["candidate_id"], self.vault)
+        return cand, plan
+
+    # --- 9a: Conflicted hash mismatch ---
+
+    def test_conflicted_hash_mismatch_reports_facts(self):
+        """conflicted candidate 返回纯事实：candidate_state, candidate_path_exists, current vs expected hash."""
+        from vault_scanner.vault_writer import inspect_promotion_recovery  # noqa
+        cand, plan = self._create_approve_plan()
+        file_path = self.vault / cand["relative_path"]
+        file_path.write_text(
+            file_path.read_text(encoding="utf-8") + "\nTampered.\n",
+            encoding="utf-8",
+        )
+        from vault_scanner.vault_writer import check_promotion_conflicts
+        conflict = check_promotion_conflicts(
+            self.db_path, cand["candidate_id"], self.vault, plan_id=plan["plan_id"]
+        )
+        self.assertIsNotNone(conflict)
+        result = inspect_promotion_recovery(
+            self.db_path, plan["plan_id"], vault_root=self.vault
+        )
+
+        # Core facts — these are the output of pure inspection
+        self.assertEqual(result.get("plan_state"), "active")
+        self.assertEqual(result.get("candidate_state"), "conflicted")
+        self.assertTrue(result.get("candidate_path_exists"))
+        self.assertFalse(result.get("target_path_exists"))
+        # Hash mismatch must be observable
+        expected = result.get("expected_candidate_hash")
+        current = result.get("current_candidate_hash")
+        self.assertIsNotNone(expected)
+        self.assertIsNotNone(current)
+        self.assertNotEqual(expected, current)
+
+        # No decision fields
+        self.assertNotIn("safe_to_retry", result)
+        self.assertNotIn("recovery_options", result)
+        self.assertNotIn("reasons", result)
+
+    # --- 9b: Target already exists ---
+
+    def test_target_exists_reports_facts(self):
+        """target 已存在返回纯事实：target_path_exists=True."""
+        from vault_scanner.vault_writer import inspect_promotion_recovery  # noqa
+        cand, plan = self._create_approve_plan()
+        target_path = self.vault / plan["target_path"]
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text("Occupied.\n", encoding="utf-8")
+        result = inspect_promotion_recovery(
+            self.db_path, plan["plan_id"], vault_root=self.vault
+        )
+
+        # Core facts
+        self.assertEqual(result.get("plan_state"), "active")
+        self.assertEqual(result.get("candidate_state"), "approved")
+        self.assertTrue(result.get("candidate_path_exists"))
+        self.assertTrue(result.get("target_path_exists"))
+        self.assertEqual(
+            result.get("current_candidate_hash"),
+            result.get("expected_candidate_hash"),
+        )
+
+        # No decision fields
+        self.assertNotIn("safe_to_retry", result)
+        self.assertNotIn("recovery_options", result)
+        self.assertNotIn("reasons", result)
+
+    # --- 9c: Completed promotion with orphan source ---
+
+    def test_completed_with_orphan_source_reports_facts(self):
+        """promotion 完成但 source 残留返回纯事实：candidate_path_exists=True."""
+        from vault_scanner.vault_writer import inspect_promotion_recovery, promote  # noqa
+        cand, plan = self._create_approve_plan()
+        promote(self.db_path, plan["plan_id"], vault_root=self.vault)
+
+        # Source should be gone after successful promote
+        source_path = self.vault / cand["relative_path"]
+        self.assertFalse(source_path.exists())
+
+        # Re-create source (simulate orphan)
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(self._content(), encoding="utf-8")
+
+        result = inspect_promotion_recovery(
+            self.db_path, plan["plan_id"], vault_root=self.vault
+        )
+
+        # Core facts
+        self.assertEqual(result.get("plan_state"), "completed")
+        self.assertEqual(result.get("candidate_state"), "active")
+        self.assertTrue(result.get("candidate_path_exists"))
+        self.assertTrue(result.get("target_path_exists"))
+
+        # No decision fields
+        self.assertNotIn("safe_to_retry", result)
+        self.assertNotIn("recovery_options", result)
+        self.assertNotIn("reasons", result)
+
+    # --- 9d: Inspect is read-only ---
+
+    def test_inspect_is_read_only(self):
+        """RED: inspect_promotion_recovery() missing."""
+        import sqlite3
+        from contextlib import closing
+        from vault_scanner.vault_writer import inspect_promotion_recovery  # noqa
+        cand, plan = self._create_approve_plan()
+        file_path = self.vault / cand["relative_path"]
+        file_path.write_text(
+            file_path.read_text(encoding="utf-8") + "\nTampered.\n",
+            encoding="utf-8",
+        )
+        from vault_scanner.vault_writer import check_promotion_conflicts
+        check_promotion_conflicts(
+            self.db_path, cand["candidate_id"], self.vault, plan_id=plan["plan_id"]
+        )
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            state_before = conn.execute(
+                "SELECT candidate_state, state FROM candidates c "
+                "JOIN promotion_plans p ON c.candidate_id = p.candidate_id "
+                "WHERE p.plan_id = ?", (plan["plan_id"],),
+            ).fetchone()
+            audit_before = conn.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()[0]
+        target_before = (self.vault / plan["target_path"]).exists()
+        source_before = (self.vault / cand["relative_path"]).exists()
+
+        inspect_promotion_recovery(self.db_path, plan["plan_id"], vault_root=self.vault)
+
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            state_after = conn.execute(
+                "SELECT candidate_state, state FROM candidates c "
+                "JOIN promotion_plans p ON c.candidate_id = p.candidate_id "
+                "WHERE p.plan_id = ?", (plan["plan_id"],),
+            ).fetchone()
+            audit_after = conn.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()[0]
+        target_after = (self.vault / plan["target_path"]).exists()
+        source_after = (self.vault / cand["relative_path"]).exists()
+
+        self.assertEqual(state_before, state_after)
+        self.assertEqual(audit_before, audit_after)
+        self.assertEqual(target_before, target_after)
+        self.assertEqual(source_before, source_after)
+
+
+
 # ── Sliver 5: Conflict Detection ────────────────────────────────────
 
 
