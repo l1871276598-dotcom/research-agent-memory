@@ -967,7 +967,70 @@ def abandon_promotion_plan(
     return {"action": "abandon_plan", "status": "completed"}
 
 
-# ── Sliver 6: Atomic Promotion ─────────────────────────────────────
+# ── Sliver 13: Re-review Conflicted Candidate ─────────────────────
+
+
+def re_review_conflicted_candidate(
+    db_path: Path,
+    candidate_id: str,
+    actor: str | None = None,
+    reason: str | None = None,
+    vault_root: Path | None = None,
+) -> dict:
+    """Send a conflicted candidate back to pending_review for human re-review.
+
+    Only allowed on candidates with candidate_state == 'conflicted'.
+    The candidate file must still exist on disk (fail-closed otherwise).
+
+    Sets candidate_state to 'pending_review' and clears reviewed_hash,
+    reviewed_at, and reviewed_by. Old promotion plans are NOT modified.
+
+    Raises ValueError if:
+    - candidate is not in 'conflicted' state
+    - candidate file is missing from disk (when vault_root provided)
+    """
+    cand = _get_candidate(db_path, candidate_id)
+    if cand is None:
+        raise ValueError(f"Candidate not found: {candidate_id}")
+
+    if cand["candidate_state"] != "conflicted":
+        raise ValueError(
+            f"Candidate {candidate_id} is '{cand['candidate_state']}', "
+            f"only 'conflicted' can be re-reviewed"
+        )
+
+    # Fail-closed: candidate file must exist on disk
+    if vault_root is not None:
+        rel_path = cand.get("relative_path")
+        if rel_path:
+            file_path = (vault_root / rel_path).resolve()
+            if not file_path.exists():
+                raise ValueError(
+                    f"Candidate file not found on disk: {rel_path}"
+                )
+
+    now = _now_iso()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute(
+            "UPDATE candidates SET candidate_state = ?, reviewed_hash = NULL, "
+            "reviewed_at = NULL, reviewed_by = NULL WHERE candidate_id = ?",
+            ("pending_review", candidate_id),
+        )
+        conn.execute(
+            "INSERT INTO audit_events "
+            "(event_type, candidate_id, actor, timestamp, "
+            "before_state, after_state, reason, tool_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("candidate.re_review_requested", candidate_id, actor, now,
+             "conflicted", "pending_review", reason, TOOL_VERSION),
+        )
+        conn.commit()
+
+    return {
+        "candidate_id": candidate_id,
+        "candidate_state": "pending_review",
+        "previous_state": "conflicted",
+    }
 
 
 def promote(

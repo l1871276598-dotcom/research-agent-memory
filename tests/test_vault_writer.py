@@ -1495,6 +1495,228 @@ class TestSliver12AbandonPromotionPlan(unittest.TestCase):
         self.assertEqual(cand_state, "approved")
 
 
+# ── Sliver 13: Re-review Conflicted Candidate ──────────────────────
+
+
+class TestSliver13ReReviewConflictedCandidate(unittest.TestCase):
+    """Phase 3: Re-review a conflicted candidate — send back to pending_review.
+
+    RED: re_review_conflicted_candidate() does not exist yet.
+    """
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp())
+        self.vault = self.temp / "vault"
+        self.laos_dir = self.vault / "0-inbox" / "laos-generated"
+        self.laos_dir.mkdir(parents=True, exist_ok=True)
+        for d in ["1-projects", "2-areas", "3-resources"]:
+            (self.vault / d).mkdir(parents=True, exist_ok=True)
+        self.db_path = self.temp / "test_index.sqlite"
+        from vault_scanner.vault_writer import init_candidate_db
+        init_candidate_db(self.db_path)
+
+    def _content(self, doc_type: str = "project") -> str:
+        return (
+            "---\nid: test-sliver13-note\n"
+            "schema_version: 1\n"
+            f"type: {doc_type}\nlifecycle: active\nsource: laos\n"
+            "created: 2026-07-07\nupdated: 2026-07-07\n---\nBody.\n"
+        )
+
+    def _create_conflicted_candidate(self) -> tuple:
+        """Create → approve → plan → tamper candidate → conflict detection → return (cand, plan)."""
+        from vault_scanner.vault_writer import (
+            create_candidate, review_candidate, plan_promotion,
+            check_promotion_conflicts,
+        )
+        content = self._content()
+        cand = create_candidate(vault_root=self.vault, db_path=self.db_path,
+                                content=content, generator="test-suite",
+                                generator_version="0.1.0")
+        review_candidate(self.db_path, cand["candidate_id"],
+                         decision="approve", reviewed_by="human-tester")
+        plan = plan_promotion(self.db_path, cand["candidate_id"], self.vault)
+        # Tamper candidate to force conflict
+        file_path = self.vault / cand["relative_path"]
+        file_path.write_text(file_path.read_text("utf-8") + "\nTampered.\n", "utf-8")
+        check_promotion_conflicts(self.db_path, cand["candidate_id"],
+                                   self.vault, plan_id=plan["plan_id"])
+        return cand, plan
+
+    def _count_audit_events(self, candidate_id: str, event_type: str) -> int:
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            rows = conn.execute(
+                "SELECT COUNT(*) FROM audit_events "
+                "WHERE candidate_id = ? AND event_type = ?",
+                (candidate_id, event_type),
+            ).fetchone()
+        return rows[0] if rows else 0
+
+    # --- 13a: Conflicted candidate → re-reviewed → pending_review ---
+
+    def test_conflicted_can_be_re_reviewed(self):
+        """RED: re_review_conflicted_candidate() missing."""
+        from vault_scanner.vault_writer import re_review_conflicted_candidate  # noqa
+        cand, plan = self._create_conflicted_candidate()
+
+        result = re_review_conflicted_candidate(
+            self.db_path, cand["candidate_id"],
+            actor="tester", reason="updated",
+        )
+
+        self.assertEqual(result["candidate_state"], "pending_review")
+
+        # reviewed_hash, reviewed_at, reviewed_by cleared
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            row = conn.execute(
+                "SELECT reviewed_hash, reviewed_at, reviewed_by "
+                "FROM candidates WHERE candidate_id = ?",
+                (cand["candidate_id"],),
+            ).fetchone()
+        self.assertIsNone(row[0])  # reviewed_hash cleared
+        self.assertIsNone(row[1])  # reviewed_at cleared
+        self.assertIsNone(row[2])  # reviewed_by cleared
+
+        # audit event
+        self.assertGreaterEqual(
+            self._count_audit_events(cand["candidate_id"],
+                                      "candidate.re_review_requested"), 1,
+        )
+
+    # --- 13b: Approved candidate cannot be re-reviewed ---
+
+    def test_approved_cannot_be_re_reviewed(self):
+        """RED: re_review_conflicted_candidate() missing."""
+        from vault_scanner.vault_writer import re_review_conflicted_candidate  # noqa
+        from vault_scanner.vault_writer import review_candidate
+        cand, plan = self._create_conflicted_candidate()
+
+        # Directly set candidate_state back to approved (simulate)
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            conn.execute(
+                "UPDATE candidates SET candidate_state = 'approved' "
+                "WHERE candidate_id = ?",
+                (cand["candidate_id"],),
+            )
+            conn.commit()
+
+        with self.assertRaises(ValueError):
+            re_review_conflicted_candidate(
+                self.db_path, cand["candidate_id"],
+                actor="tester", reason="should not be allowed",
+            )
+
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            state = conn.execute(
+                "SELECT candidate_state FROM candidates WHERE candidate_id = ?",
+                (cand["candidate_id"],),
+            ).fetchone()[0]
+        self.assertEqual(state, "approved")
+
+    # --- 13c: Active candidate cannot be re-reviewed ---
+
+    def test_active_cannot_be_re_reviewed(self):
+        """RED: re_review_conflicted_candidate() missing."""
+        from vault_scanner.vault_writer import re_review_conflicted_candidate  # noqa
+        cand, plan = self._create_conflicted_candidate()
+
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            conn.execute(
+                "UPDATE candidates SET candidate_state = 'active' "
+                "WHERE candidate_id = ?",
+                (cand["candidate_id"],),
+            )
+            conn.commit()
+
+        with self.assertRaises(ValueError):
+            re_review_conflicted_candidate(
+                self.db_path, cand["candidate_id"],
+                actor="tester", reason="should not be allowed",
+            )
+
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            state = conn.execute(
+                "SELECT candidate_state FROM candidates WHERE candidate_id = ?",
+                (cand["candidate_id"],),
+            ).fetchone()[0]
+        self.assertEqual(state, "active")
+
+    # --- 13d: Old promotion plan is NOT revived ---
+
+    def test_re_review_does_not_revive_old_plan(self):
+        """Plan state is NEVER modified by re_review_conflicted_candidate.
+
+        check_promotion_conflicts() returns early when candidate_state != 'approved',
+        so the plan stays 'active' (never set to 'conflicted'). After re-review,
+        the plan must remain unchanged — re-review touches only the candidate.
+        """
+        from vault_scanner.vault_writer import re_review_conflicted_candidate  # noqa
+        cand, plan = self._create_conflicted_candidate()
+
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            plan_state_before = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()[0]
+
+        re_review_conflicted_candidate(
+            self.db_path, cand["candidate_id"],
+            actor="tester", reason="updated",
+        )
+
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            plan_state_after = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()[0]
+
+        # Plan state must never change — re-review only touches candidates table
+        self.assertEqual(plan_state_before, plan_state_after,
+                         msg="Re-review must not modify promotion_plans table")
+        # Plan must not be 'active' when it was 'conflicted' or 'failed' before
+        # (though in this scenario check_promotion_conflicts returns early,
+        #  so the plan may still be 'active' — the key invariant is NO change)
+
+    # --- 13e: Candidate file missing → fail closed ---
+
+    def test_missing_file_fails_closed(self):
+        """RED: re_review_conflicted_candidate() missing."""
+        from vault_scanner.vault_writer import re_review_conflicted_candidate  # noqa
+        cand, plan = self._create_conflicted_candidate()
+
+        # Delete the candidate file
+        file_path = self.vault / cand["relative_path"]
+        file_path.unlink()
+        self.assertFalse(file_path.exists(), "precondition: candidate file removed")
+
+        with self.assertRaises(ValueError):
+            re_review_conflicted_candidate(
+                self.db_path, cand["candidate_id"],
+                actor="tester", reason="file lost",
+                vault_root=self.vault,
+            )
+
+        # Candidate state still conflicted
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            state = conn.execute(
+                "SELECT candidate_state FROM candidates WHERE candidate_id = ?",
+                (cand["candidate_id"],),
+            ).fetchone()[0]
+        self.assertEqual(state, "conflicted")
+
+
 # ── Sliver 5: Conflict Detection ────────────────────────────────────
 
 
