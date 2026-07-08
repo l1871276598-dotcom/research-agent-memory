@@ -1012,6 +1012,89 @@ class TestSliver9RecoveryInspection(unittest.TestCase):
 
 
 
+
+
+# ── Sliver 10: Recovery Decision / 恢复决策 ─────────────────────
+
+
+class TestSliver10RecoveryDecision(unittest.TestCase):
+    """Phase 3: Decision layer between Inspection (Sliver 9) and Recovery (Sliver 11).
+
+    RED: recommend_recovery_actions() does not exist yet.
+    """
+
+    # --- 10a: Conflicted hash mismatch ---
+
+    def test_conflicted_hash_mismatch_blocks_retry(self):
+        """RED: recommend_recovery_actions() missing."""
+        from vault_scanner.vault_writer import recommend_recovery_actions  # noqa
+        facts = {
+            "plan_state": "active",
+            "candidate_state": "conflicted",
+            "candidate_path_exists": True,
+            "target_path_exists": False,
+            "current_candidate_hash": "abc123",
+            "expected_candidate_hash": "def456",
+        }
+        result = recommend_recovery_actions(facts)
+        self.assertIn("re_review_candidate", result.get("allowed_actions", []))
+        self.assertIn("abandon_plan", result.get("allowed_actions", []))
+        self.assertIn("retry_promotion", result.get("blocked_actions", []))
+
+    # --- 10b: Target exists before completion ---
+
+    def test_target_exists_blocks_retry(self):
+        """RED: recommend_recovery_actions() missing."""
+        from vault_scanner.vault_writer import recommend_recovery_actions  # noqa
+        facts = {
+            "plan_state": "active",
+            "candidate_state": "approved",
+            "candidate_path_exists": True,
+            "target_path_exists": True,
+            "current_candidate_hash": "abc123",
+            "expected_candidate_hash": "abc123",
+        }
+        result = recommend_recovery_actions(facts)
+        self.assertIn("choose_new_target", result.get("allowed_actions", []))
+        self.assertIn("abandon_plan", result.get("allowed_actions", []))
+        self.assertIn("retry_promotion", result.get("blocked_actions", []))
+
+    # --- 10c: Completed with orphan source ---
+
+    def test_completed_with_orphan_blocks_retry(self):
+        """RED: recommend_recovery_actions() missing."""
+        from vault_scanner.vault_writer import recommend_recovery_actions  # noqa
+        facts = {
+            "plan_state": "completed",
+            "candidate_state": "active",
+            "candidate_path_exists": True,
+            "target_path_exists": True,
+            "current_candidate_hash": "abc123",
+            "expected_candidate_hash": "abc123",
+        }
+        result = recommend_recovery_actions(facts)
+        self.assertIn("cleanup_orphan_source", result.get("allowed_actions", []))
+        self.assertIn("retry_promotion", result.get("blocked_actions", []))
+
+    # --- 10d: Healthy active plan ---
+
+    def test_healthy_plan_allows_retry(self):
+        """RED: recommend_recovery_actions() missing."""
+        from vault_scanner.vault_writer import recommend_recovery_actions  # noqa
+        facts = {
+            "plan_state": "active",
+            "candidate_state": "approved",
+            "candidate_path_exists": True,
+            "target_path_exists": False,
+            "current_candidate_hash": "abc123",
+            "expected_candidate_hash": "abc123",
+        }
+        result = recommend_recovery_actions(facts)
+        self.assertIn("retry_promotion", result.get("allowed_actions", []))
+        blocked = result.get("blocked_actions", [])
+        self.assertNotIn("retry_promotion", blocked)
+
+
 # ── Sliver 5: Conflict Detection ────────────────────────────────────
 
 

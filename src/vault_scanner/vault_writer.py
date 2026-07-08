@@ -776,6 +776,63 @@ def inspect_promotion_recovery(
     }
 
 
+# ── Sliver 10: Recovery Decision ─────────────────────────────────────
+
+
+def recommend_recovery_actions(inspection: dict) -> dict:
+    """Given inspection facts, return allowed and blocked recovery actions.
+
+    Pure decision function: no I/O, no side effects.
+    Input is a dict from inspect_promotion_recovery().
+    Output contains only 'allowed_actions' and 'blocked_actions'.
+    """
+    allowed: list[str] = []
+    blocked: list[str] = []
+
+    plan_state = inspection.get("plan_state")
+    candidate_state = inspection.get("candidate_state")
+    candidate_path_exists = inspection.get("candidate_path_exists")
+    target_path_exists = inspection.get("target_path_exists")
+    current_hash = inspection.get("current_candidate_hash")
+    expected_hash = inspection.get("expected_candidate_hash")
+    hashes_match = (
+        current_hash is not None
+        and expected_hash is not None
+        and current_hash == expected_hash
+    )
+
+    # Rule 1: Conflicted hash mismatch
+    if candidate_state == "conflicted" and not hashes_match:
+        allowed.append("re_review_candidate")
+        allowed.append("abandon_plan")
+        blocked.append("retry_promotion")
+        return {"allowed_actions": allowed, "blocked_actions": blocked}
+
+    # Rule 2: Target exists before completion
+    if plan_state != "completed" and target_path_exists:
+        allowed.append("choose_new_target")
+        allowed.append("abandon_plan")
+        blocked.append("retry_promotion")
+        return {"allowed_actions": allowed, "blocked_actions": blocked}
+
+    # Rule 3: Completed with orphan source
+    if plan_state == "completed" and candidate_path_exists:
+        allowed.append("cleanup_orphan_source")
+        blocked.append("retry_promotion")
+        return {"allowed_actions": allowed, "blocked_actions": blocked}
+
+    # Rule 4: Healthy active plan
+    if (plan_state == "active"
+            and candidate_state == "approved"
+            and hashes_match
+            and not target_path_exists):
+        allowed.append("retry_promotion")
+        return {"allowed_actions": allowed, "blocked_actions": blocked}
+
+    # Fallback: unknown state — no actions recommended
+    return {"allowed_actions": allowed, "blocked_actions": blocked}
+
+
 # ── Sliver 6: Atomic Promotion ─────────────────────────────────────
 
 
