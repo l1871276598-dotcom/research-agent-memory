@@ -776,61 +776,76 @@ def inspect_promotion_recovery(
     }
 
 
-# ── Sliver 10: Recovery Decision ─────────────────────────────────────
+# ── Sliver 10.5: Recovery Decision Rule Library ─────────────────────
+
+RECOVERY_DECISION_RULES = [
+    # Rule 1: Conflicted hash mismatch
+    {
+        "id": "conflicted_hash_mismatch",
+        "condition": lambda i: (
+            i.get("candidate_state") == "conflicted"
+            and (
+                i.get("current_candidate_hash") is not None
+                and i.get("expected_candidate_hash") is not None
+                and i.get("current_candidate_hash") != i.get("expected_candidate_hash")
+            )
+        ),
+        "allowed_actions": ["re_review_candidate", "abandon_plan"],
+        "blocked_actions": ["retry_promotion"],
+    },
+    # Rule 2: Target exists before completion
+    {
+        "id": "target_exists_before_completion",
+        "condition": lambda i: (
+            i.get("plan_state") != "completed"
+            and i.get("target_path_exists") is True
+        ),
+        "allowed_actions": ["choose_new_target", "abandon_plan"],
+        "blocked_actions": ["retry_promotion"],
+    },
+    # Rule 3: Completed with orphan source
+    {
+        "id": "completed_with_orphan_source",
+        "condition": lambda i: (
+            i.get("plan_state") == "completed"
+            and i.get("candidate_path_exists") is True
+        ),
+        "allowed_actions": ["cleanup_orphan_source"],
+        "blocked_actions": ["retry_promotion"],
+    },
+    # Rule 4: Healthy active plan
+    {
+        "id": "healthy_active_plan",
+        "condition": lambda i: (
+            i.get("plan_state") == "active"
+            and i.get("candidate_state") == "approved"
+            and (
+                i.get("current_candidate_hash") is not None
+                and i.get("expected_candidate_hash") is not None
+                and i.get("current_candidate_hash") == i.get("expected_candidate_hash")
+            )
+            and i.get("target_path_exists") is not True
+        ),
+        "allowed_actions": ["retry_promotion"],
+        "blocked_actions": [],
+    },
+]
 
 
 def recommend_recovery_actions(inspection: dict) -> dict:
     """Given inspection facts, return allowed and blocked recovery actions.
 
     Pure decision function: no I/O, no side effects.
-    Input is a dict from inspect_promotion_recovery().
-    Output contains only 'allowed_actions' and 'blocked_actions'.
+    Matches inspection facts against RECOVERY_DECISION_RULES in order.
+    Returns the first matching rule's action sets, or empty lists for fallback.
     """
-    allowed: list[str] = []
-    blocked: list[str] = []
-
-    plan_state = inspection.get("plan_state")
-    candidate_state = inspection.get("candidate_state")
-    candidate_path_exists = inspection.get("candidate_path_exists")
-    target_path_exists = inspection.get("target_path_exists")
-    current_hash = inspection.get("current_candidate_hash")
-    expected_hash = inspection.get("expected_candidate_hash")
-    hashes_match = (
-        current_hash is not None
-        and expected_hash is not None
-        and current_hash == expected_hash
-    )
-
-    # Rule 1: Conflicted hash mismatch
-    if candidate_state == "conflicted" and not hashes_match:
-        allowed.append("re_review_candidate")
-        allowed.append("abandon_plan")
-        blocked.append("retry_promotion")
-        return {"allowed_actions": allowed, "blocked_actions": blocked}
-
-    # Rule 2: Target exists before completion
-    if plan_state != "completed" and target_path_exists:
-        allowed.append("choose_new_target")
-        allowed.append("abandon_plan")
-        blocked.append("retry_promotion")
-        return {"allowed_actions": allowed, "blocked_actions": blocked}
-
-    # Rule 3: Completed with orphan source
-    if plan_state == "completed" and candidate_path_exists:
-        allowed.append("cleanup_orphan_source")
-        blocked.append("retry_promotion")
-        return {"allowed_actions": allowed, "blocked_actions": blocked}
-
-    # Rule 4: Healthy active plan
-    if (plan_state == "active"
-            and candidate_state == "approved"
-            and hashes_match
-            and not target_path_exists):
-        allowed.append("retry_promotion")
-        return {"allowed_actions": allowed, "blocked_actions": blocked}
-
-    # Fallback: unknown state — no actions recommended
-    return {"allowed_actions": allowed, "blocked_actions": blocked}
+    for rule in RECOVERY_DECISION_RULES:
+        if rule["condition"](inspection):
+            return {
+                "allowed_actions": list(rule["allowed_actions"]),
+                "blocked_actions": list(rule["blocked_actions"]),
+            }
+    return {"allowed_actions": [], "blocked_actions": []}
 
 
 # ── Sliver 11: Cleanup Orphan Source ─────────────────────────────────────

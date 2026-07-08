@@ -1095,6 +1095,113 @@ class TestSliver10RecoveryDecision(unittest.TestCase):
         self.assertNotIn("retry_promotion", blocked)
 
 
+# ── Sliver 10.5: Recovery Decision Rule Library / 恢复决策规则库 ──────
+
+
+class TestSliver10_5RecoveryDecisionRuleLibrary(unittest.TestCase):
+    """Phase 3.5: Recovery Decision Rule Library — rules as data, not inline if/return.
+
+    RED: RECOVERY_DECISION_RULES does not exist in vault_writer yet.
+    This is a pure additive refactor: behavior unchanged, data structure introduced.
+    """
+
+    # --- 10.5a: RECOVERY_DECISION_RULES can be imported ---
+
+    def test_recovery_decision_rules_is_exported(self):
+        """RECOVERY_DECISION_RULES is a module-level constant in vault_writer."""
+        from vault_scanner.vault_writer import RECOVERY_DECISION_RULES  # noqa
+        self.assertIsNotNone(RECOVERY_DECISION_RULES)
+
+    # --- 10.5b: Each rule has a unique id ---
+
+    def test_each_rule_has_unique_id(self):
+        """Every rule in RECOVERY_DECISION_RULES declares a non-empty unique id."""
+        from vault_scanner.vault_writer import RECOVERY_DECISION_RULES  # noqa
+        ids = [rule["id"] for rule in RECOVERY_DECISION_RULES]
+        self.assertEqual(len(ids), len(set(ids)),
+                         msg="Rule IDs must be unique")
+        for rid in ids:
+            self.assertIsInstance(rid, str)
+            self.assertGreater(len(rid), 0,
+                               msg=f"Rule id must be non-empty, got {rid!r}")
+
+    # --- 10.5c: Each rule declares allowed_actions and blocked_actions ---
+
+    def test_each_rule_declares_actions(self):
+        """Every rule has declared allowed_actions (list) and blocked_actions (list)."""
+        from vault_scanner.vault_writer import RECOVERY_DECISION_RULES  # noqa
+        for rule in RECOVERY_DECISION_RULES:
+            with self.subTest(rule_id=rule.get("id", "<missing>")):
+                self.assertIn("allowed_actions", rule)
+                self.assertIsInstance(rule["allowed_actions"], list)
+                self.assertIn("blocked_actions", rule)
+                self.assertIsInstance(rule["blocked_actions"], list)
+
+    # --- 10.5d: recommend_recovery_actions() behavior unchanged for 4 scenarios ---
+
+    def test_conflicted_hash_mismatch_still_blocks_retry(self):
+        """Rule Library refactor does not change Rule 1 output."""
+        from vault_scanner.vault_writer import recommend_recovery_actions
+        facts = {
+            "plan_state": "active",
+            "candidate_state": "conflicted",
+            "candidate_path_exists": True,
+            "target_path_exists": False,
+            "current_candidate_hash": "abc123",
+            "expected_candidate_hash": "def456",
+        }
+        result = recommend_recovery_actions(facts)
+        self.assertIn("re_review_candidate", result.get("allowed_actions", []))
+        self.assertIn("abandon_plan", result.get("allowed_actions", []))
+        self.assertIn("retry_promotion", result.get("blocked_actions", []))
+
+    def test_target_exists_still_blocks_retry(self):
+        """Rule Library refactor does not change Rule 2 output."""
+        from vault_scanner.vault_writer import recommend_recovery_actions
+        facts = {
+            "plan_state": "active",
+            "candidate_state": "approved",
+            "candidate_path_exists": True,
+            "target_path_exists": True,
+            "current_candidate_hash": "abc123",
+            "expected_candidate_hash": "abc123",
+        }
+        result = recommend_recovery_actions(facts)
+        self.assertIn("choose_new_target", result.get("allowed_actions", []))
+        self.assertIn("abandon_plan", result.get("allowed_actions", []))
+        self.assertIn("retry_promotion", result.get("blocked_actions", []))
+
+    def test_completed_with_orphan_still_blocks_retry(self):
+        """Rule Library refactor does not change Rule 3 output."""
+        from vault_scanner.vault_writer import recommend_recovery_actions
+        facts = {
+            "plan_state": "completed",
+            "candidate_state": "active",
+            "candidate_path_exists": True,
+            "target_path_exists": True,
+            "current_candidate_hash": "abc123",
+            "expected_candidate_hash": "abc123",
+        }
+        result = recommend_recovery_actions(facts)
+        self.assertIn("cleanup_orphan_source", result.get("allowed_actions", []))
+        self.assertIn("retry_promotion", result.get("blocked_actions", []))
+
+    def test_healthy_plan_still_allows_retry(self):
+        """Rule Library refactor does not change Rule 4 output."""
+        from vault_scanner.vault_writer import recommend_recovery_actions
+        facts = {
+            "plan_state": "active",
+            "candidate_state": "approved",
+            "candidate_path_exists": True,
+            "target_path_exists": False,
+            "current_candidate_hash": "abc123",
+            "expected_candidate_hash": "abc123",
+        }
+        result = recommend_recovery_actions(facts)
+        self.assertIn("retry_promotion", result.get("allowed_actions", []))
+        self.assertNotIn("retry_promotion", result.get("blocked_actions", []))
+
+
 # ── Sliver 11: Cleanup Orphan Source / 清理孤儿源文件 ─────────────────
 
 
