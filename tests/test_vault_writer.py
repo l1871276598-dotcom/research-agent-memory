@@ -610,6 +610,220 @@ if __name__ == "__main__":
     unittest.main()
 
 
+# ── Sliver 8: Failure Audit Boundary / 异常审计边界 ─────────────────
+
+
+class TestSliver8FailureAudit(unittest.TestCase):
+    """Phase 3: All promotion failures must leave a queryable audit event.
+
+    Current code (Sliver 7) raises ValueError but does NOT write audit
+    events for claim failures (already_completed, claim_failed) or for
+    promotion conflicts set to 'conflicted' state.
+
+    These tests are RED: they expect audit events that don't exist yet.
+    Sliver 8 should wrap promote() callers with an audit boundary.
+    """
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp())
+        self.vault = self.temp / "vault"
+        self.laos_dir = self.vault / "0-inbox" / "laos-generated"
+        self.laos_dir.mkdir(parents=True, exist_ok=True)
+        for d in ["1-projects", "2-areas", "3-resources"]:
+            (self.vault / d).mkdir(parents=True, exist_ok=True)
+        self.db_path = self.temp / "test_index.sqlite"
+        from vault_scanner.vault_writer import init_candidate_db
+        init_candidate_db(self.db_path)
+
+    def _content(self, doc_type: str = "project") -> str:
+        return (
+            "---\nid: test-sliver8-note\n"
+            "schema_version: 1\n"
+            f"type: {doc_type}\nlifecycle: active\nsource: laos\n"
+            "created: 2026-07-07\nupdated: 2026-07-07\n---\nBody.\n"
+        )
+
+    def _create_approve_plan(self):
+        """Helper: create → approve → plan → return (candidate, plan)."""
+        from vault_scanner.vault_writer import create_candidate, review_candidate, plan_promotion
+        content = self._content()
+        cand = create_candidate(vault_root=self.vault, db_path=self.db_path,
+                                content=content, generator="test-suite",
+                                generator_version="0.1.0")
+        review_candidate(self.db_path, cand["candidate_id"],
+                         decision="approve", reviewed_by="human-tester")
+        plan = plan_promotion(self.db_path, cand["candidate_id"], self.vault)
+        return cand, plan
+
+    def _count_audit_events(self, plan_id: str, event_type: str) -> int:
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            rows = conn.execute(
+                "SELECT COUNT(*) FROM audit_events "
+                "WHERE plan_id = ? AND event_type = ?",
+                (plan_id, event_type),
+            ).fetchone()
+        return rows[0] if rows else 0
+
+    # ── 8a: already_completed → promotion.failed audit ────────────────
+
+    def test_already_completed_writes_failed_audit(self):
+        """已 completed 的 plan 被第二次 promote 后，留下 promotion.failed audit。
+
+        Current code raises ValueError('already_completed') but does NOT
+        write an audit event. This test expects exactly 1 promotion.failed
+        with reason containing 'already_completed'.
+
+        RED: current code produces 0 audit events for this path.
+        """
+        from vault_scanner.vault_writer import promote
+        _, plan = self._create_approve_plan()
+
+        # First promote succeeds
+        promote(self.db_path, plan["plan_id"], vault_root=self.vault)
+
+        # Second promote fails
+        with self.assertRaises(ValueError):
+            promote(self.db_path, plan["plan_id"], vault_root=self.vault)
+
+        # RED: there should be a promotion.failed event, but currently none
+        count = self._count_audit_events(plan["plan_id"], "promotion.failed")
+        self.assertGreaterEqual(
+            count, 1,
+            msg="RED: 第二次 promote 已 completed 的 plan 后应有 promotion.failed "
+                "audit event，当前为 0。Sliver 8 需在 raise 前写 audit。"
+        )
+
+        # Verify the audit event's reason explains it
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            row = conn.execute(
+                "SELECT reason FROM audit_events "
+                "WHERE plan_id = ? AND event_type = 'promotion.failed'",
+                (plan["plan_id"],),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertIn("already_completed", row[0].lower(),
+                      msg="promotion.failed audit 的 reason 应包含 'already_completed'")
+
+    # ── 8b: claim_failed → promotion.failed audit ─────────────────────
+
+    def test_claim_failed_writes_failed_audit(self):
+        """promoting 被另一个 promote 拒绝后，留下 promotion.failed audit。
+
+        Current code raises ValueError('claim_failed') but does NOT write
+        an audit event. This test expects exactly 1 promotion.failed
+        with reason containing 'claim_failed'.
+
+        RED: current code produces 0 audit events for this path.
+        """
+        import sqlite3
+        from contextlib import closing
+        from vault_scanner.vault_writer import promote
+        _, plan = self._create_approve_plan()
+
+        # Manually put plan in 'promoting' (simulating another process)
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            conn.execute(
+                "UPDATE promotion_plans SET state = ? WHERE plan_id = ?",
+                ("promoting", plan["plan_id"]),
+            )
+            conn.commit()
+
+        # This promote fails because claim fails
+        with self.assertRaises(ValueError):
+            promote(self.db_path, plan["plan_id"], vault_root=self.vault)
+
+        # RED: there should be a promotion.failed event, but currently none
+        count = self._count_audit_events(plan["plan_id"], "promotion.failed")
+        self.assertGreaterEqual(
+            count, 1,
+            msg="RED: claim 失败后应有 promotion.failed audit event，"
+                "当前为 0。Sliver 8 需在 raise 前写 audit。"
+        )
+
+        # Verify the audit event's reason explains it
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            row = conn.execute(
+                "SELECT reason FROM audit_events "
+                "WHERE plan_id = ? AND event_type = 'promotion.failed'",
+                (plan["plan_id"],),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertIn("claim_failed", row[0].lower(),
+                      msg="promotion.failed audit 的 reason 应包含 'claim_failed'")
+
+    # ── 8c: candidate hash mismatch → promotion.conflicted audit ──────
+
+    def test_candidate_hash_mismatch_writes_conflicted_audit(self):
+        """candidate hash mismatch 后留下 promotion.conflicted audit。
+
+        Current code sets plan.state = 'conflicted' and raises ValueError,
+        but does NOT write a promotion.conflicted audit event.
+        The conflict reason is already set by check_promotion_conflicts
+        which writes 'promotion.conflicted' to audit_events, but only
+        via check_promotion_conflicts and only for conflict detection
+        called externally — the internal path from promote() may or may
+        not produce the expected event.
+
+        RED: promote() does not audit the conflict it raises; the caller
+        gets a ValueError with no audit trail.
+        """
+        from vault_scanner.vault_writer import promote
+        cand, plan = self._create_approve_plan()
+
+        # Modify candidate content after planning (causes hash mismatch)
+        file_path = self.vault / cand["relative_path"]
+        file_path.write_text(
+            file_path.read_text(encoding="utf-8") + "\nTampered.\n",
+            encoding="utf-8",
+        )
+
+        # promote fails due to conflict
+        with self.assertRaises(ValueError):
+            promote(self.db_path, plan["plan_id"], vault_root=self.vault)
+
+        # The conflict detection inside promote() sets plan to 'conflicted'
+        # but does it produce an audit event?
+
+        import sqlite3
+        from contextlib import closing
+
+        # Plan should be 'conflicted'
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            state = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()
+        self.assertEqual(state[0], "conflicted",
+                         msg="promote 检测到冲突后计划应进入 conflicted 状态")
+
+        # promotion.conflicted 应只有 1 条（由 check_promotion_conflicts 在冲突检测时写入）
+        count = self._count_audit_events(plan["plan_id"], "promotion.conflicted")
+        self.assertEqual(
+            count, 1,
+            msg="candidate hash mismatch 后应有且仅有 1 条 promotion.conflicted "
+                f"audit event，实际 {count} 条。"
+        )
+
+        # Verify the audit event's reason explains it
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            row = conn.execute(
+                "SELECT reason FROM audit_events "
+                "WHERE plan_id = ? AND event_type = 'promotion.conflicted'",
+                (plan["plan_id"],),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        # check_promotion_conflicts 写入的 reason 是原始 conflict reasons（如 candidate_plan_hash_mismatch）
+        self.assertTrue(
+            "hash" in row[0].lower(),
+            msg="promotion.conflicted audit 的 reason 应包含 hash 相关信息，"
+                f"Got: {row[0]}"
+        )
+
+
 # ── Sliver 5: Conflict Detection ────────────────────────────────────
 
 

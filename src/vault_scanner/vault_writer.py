@@ -151,18 +151,19 @@ def _write_audit_event(db_path: Path, event_type: str, candidate_id: str,
                         candidate_hash: str | None = None,
                         target_path: str | None = None,
                         target_hash: str | None = None,
-                        reason: str | None = None):
+                        reason: str | None = None,
+                        plan_id: str | None = None):
     """Append an audit event. Raises on failure (audit fail = operation fail)."""
     with closing(sqlite3.connect(str(db_path))) as conn:
         conn.execute(
             "INSERT INTO audit_events "
             "(event_type, candidate_id, note_id, actor, timestamp, "
             "before_state, after_state, candidate_hash, target_path, "
-            "target_hash, reason, tool_version) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "target_hash, reason, tool_version, plan_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (event_type, candidate_id, note_id, actor, _now_iso(),
              before_state, after_state, candidate_hash, target_path,
-             target_hash, reason, TOOL_VERSION),
+             target_hash, reason, TOOL_VERSION, plan_id),
         )
         conn.commit()
 
@@ -686,12 +687,12 @@ def check_promotion_conflicts(
             "INSERT INTO audit_events "
             "(event_type, candidate_id, note_id, actor, timestamp, "
             "before_state, after_state, candidate_hash, target_path, "
-            "reason, tool_version) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "reason, tool_version, plan_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             ("promotion.conflicted", candidate_id, cand["note_id"],
              "system", now, "approved", "conflicted",
              cand.get("reviewed_hash"), target_path,
-             "; ".join(reasons), TOOL_VERSION),
+             "; ".join(reasons), TOOL_VERSION, plan_id),
         )
         conn.commit()
 
@@ -741,19 +742,29 @@ def promote(
         # Claim failed — re-read current state for a structured error
         with closing(sqlite3.connect(str(db_path))) as conn:
             plan_row = conn.execute(
-                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                "SELECT candidate_id, state FROM promotion_plans WHERE plan_id = ?",
                 (plan_id,),
             ).fetchone()
 
         if plan_row is None:
             raise ValueError(f"Promotion plan not found: {plan_id}")
 
-        current_state = plan_row[0]
+        current_state = plan_row[1]
         if current_state == "completed":
+            _write_audit_event(
+                db_path, "promotion.failed", plan_row[0],
+                reason=f"already_completed: plan {plan_id} is already completed",
+                plan_id=plan_id,
+            )
             raise ValueError(
                 f"already_completed: plan {plan_id} is already completed"
             )
         elif current_state == "promoting":
+            _write_audit_event(
+                db_path, "promotion.failed", plan_row[0],
+                reason=f"claim_failed: plan {plan_id} is already being promoted",
+                plan_id=plan_id,
+            )
             raise ValueError(
                 f"claim_failed: plan {plan_id} is already being promoted by another process"
             )
