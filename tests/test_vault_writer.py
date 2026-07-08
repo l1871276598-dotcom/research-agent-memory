@@ -1264,6 +1264,237 @@ class TestSliver11CleanupOrphanSource(unittest.TestCase):
         self.assertTrue(user_note.exists(), "external file must not be deleted")
 
 
+# ── Sliver 12: Abandon Promotion Plan / 放弃晋升计划 ─────────────────
+
+
+class TestSliver12AbandonPromotionPlan(unittest.TestCase):
+    """Phase 3: Abandon a promotion plan that should no longer proceed.
+
+    RED: abandon_promotion_plan() does not exist yet.
+    """
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp())
+        self.vault = self.temp / "vault"
+        self.laos_dir = self.vault / "0-inbox" / "laos-generated"
+        self.laos_dir.mkdir(parents=True, exist_ok=True)
+        for d in ["1-projects", "2-areas", "3-resources"]:
+            (self.vault / d).mkdir(parents=True, exist_ok=True)
+        self.db_path = self.temp / "test_index.sqlite"
+        from vault_scanner.vault_writer import init_candidate_db
+        init_candidate_db(self.db_path)
+
+    def _content(self, doc_type: str = "project") -> str:
+        return (
+            "---\nid: test-sliver12-note\n"
+            "schema_version: 1\n"
+            f"type: {doc_type}\nlifecycle: active\nsource: laos\n"
+            "created: 2026-07-07\nupdated: 2026-07-07\n---\nBody.\n"
+        )
+
+    def _create_active_plan(self) -> tuple:
+        """Create candidate → approve → plan → return (cand, plan)."""
+        from vault_scanner.vault_writer import (
+            create_candidate,
+            plan_promotion,
+            review_candidate,
+        )
+        content = self._content()
+        cand = create_candidate(vault_root=self.vault, db_path=self.db_path,
+                                content=content, generator="test-suite",
+                                generator_version="0.1.0")
+        review_candidate(self.db_path, cand["candidate_id"],
+                         decision="approve", reviewed_by="human-tester")
+        plan = plan_promotion(self.db_path, cand["candidate_id"], self.vault)
+        return cand, plan
+
+    def _count_audit_events(self, plan_id: str, event_type: str) -> int:
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            rows = conn.execute(
+                "SELECT COUNT(*) FROM audit_events "
+                "WHERE plan_id = ? AND event_type = ?",
+                (plan_id, event_type),
+            ).fetchone()
+        return rows[0] if rows else 0
+
+    # --- 12a: Active plan can be abandoned ---
+
+    def test_active_plan_can_be_abandoned(self):
+        """RED: abandon_promotion_plan() missing."""
+        from vault_scanner.vault_writer import abandon_promotion_plan  # noqa
+        cand, plan = self._create_active_plan()
+        result = abandon_promotion_plan(
+            self.db_path, plan["plan_id"],
+            actor="tester", reason="not needed",
+        )
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            plan_state = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()[0]
+            cand_state = conn.execute(
+                "SELECT candidate_state FROM candidates WHERE candidate_id = ?",
+                (cand["candidate_id"],),
+            ).fetchone()[0]
+        self.assertEqual(plan_state, "abandoned")
+        self.assertEqual(cand_state, "approved")
+        self.assertGreaterEqual(
+            self._count_audit_events(plan["plan_id"], "promotion.abandoned"), 1,
+        )
+
+    # --- 12b: Conflicted plan can be abandoned ---
+
+    def test_conflicted_plan_can_be_abandoned(self):
+        """RED: abandon_promotion_plan() missing."""
+        from vault_scanner.vault_writer import abandon_promotion_plan  # noqa
+        cand, plan = self._create_active_plan()
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            conn.execute(
+                "UPDATE promotion_plans SET state = 'conflicted' WHERE plan_id = ?",
+                (plan["plan_id"],),
+            )
+            conn.commit()
+        result = abandon_promotion_plan(
+            self.db_path, plan["plan_id"],
+            actor="tester", reason="conflicts unresolvable",
+        )
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            plan_state = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()[0]
+        self.assertEqual(plan_state, "abandoned")
+
+    # --- 12c: Failed plan can be abandoned ---
+
+    def test_failed_plan_can_be_abandoned(self):
+        """RED: abandon_promotion_plan() missing."""
+        from vault_scanner.vault_writer import abandon_promotion_plan  # noqa
+        cand, plan = self._create_active_plan()
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            conn.execute(
+                "UPDATE promotion_plans SET state = 'failed' WHERE plan_id = ?",
+                (plan["plan_id"],),
+            )
+            conn.commit()
+        result = abandon_promotion_plan(
+            self.db_path, plan["plan_id"],
+            actor="tester", reason="clean up after failure",
+        )
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            plan_state = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()[0]
+        self.assertEqual(plan_state, "abandoned")
+
+    # --- 12d: Completed plan cannot be abandoned ---
+
+    def test_completed_plan_cannot_be_abandoned(self):
+        """RED: abandon_promotion_plan() missing."""
+        from vault_scanner.vault_writer import abandon_promotion_plan  # noqa
+        cand, plan = self._create_active_plan()
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            conn.execute(
+                "UPDATE promotion_plans SET state = 'completed' WHERE plan_id = ?",
+                (plan["plan_id"],),
+            )
+            conn.commit()
+        with self.assertRaises(ValueError):
+            abandon_promotion_plan(
+                self.db_path, plan["plan_id"],
+                actor="tester", reason="should not be allowed",
+            )
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            plan_state = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()[0]
+        self.assertEqual(plan_state, "completed")
+
+    # --- 12f: Promoting plan cannot be abandoned ---
+
+    def test_promoting_plan_cannot_be_abandoned(self):
+        """promoting 状态的 plan 不能被 abandon，状态保持不变。"""
+        from vault_scanner.vault_writer import abandon_promotion_plan  # noqa
+        cand, plan = self._create_active_plan()
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            conn.execute(
+                "UPDATE promotion_plans SET state = 'promoting' WHERE plan_id = ?",
+                (plan["plan_id"],),
+            )
+            conn.commit()
+        with self.assertRaises(ValueError):
+            abandon_promotion_plan(
+                self.db_path, plan["plan_id"],
+                actor="tester", reason="cannot abandon promoting",
+            )
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            plan_state = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()[0]
+        self.assertEqual(plan_state, "promoting")
+
+    # --- 12g: Missing plan_id cannot be abandoned ---
+
+    def test_missing_plan_cannot_be_abandoned(self):
+        """不存在的 plan_id 调用 abandon 应 raise ValueError，不留 audit。"""
+        from vault_scanner.vault_writer import abandon_promotion_plan  # noqa
+        with self.assertRaises(ValueError):
+            abandon_promotion_plan(
+                self.db_path, "missing-plan-id",
+                actor="tester", reason="should not exist",
+            )
+        # 不应有 promotion.abandoned audit
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            abandoned = conn.execute(
+                "SELECT COUNT(*) FROM audit_events "
+                "WHERE event_type = 'promotion.abandoned'",
+            ).fetchone()[0]
+        self.assertEqual(abandoned, 0)
+
+    # --- 12e: Abandoned plan cannot be promoted ---
+
+    def test_abandoned_plan_cannot_be_promoted(self):
+        """RED: abandon_promotion_plan() missing."""
+        from vault_scanner.vault_writer import abandon_promotion_plan  # noqa
+        cand, plan = self._create_active_plan()
+        abandon_promotion_plan(
+            self.db_path, plan["plan_id"],
+            actor="tester", reason="superseded",
+        )
+        from vault_scanner.vault_writer import promote
+        with self.assertRaises(ValueError):
+            promote(self.db_path, plan["plan_id"], vault_root=self.vault)
+        # Target must not be written
+        target_path = self.vault / plan["target_path"]
+        self.assertFalse(target_path.exists(), "promote must not write target")
+        # Candidate state unchanged
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            cand_state = conn.execute(
+                "SELECT candidate_state FROM candidates WHERE candidate_id = ?",
+                (cand["candidate_id"],),
+            ).fetchone()[0]
+        self.assertEqual(cand_state, "approved")
+
+
 # ── Sliver 5: Conflict Detection ────────────────────────────────────
 
 

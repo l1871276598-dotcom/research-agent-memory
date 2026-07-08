@@ -913,6 +913,60 @@ def cleanup_orphan_source(
     return {"action": "cleanup_orphan_source", "status": "completed"}
 
 
+# ── Sliver 12: Abandon Promotion Plan ────────────────────────────────────
+
+
+ABANDONABLE_STATES = frozenset({"active", "failed", "conflicted"})
+
+
+def abandon_promotion_plan(
+    db_path: Path,
+    plan_id: str,
+    actor: str | None = None,
+    reason: str | None = None,
+) -> dict:
+    """Abandon a promotion plan that should no longer proceed.
+
+    Allowed on plans in: active, failed, conflicted.
+    Forbidden on: completed, promoting, abandoned.
+
+    Never modifies candidate_state or deletes files.
+    """
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        row = conn.execute(
+            "SELECT state, candidate_id FROM promotion_plans WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+
+    if row is None:
+        raise ValueError(f"Promotion plan not found: {plan_id}")
+
+    current_state, candidate_id = row
+
+    if current_state not in ABANDONABLE_STATES:
+        raise ValueError(
+            f"Plan {plan_id} is '{current_state}', "
+            f"cannot abandon (only {sorted(ABANDONABLE_STATES)})"
+        )
+
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute(
+            "UPDATE promotion_plans SET state = ? WHERE plan_id = ?",
+            ("abandoned", plan_id),
+        )
+        conn.execute(
+            "INSERT INTO audit_events "
+            "(event_type, candidate_id, actor, timestamp, "
+            "before_state, after_state, reason, tool_version, plan_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("promotion.abandoned", candidate_id, actor, _now_iso(),
+             current_state, "abandoned", reason, TOOL_VERSION, plan_id),
+        )
+        conn.commit()
+
+    return {"action": "abandon_plan", "status": "completed"}
+
+
 # ── Sliver 6: Atomic Promotion ─────────────────────────────────────
 
 
