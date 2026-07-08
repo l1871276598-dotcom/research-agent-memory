@@ -628,7 +628,7 @@ def check_promotion_conflicts(
         with closing(sqlite3.connect(str(db_path))) as conn:
             plan_row = conn.execute(
                 "SELECT expected_candidate_hash FROM promotion_plans "
-                "WHERE plan_id = ? AND state = 'active'",
+                "WHERE plan_id = ? AND state IN ('active', 'promoting')",
                 (plan_id,),
             ).fetchone()
         if plan_row is None:
@@ -713,21 +713,56 @@ def promote(
     """Execute an atomic promotion for an approved candidate.
 
     Steps:
-      1. Load the promotion plan and verify 'active' state
-      2. Load the candidate
+      1. Atomically claim the plan: active → promoting
+         - rowcount == 0: re-read state, raise structured error
+           (already_completed / claim_failed / promotion_plan_not_active)
+      2. Load candidate, verify approved
       3. Run conflict checks (hash, target, symlink)
+         - conflict → plan.state = 'conflicted'
       4. Read candidate file content
       5. Atomic write to target path
-      6. Update candidate state to 'active'
-      7. Update plan state to 'completed'
-      8. Write promotion.completed audit event
-
-    On failure at any DB step after file write: the target file is cleaned up
-    so no partial artifact remains.
+      6. DB updates: candidate → active, plan → completed, audit
+         - DB failure → plan.state = 'failed', cleanup target file
+      7. Remove source candidate file (non-fatal)
 
     Returns a dict with promotion result.
     """
-    # ── 1. Load plan ─────────────────────────────────────────────────
+    # ── 1. Atomic claim: active → promoting ─────────────────────────────
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        cursor = conn.execute(
+            "UPDATE promotion_plans SET state = ? "
+            "WHERE plan_id = ? AND state = ?",
+            ("promoting", plan_id, "active"),
+        )
+        claimed = cursor.rowcount
+        conn.commit()
+
+    if claimed == 0:
+        # Claim failed — re-read current state for a structured error
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            plan_row = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan_id,),
+            ).fetchone()
+
+        if plan_row is None:
+            raise ValueError(f"Promotion plan not found: {plan_id}")
+
+        current_state = plan_row[0]
+        if current_state == "completed":
+            raise ValueError(
+                f"already_completed: plan {plan_id} is already completed"
+            )
+        elif current_state == "promoting":
+            raise ValueError(
+                f"claim_failed: plan {plan_id} is already being promoted by another process"
+            )
+        else:
+            raise ValueError(
+                f"promotion_plan_not_active: plan {plan_id} is '{current_state}'"
+            )
+
+    # ── 2. Load plan details ────────────────────────────────────────────
     with closing(sqlite3.connect(str(db_path))) as conn:
         plan_row = conn.execute(
             "SELECT plan_id, candidate_id, expected_candidate_hash, "
@@ -735,19 +770,10 @@ def promote(
             (plan_id,),
         ).fetchone()
 
-    if plan_row is None:
-        raise ValueError(f"Promotion plan not found: {plan_id}")
-
-    plan_state = plan_row[4]
-    if plan_state != "active":
-        raise ValueError(
-            f"Plan {plan_id} is '{plan_state}', must be 'active' for promotion"
-        )
-
     candidate_id = plan_row[1]
     target_path_str = plan_row[3]
 
-    # ── 2. Load candidate ────────────────────────────────────────────
+    # ── 3. Load candidate ───────────────────────────────────────────────
     cand = _get_candidate(db_path, candidate_id)
     if cand is None:
         raise ValueError(f"Candidate not found: {candidate_id}")
@@ -758,17 +784,24 @@ def promote(
             f"must be 'approved' for promotion"
         )
 
-    # ── 3. Conflict check ────────────────────────────────────────────
+    # ── 4. Conflict check ───────────────────────────────────────────────
     conflict = check_promotion_conflicts(
         db_path, candidate_id, vault_root, plan_id=plan_id
     )
     if conflict is not None:
         reasons = "; ".join(conflict.get("reasons", ["unknown_conflict"]))
+        # Set plan state to conflicted
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            conn.execute(
+                "UPDATE promotion_plans SET state = ? WHERE plan_id = ?",
+                ("conflicted", plan_id),
+            )
+            conn.commit()
         raise ValueError(
             f"Promotion conflicts detected for plan {plan_id}: {reasons}"
         )
 
-    # ── 4. Read candidate file content ───────────────────────────────
+    # ── 5. Read candidate file content ──────────────────────────────────
     source_path = (vault_root / cand["relative_path"]).resolve()
     if not source_path.exists():
         raise FileNotFoundError(f"Candidate file not found: {source_path}")
@@ -778,28 +811,24 @@ def promote(
     except Exception as e:
         raise IOError(f"Failed to read candidate file: {e}") from e
 
-    # ── 5. Ensure target parent dir exists & atomic write ────────────
+    # ── 6. Ensure target parent dir exists & atomic write ───────────────
     target_path = (vault_root / target_path_str).resolve()
     target_path.parent.mkdir(parents=True, exist_ok=True)
     _write_atomic(target_path, content)
 
-    # ── 6. DB updates (candidate + plan + audit in one transaction) ──
+    # ── 7. DB updates (candidate + plan + audit in one transaction) ─────
     now = _now_iso()
-    file_cleaned_up = False
 
     try:
         with closing(sqlite3.connect(str(db_path))) as conn:
-            # Update candidate state to active
             conn.execute(
                 "UPDATE candidates SET candidate_state = ? WHERE candidate_id = ?",
                 ("active", candidate_id),
             )
-            # Update plan state to completed
             conn.execute(
                 "UPDATE promotion_plans SET state = ? WHERE plan_id = ?",
                 ("completed", plan_id),
             )
-            # Write audit event
             conn.execute(
                 "INSERT INTO audit_events "
                 "(event_type, candidate_id, note_id, actor, timestamp, "
@@ -813,18 +842,21 @@ def promote(
             )
             conn.commit()
     except Exception:
-        # DB write failed — rollback the file write
+        # DB write failed — rollback the file write, set plan to failed
         if target_path.exists():
             target_path.unlink()
-        file_cleaned_up = True
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            conn.execute(
+                "UPDATE promotion_plans SET state = ? WHERE plan_id = ?",
+                ("failed", plan_id),
+            )
+            conn.commit()
         raise
 
-    # ── 9. Remove source candidate file ──────────────────────────────
+    # ── 8. Remove source candidate file ─────────────────────────────────
     try:
         source_path.unlink()
     except Exception:
-        # Non-fatal: candidate is already active, file in target.
-        # Log the orphan but do not fail the promotion.
         with closing(sqlite3.connect(str(db_path))) as conn:
             conn.execute(
                 "INSERT INTO audit_events "

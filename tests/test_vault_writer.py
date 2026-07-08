@@ -332,6 +332,280 @@ class TestSliver1And2(unittest.TestCase):
                          f"Temp files remain: {laos_files}")
 
 
+# ── Sliver 7: Promotion Lock / 并发防护 ─────────────────────────────
+
+
+class TestSliver7PromotionLock(unittest.TestCase):
+    """Phase 3: Concurrent promotion protection via 'promoting' intermediate state.
+
+    The target flow: active → atomically claim to 'promoting' → completed/failed/conflicted.
+
+    Corrected state machine boundaries:
+    - completed 不可降级为 failed（历史审计事实）
+    - promoting 不能被无 token 的 promote 接管（当前不做 lease）
+    - 并发只要求最多一个成功
+    """
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp())
+        self.vault = self.temp / "vault"
+        self.laos_dir = self.vault / "0-inbox" / "laos-generated"
+        self.laos_dir.mkdir(parents=True, exist_ok=True)
+        for d in ["1-projects", "2-areas", "3-resources"]:
+            (self.vault / d).mkdir(parents=True, exist_ok=True)
+        self.db_path = self.temp / "test_index.sqlite"
+        from vault_scanner.vault_writer import init_candidate_db
+        init_candidate_db(self.db_path)
+
+    def _content(self, doc_type: str = "project") -> str:
+        return (
+            "---\nid: test-sliver7-note\n"
+            "schema_version: 1\n"
+            f"type: {doc_type}\nlifecycle: active\nsource: laos\n"
+            "created: 2026-07-07\nupdated: 2026-07-07\n---\nBody.\n"
+        )
+
+    def _create_approve_plan(self):
+        """Helper: create → approve → plan → return (candidate, plan)."""
+        from vault_scanner.vault_writer import create_candidate, review_candidate, plan_promotion
+        content = self._content()
+        cand = create_candidate(vault_root=self.vault, db_path=self.db_path,
+                                content=content, generator="test-suite",
+                                generator_version="0.1.0")
+        review_candidate(self.db_path, cand["candidate_id"],
+                         decision="approve", reviewed_by="human-tester")
+        plan = plan_promotion(self.db_path, cand["candidate_id"], self.vault)
+        return cand, plan
+
+    # ── 7a: 重复执行不能降级 completed 为 failed ─────────────────────
+
+    def test_repeated_promote_rejected_completed_preserved(self):
+        """第二次 promote 一个已 completed 的 plan 被拒绝，completed 不变。
+
+        第一次 promote 成功：active → promoting → completed
+        第二次 promote：plan 已是 completed，拒绝，但保持 completed 不变。
+        completed 是审计事实，不应降级为 failed。
+
+        RED: 当前代码无 claim 步骤，第二次拒绝报 'is completed'。
+        Sliver 7 应增加 claim 步骤，使第二次拒绝报 'already_completed'
+        或 'plan_not_active'，但 plan 保持 completed。
+        """
+        import sqlite3
+        from contextlib import closing
+        from vault_scanner.vault_writer import promote
+        _, plan = self._create_approve_plan()
+
+        # First promote succeeds
+        result = promote(self.db_path, plan["plan_id"], vault_root=self.vault)
+        self.assertEqual(result["candidate_state"], "active")
+
+        # Second promote → must fail
+        with self.assertRaises(ValueError) as ctx:
+            promote(self.db_path, plan["plan_id"], vault_root=self.vault)
+
+        # RED: 当前代码报 'is completed'。
+        # Sliver 7 应报 already_completed 或 plan_not_active，
+        # 但绝对不能降级 completed → failed。
+        err_msg = str(ctx.exception).lower()
+        self.assertIn(
+            "already_completed", err_msg,
+            msg="RED: promote() 应拒绝已 completed 的 plan，"
+                f"报 already_completed。Got: {err_msg}"
+        )
+
+        # Plan 仍为 completed，不可降级
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            state = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()
+        self.assertEqual(state[0], "completed",
+                         msg="RED: plan 应保持 completed，"
+                             f"实际为 {state[0]}")
+
+        # Target 不变（只有第一次写的文件）
+        target_full = self.vault / plan["target_path"]
+        self.assertTrue(target_full.exists())
+
+        # promotion.completed 仍只有 1 条
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            completed = conn.execute(
+                "SELECT event_type FROM audit_events "
+                "WHERE plan_id = ? AND event_type = 'promotion.completed'",
+                (plan["plan_id"],),
+            ).fetchall()
+        self.assertEqual(len(completed), 1)
+
+    # ── 7b: promoting 状态不可被无 token 的 promote 接管 ────────────
+
+    def test_promoting_not_claimable_by_others(self):
+        """plan 在 promoting 状态时，另一个 promote 调用被拒绝。
+
+        不实现 lease/owner token 的情况下：
+        - promoting 被拒绝
+        - plan 仍保持 promoting（不是 failed — completed 不能降级，
+          promoting 也不应被无 token 的 caller 改变状态）
+        - 不写 target
+        - 不改 candidate
+
+        RED: 当前代码检查 state != 'active' 就拒绝。
+        需要的 Sliver 7 行为：
+        - promote 内部先原子 claim（UPDATE WHERE state = 'active' → 'promoting'）
+        - 第二个 caller 因 claim 0 rows 失败，报 claim_failed
+        - plan 保持 promoting（无 owner token 时不应修改他人 claim）
+        """
+        import sqlite3
+        from contextlib import closing
+        from vault_scanner.vault_writer import promote
+        _, plan = self._create_approve_plan()
+
+        # 模拟另一个进程已 claim 该 plan
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            conn.execute(
+                "UPDATE promotion_plans SET state = ? WHERE plan_id = ?",
+                ("promoting", plan["plan_id"]),
+            )
+            conn.commit()
+
+        # promote 应因 claim 失败而拒绝
+        with self.assertRaises(ValueError) as ctx:
+            promote(self.db_path, plan["plan_id"], vault_root=self.vault)
+
+        # RED: 当前代码报 'is promoting'。
+        # Sliver 7 应报 claim_failed/plan_not_active。
+        err_msg = str(ctx.exception).lower()
+        self.assertIn(
+            "claim_failed", err_msg,
+            msg="RED: claim 失败应报 claim_failed，"
+                f"Got: {err_msg}"
+        )
+
+        # Plan 保持 promoting（无 lease 时不改为 failed）
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            state = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()
+        self.assertEqual(state[0], "promoting",
+                         msg="RED: plan 应保持 promoting，"
+                             f"Got: {state[0]}。不应降级 completed 为 failed，"
+                             "也不应以无 token 方式修改他人的 promoting claim。")
+
+        # Target 未写入
+        target_full = self.vault / plan["target_path"]
+        self.assertFalse(target_full.exists())
+
+        # Candidate 不变
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            cand_id = conn.execute(
+                "SELECT candidate_id FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()
+        if cand_id:
+            import sqlite3  # noqa: F811
+            with closing(sqlite3.connect(str(self.db_path))) as conn:
+                state_row = conn.execute(
+                    "SELECT candidate_state FROM candidates WHERE candidate_id = ?",
+                    (cand_id[0],),
+                ).fetchone()
+            self.assertIsNotNone(state_row)
+            self.assertEqual(state_row[0], "approved")
+
+        # 无 promotion.completed audit
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            completed = conn.execute(
+                "SELECT event_type FROM audit_events "
+                "WHERE plan_id = ? AND event_type = 'promotion.completed'",
+                (plan["plan_id"],),
+            ).fetchall()
+        self.assertEqual(len(completed), 0)
+
+    # ── 7c: 并发 promote — 最多一个成功 ──────────────────────────────
+
+    def test_concurrent_promote_at_most_one_succeeds(self):
+        """多个线程/进程同时调用 promote(plan_id)，最多一个成功。
+
+        验收标准：
+        - 最多 1 次成功
+        - plan 最终 completed
+        - target 只有 1 个
+        - promotion.completed 只有 1 条
+        - 失败的调用报 claim_failed 且不影响 completed 状态
+
+        测试方式：使用 threading 模拟两个并发调用。
+        不预先设 promoting，让两个 promote 内部竞争 claim。
+
+        RED: 当前代码无 claim 步骤，两个 promote 会同时成功，
+        或第二个报 'is completed' 但缺少并发竞争语义。
+        """
+        import concurrent.futures
+        from vault_scanner.vault_writer import promote
+        _, plan = self._create_approve_plan()
+
+        def do_promote():
+            try:
+                result = promote(self.db_path, plan["plan_id"], vault_root=self.vault)
+                return {"ok": True, "result": result}
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
+
+        # 两个线程同时 promote
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            fut_a = pool.submit(do_promote)
+            fut_b = pool.submit(do_promote)
+            results = [fut_a.result(), fut_b.result()]
+
+        # 最多一个成功
+        successes = [r for r in results if r["ok"]]
+        failures = [r for r in results if not r["ok"]]
+        self.assertLessEqual(len(successes), 1,
+                             msg=f"最多 1 个 promote 成功，实际 {len(successes)} 个成功")
+
+        # 如果所有都失败，则 RED（至少应有一个成功）
+        self.assertGreaterEqual(len(successes), 1,
+                                msg="RED: promote 内部需实现 claim 步骤，"
+                                    "至少一个 caller 应成功。Got: 全部失败")
+
+        # Plan 最终 completed
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            state = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()
+        self.assertEqual(state[0], "completed")
+
+        # Target 只有 1 个
+        target_full = self.vault / plan["target_path"]
+        self.assertTrue(target_full.exists())
+        # 读目标文件内容确认唯一
+        content = target_full.read_text(encoding="utf-8")
+        self.assertIn("Body.", content)
+
+        # promotion.completed 只有 1 条
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            completed = conn.execute(
+                "SELECT event_type FROM audit_events "
+                "WHERE plan_id = ? AND event_type = 'promotion.completed'",
+                (plan["plan_id"],),
+            ).fetchall()
+        self.assertEqual(len(completed), 1)
+
+        # 失败的调用应接受两种合法 loser 结果：
+        # - winner 仍在 promoting → claim_failed
+        # - winner 已完成 completed → already_completed
+        for f in failures:
+            err = f["error"].lower()
+            is_claim_failed = "claim_failed" in err
+            is_already_completed = "already_completed" in err
+            self.assertTrue(
+                is_claim_failed or is_already_completed,
+                msg=f"失败的 promote 应报 claim_failed 或 already_completed，"
+                    f"Got: {f['error']}"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
 
