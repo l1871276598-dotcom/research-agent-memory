@@ -982,6 +982,121 @@ def abandon_promotion_plan(
     return {"action": "abandon_plan", "status": "completed"}
 
 
+# ── Sliver 14: Choose New Target ────────────────────────────────────
+
+
+def choose_new_promotion_target(
+    db_path: Path,
+    old_plan_id: str,
+    vault_root: Path,
+    new_target_path: str,
+    actor: str | None = None,
+    reason: str | None = None,
+) -> dict:
+    """Abandon an old promotion plan and create a new one with a different target.
+
+    Only allowed when:
+    - old plan.state in {active, conflicted, failed}
+    - candidate_state is 'approved'
+    - new_target_path does not already exist on disk
+    - new_target_path passes path traversal checks
+
+    On success:
+    - old plan.state = abandoned
+    - new plan is created with state = active
+    - candidate_state unchanged
+    - audit: promotion.target_changed
+
+    Raises ValueError on any violation. DB unchanged on failure.
+    """
+    # 1. Fetch old plan
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        old_row = conn.execute(
+            "SELECT candidate_id, state FROM promotion_plans WHERE plan_id = ?",
+            (old_plan_id,),
+        ).fetchone()
+
+    if old_row is None:
+        raise ValueError(f"Plan not found: {old_plan_id}")
+
+    old_candidate_id, old_state = old_row
+    ALLOWED_STATES = {"active", "conflicted", "failed"}
+    if old_state not in ALLOWED_STATES:
+        raise ValueError(
+            f"Plan {old_plan_id} state is '{old_state}', "
+            f"only {sorted(ALLOWED_STATES)} can choose a new target"
+        )
+
+    # 2. Fetch candidate — must be approved
+    cand = _get_candidate(db_path, old_candidate_id)
+    if cand is None:
+        raise ValueError(f"Candidate not found: {old_candidate_id}")
+
+    if cand["candidate_state"] != "approved":
+        raise ValueError(
+            f"Candidate {old_candidate_id} is '{cand['candidate_state']}', "
+            f"must be 'approved' to choose a new target"
+        )
+
+    # 3. Validate new_target_path: no traversal, no forbidden dirs
+    _validate_relative_path(new_target_path, vault_root)
+
+    new_target_str = str(new_target_path)
+    for forbidden in FORBIDDEN_TARGET_DIRS:
+        if new_target_str.startswith(forbidden):
+            raise ValueError(
+                f"Target path '{new_target_str}' is in a forbidden directory "
+                f"(reserved: {', '.join(FORBIDDEN_TARGET_DIRS)})"
+            )
+
+    if ".." in Path(new_target_str).parts:
+        raise ValueError(f"Target path contains path traversal: {new_target_path}")
+
+    # 4. Check target doesn't already exist on disk
+    target_full = (vault_root / new_target_path).resolve()
+    if target_full.exists():
+        raise ValueError(f"Target path already exists: {new_target_path}")
+
+    # 5. Everything valid — perform operations
+    now = _now_iso()
+    new_plan_id = _generate_plan_id()
+    expected_hash = cand.get("reviewed_hash")
+
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute(
+            "UPDATE promotion_plans SET state = 'abandoned' WHERE plan_id = ?",
+            (old_plan_id,),
+        )
+        conn.execute(
+            "INSERT INTO promotion_plans "
+            "(plan_id, candidate_id, expected_candidate_hash, target_path, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (new_plan_id, old_candidate_id, expected_hash, new_target_path, now),
+        )
+        conn.execute(
+            "UPDATE candidates SET target_path = ? WHERE candidate_id = ?",
+            (new_target_path, old_candidate_id),
+        )
+        conn.execute(
+            "INSERT INTO audit_events "
+            "(event_type, candidate_id, actor, timestamp, "
+            " before_state, after_state, reason, tool_version, plan_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("promotion.target_changed", old_candidate_id, actor, now,
+             old_state, "abandoned", reason, TOOL_VERSION, old_plan_id),
+        )
+        conn.commit()
+
+    return {
+        "new_plan_id": new_plan_id,
+        "old_plan_id": old_plan_id,
+        "candidate_id": old_candidate_id,
+        "new_target_path": new_target_path,
+        "old_plan_state": old_state,
+        "new_plan_state": "active",
+    }
+
+
 # ── Sliver 13: Re-review Conflicted Candidate ─────────────────────
 
 

@@ -1202,6 +1202,272 @@ class TestSliver10_5RecoveryDecisionRuleLibrary(unittest.TestCase):
         self.assertNotIn("retry_promotion", result.get("blocked_actions", []))
 
 
+# ── Sliver 14: Choose New Target / 重选目标路径 ─────────────────────
+
+
+class TestSliver14ChooseNewTarget(unittest.TestCase):
+    """Phase 3: Choose a new target path when the original target is blocked.
+
+    RED: choose_new_promotion_target() does not exist yet.
+    """
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp())
+        self.vault = self.temp / "vault"
+        self.laos_dir = self.vault / "0-inbox" / "laos-generated"
+        self.laos_dir.mkdir(parents=True, exist_ok=True)
+        for d in ["1-projects", "2-areas", "3-resources"]:
+            (self.vault / d).mkdir(parents=True, exist_ok=True)
+        self.db_path = self.temp / "test_index.sqlite"
+        from vault_scanner.vault_writer import init_candidate_db
+        init_candidate_db(self.db_path)
+
+    def _content(self, doc_type: str = "project") -> str:
+        return (
+            "---\nid: test-sliver14-note\n"
+            "schema_version: 1\n"
+            f"type: {doc_type}\nlifecycle: active\nsource: laos\n"
+            "created: 2026-07-07\nupdated: 2026-07-07\n---\nBody.\n"
+        )
+
+    def _create_active_plan(self) -> tuple:
+        from vault_scanner.vault_writer import create_candidate, plan_promotion, review_candidate
+        content = self._content()
+        cand = create_candidate(vault_root=self.vault, db_path=self.db_path,
+                                content=content, generator="test-suite",
+                                generator_version="0.1.0")
+        review_candidate(self.db_path, cand["candidate_id"],
+                         decision="approve", reviewed_by="human-tester")
+        plan = plan_promotion(self.db_path, cand["candidate_id"], self.vault)
+        return cand, plan
+
+    def _count_audit_events(self, plan_id: str, event_type: str) -> int:
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            rows = conn.execute(
+                "SELECT COUNT(*) FROM audit_events "
+                "WHERE plan_id = ? AND event_type = ?",
+                (plan_id, event_type),
+            ).fetchone()
+        return rows[0] if rows else 0
+
+    # --- 14a: Active old plan → choose new target ---
+
+    def test_active_old_plan_can_choose_new_target(self):
+        from vault_scanner.vault_writer import choose_new_promotion_target  # noqa
+        cand, plan = self._create_active_plan()
+        new_target = "2-areas/new-target.md"
+
+        result = choose_new_promotion_target(
+            self.db_path, plan["plan_id"],
+            vault_root=self.vault, new_target_path=new_target,
+            actor="tester", reason="target conflict",
+        )
+
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            old_state = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()[0]
+        self.assertEqual(old_state, "abandoned")
+
+        new_plan_id = result["new_plan_id"]
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            row = conn.execute(
+                "SELECT state, target_path FROM promotion_plans WHERE plan_id = ?",
+                (new_plan_id,),
+            ).fetchone()
+        self.assertEqual(row[0], "active")
+        self.assertEqual(row[1], new_target)
+
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            cand_state = conn.execute(
+                "SELECT candidate_state FROM candidates WHERE candidate_id = ?",
+                (cand["candidate_id"],),
+            ).fetchone()[0]
+        self.assertEqual(cand_state, "approved")
+
+        self.assertGreaterEqual(
+            self._count_audit_events(plan["plan_id"], "promotion.target_changed"), 1,
+        )
+
+    # --- 14b: Conflicted old plan → choose new target ---
+
+    def test_conflicted_old_plan_can_choose_new_target(self):
+        from vault_scanner.vault_writer import choose_new_promotion_target  # noqa
+        cand, plan = self._create_active_plan()
+
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            conn.execute(
+                "UPDATE promotion_plans SET state = 'conflicted' WHERE plan_id = ?",
+                (plan["plan_id"],),
+            )
+            conn.commit()
+
+        new_target = "2-areas/new-target.md"
+        result = choose_new_promotion_target(
+            self.db_path, plan["plan_id"],
+            vault_root=self.vault, new_target_path=new_target,
+            actor="tester", reason="target still blocked",
+        )
+
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            old_state = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()[0]
+        self.assertEqual(old_state, "abandoned")
+
+        new_plan_id = result["new_plan_id"]
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            row = conn.execute(
+                "SELECT state, target_path FROM promotion_plans WHERE plan_id = ?",
+                (new_plan_id,),
+            ).fetchone()
+        self.assertEqual(row[0], "active")
+        self.assertEqual(row[1], new_target)
+
+    # --- 14c: Completed old plan cannot choose new target ---
+
+    def test_completed_old_plan_cannot_choose_new_target(self):
+        from vault_scanner.vault_writer import choose_new_promotion_target  # noqa
+        cand, plan = self._create_active_plan()
+
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            conn.execute(
+                "UPDATE promotion_plans SET state = 'completed' WHERE plan_id = ?",
+                (plan["plan_id"],),
+            )
+            conn.commit()
+
+        with self.assertRaises(ValueError):
+            choose_new_promotion_target(
+                self.db_path, plan["plan_id"],
+                vault_root=self.vault, new_target_path="2-areas/new-target.md",
+                actor="tester", reason="should not be allowed",
+            )
+
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            old_state = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()[0]
+        self.assertEqual(old_state, "completed")
+
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            plans = conn.execute(
+                "SELECT COUNT(*) FROM promotion_plans",
+            ).fetchone()[0]
+        self.assertEqual(plans, 1)
+
+    # --- 14d: Candidate not approved cannot choose new target ---
+
+    def test_candidate_not_approved_cannot_choose_new_target(self):
+        from vault_scanner.vault_writer import choose_new_promotion_target  # noqa
+        cand, plan = self._create_active_plan()
+
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            conn.execute(
+                "UPDATE candidates SET candidate_state = 'pending_review' "
+                "WHERE candidate_id = ?",
+                (cand["candidate_id"],),
+            )
+            conn.commit()
+
+        with self.assertRaises(ValueError):
+            choose_new_promotion_target(
+                self.db_path, plan["plan_id"],
+                vault_root=self.vault, new_target_path="2-areas/new-target.md",
+                actor="tester", reason="candidate not approved",
+            )
+
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            old_state = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()[0]
+        self.assertEqual(old_state, "active")
+
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            plans = conn.execute(
+                "SELECT COUNT(*) FROM promotion_plans",
+            ).fetchone()[0]
+        self.assertEqual(plans, 1)
+
+    # --- 14e: New target path already exists → fail closed ---
+
+    def test_new_target_already_exists_fails_closed(self):
+        from vault_scanner.vault_writer import choose_new_promotion_target  # noqa
+        cand, plan = self._create_active_plan()
+
+        new_target = "2-areas/existing-target.md"
+        existing_file = self.vault / new_target
+        existing_file.parent.mkdir(parents=True, exist_ok=True)
+        existing_file.write_text("Existing content.\n", "utf-8")
+        self.assertTrue(existing_file.exists(), "precondition: target file exists")
+
+        with self.assertRaises(ValueError):
+            choose_new_promotion_target(
+                self.db_path, plan["plan_id"],
+                vault_root=self.vault, new_target_path=new_target,
+                actor="tester", reason="should be blocked",
+            )
+
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            old_state = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()[0]
+        self.assertEqual(old_state, "active")
+
+        self.assertEqual(existing_file.read_text("utf-8"), "Existing content.\n")
+
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            plans = conn.execute(
+                "SELECT COUNT(*) FROM promotion_plans",
+            ).fetchone()[0]
+        self.assertEqual(plans, 1)
+
+    # --- 14f: New target path traversal → fail closed ---
+
+    def test_new_target_path_traversal_fails_closed(self):
+        from vault_scanner.vault_writer import choose_new_promotion_target  # noqa
+        cand, plan = self._create_active_plan()
+
+        with self.assertRaises(ValueError):
+            choose_new_promotion_target(
+                self.db_path, plan["plan_id"],
+                vault_root=self.vault, new_target_path="1-projects/../../outside.md",
+                actor="tester", reason="should be blocked",
+            )
+
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            old_state = conn.execute(
+                "SELECT state FROM promotion_plans WHERE plan_id = ?",
+                (plan["plan_id"],),
+            ).fetchone()[0]
+        self.assertEqual(old_state, "active")
+
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
+            plans = conn.execute(
+                "SELECT COUNT(*) FROM promotion_plans",
+            ).fetchone()[0]
+        self.assertEqual(plans, 1)
+
+
 # ── Sliver 11: Cleanup Orphan Source / 清理孤儿源文件 ─────────────────
 
 
