@@ -692,8 +692,8 @@ class LearningLoopTests(unittest.TestCase):
         from src.learning_loop.evidence import build_utility_evaluation
 
         evaluation = build_utility_evaluation(
-            experiment={"with_memory_run_id": "run-b", "without_memory_run_id": "run-a"},
-            comparison={"first_score": 0.5, "second_score": 0.8, "score_delta": 0.3},
+            experiment={"task_id": "task-1", "with_memory_run_id": "run-b", "without_memory_run_id": "run-a"},
+            comparison={"task_id": "task-1", "first_score": 0.5, "second_score": 0.8, "score_delta": 0.3},
             composition={"summary": {"total": 5, "verified": 3, "unknown": 1, "contradicted": 1}},
             thresholds={"utility_delta_min": 0.1, "verified_ratio_min": 0.5, "defined_before_run": True},
         )
@@ -710,8 +710,8 @@ class LearningLoopTests(unittest.TestCase):
         from src.learning_loop.evidence import build_utility_evaluation
 
         evaluation = build_utility_evaluation(
-            experiment={"with_memory_run_id": "run-b", "without_memory_run_id": "run-a"},
-            comparison={"first_score": 0.5, "second_score": 0.8, "score_delta": 0.3},
+            experiment={"task_id": "task-1", "with_memory_run_id": "run-b", "without_memory_run_id": "run-a"},
+            comparison={"task_id": "task-1", "first_score": 0.5, "second_score": 0.8, "score_delta": 0.3},
             composition={"summary": {"total": 5, "verified": 3, "unknown": 1, "contradicted": 1}},
             thresholds={"utility_delta_min": 0.1, "verified_ratio_min": 0.5, "defined_before_run": True},
         )
@@ -725,8 +725,8 @@ class LearningLoopTests(unittest.TestCase):
         from src.learning_loop.evidence import build_utility_evaluation, export_utility_evaluation_md
 
         evaluation = build_utility_evaluation(
-            experiment={"with_memory_run_id": "run-b", "without_memory_run_id": "run-a"},
-            comparison={"first_score": 0.5, "second_score": 0.8, "score_delta": 0.3},
+            experiment={"task_id": "task-1", "with_memory_run_id": "run-b", "without_memory_run_id": "run-a"},
+            comparison={"task_id": "task-1", "first_score": 0.5, "second_score": 0.8, "score_delta": 0.3},
             composition={"summary": {"total": 5, "verified": 3, "unknown": 1, "contradicted": 1}},
             thresholds={"utility_delta_min": 0.1, "verified_ratio_min": 0.5, "defined_before_run": True},
         )
@@ -739,8 +739,8 @@ class LearningLoopTests(unittest.TestCase):
         from src.learning_loop.evidence import build_utility_evaluation, export_utility_evaluation_md
 
         evaluation = build_utility_evaluation(
-            experiment={"with_memory_run_id": "run-b", "without_memory_run_id": "run-a"},
-            comparison={"first_score": 0.5, "second_score": 0.8, "score_delta": 0.3},
+            experiment={"task_id": "task-1", "with_memory_run_id": "run-b", "without_memory_run_id": "run-a"},
+            comparison={"task_id": "task-1", "first_score": 0.5, "second_score": 0.8, "score_delta": 0.3},
             composition={"summary": {"total": 5, "verified": 3, "unknown": 1, "contradicted": 1}},
             thresholds={"utility_delta_min": 0.1, "verified_ratio_min": 0.5, "defined_before_run": True},
         )
@@ -972,6 +972,143 @@ class LearningLoopTests(unittest.TestCase):
         extra_threshold["thresholds"]["future_unpromoted_key"] = 42
         self.assertEqual(
             evaluate_experiment_bundle(extra_threshold)["evaluation_id"], base
+        )
+
+    # --- S5.1 review-fix RED tests: producer lineage boundary + input identity ---
+
+    def test_build_utility_evaluation_requires_task_lineage(self):
+        """RED: the formal v2 producer must reject missing/mismatched task_id."""
+        from src.learning_loop.evidence import build_utility_evaluation
+
+        def call(experiment, comparison):
+            return build_utility_evaluation(
+                experiment=experiment,
+                comparison=comparison,
+                composition={"summary": {"total": 1, "verified": 1, "unknown": 0, "contradicted": 0}},
+                thresholds={"utility_delta_min": 0.1, "verified_ratio_min": 0.5, "defined_before_run": True},
+            )
+
+        valid_comparison = {
+            "task_id": "task-1",
+            "first_score": 0.2,
+            "second_score": 0.5,
+            "score_delta": 0.3,
+        }
+        with self.assertRaises(ValueError):
+            call({"without_memory_run_id": "run-a", "with_memory_run_id": "run-b"}, valid_comparison)
+        with self.assertRaises(ValueError):
+            call(
+                {"task_id": "", "without_memory_run_id": "run-a", "with_memory_run_id": "run-b"},
+                valid_comparison,
+            )
+        with self.assertRaises(ValueError):
+            call(
+                {"task_id": "task-1", "without_memory_run_id": "run-a", "with_memory_run_id": "run-b"},
+                {"first_score": 0.2, "second_score": 0.5, "score_delta": 0.3},
+            )
+        with self.assertRaises(ValueError):
+            call(
+                {"task_id": "task-1", "without_memory_run_id": "run-a", "with_memory_run_id": "run-b"},
+                dict(valid_comparison, task_id="task-other"),
+            )
+
+    def test_compare_rejects_same_content_under_different_paths(self):
+        """RED: input identity is (path, sha256); renamed inputs are a different experiment."""
+        backend = ImprovingBackend()
+        loop = LearningLoop(self.data.name, self.state.name, self.work.name, backend)
+        Path(self.work.name, "module_dup.py").write_text(
+            "def save(key, value):\n    return value\n",
+            encoding="utf-8",
+        )
+
+        t_a = task("path-iso-a", "module_one.py")
+        t_a["memory_condition"] = "without_memory"
+        first = loop.execute(t_a)
+        for cid in first["candidate_ids"]:
+            loop.review("path-iso-a", cid, "accept")
+
+        t_b = task("path-iso-b", "module_dup.py")
+        t_b["task_id"] = t_a["task_id"]
+        t_b["memory_condition"] = "with_memory"
+        loop.execute(t_b)
+
+        with self.assertRaisesRegex(ValueError, "input"):
+            loop.compare("path-iso-a", "path-iso-b")
+
+    # --- S5.1 review-fix hardening: contract locks ---
+
+    def test_adapter_rejects_full_score_tamper_matrix(self):
+        """Each score field independently rejects missing/bool/NaN/Infinity."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle, EvaluationInputError
+
+        locations = (
+            ("without_memory_outcome", "score"),
+            ("with_memory_outcome", "score"),
+            ("comparison", "first_score"),
+            ("comparison", "second_score"),
+            ("comparison", "score_delta"),
+        )
+        for container, field in locations:
+            for label, tamper in (
+                ("missing", None),
+                ("bool", True),
+                ("nan", float("nan")),
+                ("inf", float("inf")),
+            ):
+                bundle = self._valid_bundle()
+                if label == "missing":
+                    del bundle[container][field]
+                else:
+                    bundle[container][field] = tamper
+                with self.subTest(target=f"{container}.{field}", tamper=label), \
+                        self.assertRaises(EvaluationInputError):
+                    evaluate_experiment_bundle(bundle)
+
+    def test_evaluation_id_matches_frozen_identity_payload(self):
+        """Lock the exact 13-field identity payload and its canonicalization."""
+        import hashlib
+
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+
+        result = evaluate_experiment_bundle(self._valid_bundle())
+        payload = {
+            "schema_version": 2,
+            "experiment": {
+                "task_id": "task-1",
+                "without_memory_run_id": "run-a",
+                "with_memory_run_id": "run-b",
+            },
+            "comparison": {
+                "first_score": 0.2,
+                "second_score": 0.5,
+                "score_delta": 0.3,
+            },
+            "evidence_composition": {
+                "verified": 1,
+                "unknown": 0,
+                "contradicted": 0,
+            },
+            "thresholds": {
+                "utility_delta_min": 0.1,
+                "verified_ratio_min": 0.5,
+                "defined_before_run": True,
+            },
+        }
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        expected = "eval_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        self.assertEqual(result["evaluation_id"], expected)
+
+    def test_enrichment_output_has_exactly_two_fields(self):
+        """Lock the enriched artifact to the two authorized copy-only fields."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+        from src.learning_loop.enrichment import build_enriched_utility_evaluation
+
+        enriched = build_enriched_utility_evaluation(
+            evaluate_experiment_bundle(self._valid_bundle())
+        )
+        self.assertEqual(
+            set(enriched),
+            {"source_evaluation_id", "source_evaluation_snapshot"},
         )
 
     # --- S5.1d RED tests: enrichment snapshot (v4.2.1 §2.4) ---

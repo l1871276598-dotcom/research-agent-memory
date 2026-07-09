@@ -645,9 +645,13 @@ class LearningLoop:
         task_id = first_run["task_id"]
         first_evidence = _read_json(self._artifact(first_run_id, "evidence.json"))
         second_evidence = _read_json(self._artifact(second_run_id, "evidence.json"))
-        first_hashes = {item["sha256"] for item in first_evidence.get("inputs", [])}
-        second_hashes = {item["sha256"] for item in second_evidence.get("inputs", [])}
-        if first_hashes != second_hashes:
+        first_inputs = sorted(
+            (item["path"], item["sha256"]) for item in first_evidence.get("inputs", [])
+        )
+        second_inputs = sorted(
+            (item["path"], item["sha256"]) for item in second_evidence.get("inputs", [])
+        )
+        if first_inputs != second_inputs:
             raise ValueError("compared runs have different input content")
         first_task = first_run["task"]
         second_task = second["task"]

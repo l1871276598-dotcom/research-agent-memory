@@ -162,6 +162,18 @@ def build_utility_evaluation(experiment, comparison, composition, thresholds):
     if not isinstance(thresholds, dict):
         raise ValueError("thresholds must be a mapping")
 
+    task_id = experiment.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        raise ValueError("experiment.task_id must be a non-empty string")
+    comparison_task_id = comparison.get("task_id")
+    if not isinstance(comparison_task_id, str) or not comparison_task_id:
+        raise ValueError("comparison.task_id must be a non-empty string")
+    if comparison_task_id != task_id:
+        raise ValueError(
+            f"experiment.task_id {task_id!r} does not match "
+            f"comparison.task_id {comparison_task_id!r}"
+        )
+
     utility = evaluate_pack_utility(comparison)
     sufficiency = check_evidence_sufficiency(
         composition, thresholds.get("verified_ratio_min", 0.0)
