@@ -974,6 +974,67 @@ class LearningLoopTests(unittest.TestCase):
             evaluate_experiment_bundle(extra_threshold)["evaluation_id"], base
         )
 
+    # --- S5.1d RED tests: enrichment snapshot (v4.2.1 §2.4) ---
+
+    def test_enrichment_snapshot_is_copy_only_and_equal_to_input(self):
+        """RED: enrichment must copy the evaluation into an immutable snapshot."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+        from src.learning_loop.enrichment import build_enriched_utility_evaluation
+
+        evaluation = evaluate_experiment_bundle(self._valid_bundle())
+        enriched = build_enriched_utility_evaluation(evaluation)
+        self.assertEqual(enriched["source_evaluation_id"], evaluation["evaluation_id"])
+        self.assertEqual(enriched["source_evaluation_snapshot"], evaluation)
+
+        evaluation["validation_verdict"] = "tampered-after-enrichment"
+        self.assertNotEqual(enriched["source_evaluation_snapshot"], evaluation)
+
+    def test_enrichment_snapshot_canonical_form_ignores_key_order(self):
+        """RED: key insertion order must not affect the canonical snapshot."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+        from src.learning_loop.enrichment import build_enriched_utility_evaluation
+
+        evaluation = evaluate_experiment_bundle(self._valid_bundle())
+        reordered = {key: evaluation[key] for key in sorted(evaluation, reverse=True)}
+        first = build_enriched_utility_evaluation(evaluation)
+        second = build_enriched_utility_evaluation(reordered)
+        canonical = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":"))
+        self.assertEqual(
+            canonical(first["source_evaluation_snapshot"]),
+            canonical(second["source_evaluation_snapshot"]),
+        )
+
+    def test_enrichment_rejects_non_finite_values(self):
+        """RED: NaN/Infinity anywhere in the evaluation must be rejected."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+        from src.learning_loop.enrichment import build_enriched_utility_evaluation
+
+        evaluation = evaluate_experiment_bundle(self._valid_bundle())
+        evaluation["utility"]["pack_utility_delta"] = float("nan")
+        with self.assertRaises(ValueError):
+            build_enriched_utility_evaluation(evaluation)
+
+    def test_enrichment_rejects_input_without_identity(self):
+        """RED: enrichment requires a formal v2 evaluation with evaluation_id."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+        from src.learning_loop.enrichment import build_enriched_utility_evaluation
+
+        evaluation = evaluate_experiment_bundle(self._valid_bundle())
+        del evaluation["evaluation_id"]
+        with self.assertRaises(ValueError):
+            build_enriched_utility_evaluation(evaluation)
+
+    def test_enrichment_adds_no_governance_fields(self):
+        """RED: enriched artifact must stay free of governance vocabulary."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+        from src.learning_loop.enrichment import build_enriched_utility_evaluation
+
+        evaluation = evaluate_experiment_bundle(self._valid_bundle())
+        enriched = build_enriched_utility_evaluation(evaluation)
+        serialized = json.dumps(enriched).casefold()
+        for forbidden in ("trust", "ranking", "weight", "per_memory_utility", "recommendation"):
+            self.assertNotIn(forbidden, serialized, f"'{forbidden}' must not appear in enrichment")
+
     # --- S5.1b RED tests: adapter integrity (v4.2.1 §2.2) ---
 
     def test_bundle_rejects_missing_task_id(self):
