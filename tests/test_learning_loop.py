@@ -754,6 +754,7 @@ class LearningLoopTests(unittest.TestCase):
         """Return a minimal valid experiment bundle for S3.5 tests."""
         bundle = {
             "experiment": {
+                "task_id": "task-1",
                 "without_memory_run_id": "run-a",
                 "with_memory_run_id": "run-b",
             },
@@ -768,6 +769,7 @@ class LearningLoopTests(unittest.TestCase):
                 "used_memory_ids": ["memory-1"],
             },
             "comparison": {
+                "task_id": "task-1",
                 "first_run_id": "run-a",
                 "second_run_id": "run-b",
                 "first_score": 0.2,
@@ -879,3 +881,94 @@ class LearningLoopTests(unittest.TestCase):
         serialized = json.dumps(result).casefold()
         for forbidden in ("trust", "ranking", "weight", "per_memory_utility", "recommendation"):
             self.assertNotIn(forbidden, serialized, f"'{forbidden}' must not appear in evaluation")
+
+    # --- S5.1b RED tests: adapter integrity (v4.2.1 §2.2) ---
+
+    def test_bundle_rejects_missing_task_id(self):
+        """RED: experiment.task_id must be a non-empty string."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle, EvaluationInputError
+
+        bundle = self._valid_bundle()
+        del bundle["experiment"]["task_id"]
+        with self.assertRaises(EvaluationInputError):
+            evaluate_experiment_bundle(bundle)
+
+    def test_bundle_rejects_empty_task_id(self):
+        """RED: empty experiment.task_id must be rejected."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle, EvaluationInputError
+
+        bundle = self._valid_bundle()
+        bundle["experiment"]["task_id"] = ""
+        with self.assertRaises(EvaluationInputError):
+            evaluate_experiment_bundle(bundle)
+
+    def test_bundle_rejects_task_id_mismatch(self):
+        """RED: experiment.task_id must equal comparison.task_id."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle, EvaluationInputError
+
+        bundle = self._valid_bundle()
+        bundle["comparison"]["task_id"] = "task-other"
+        with self.assertRaises(EvaluationInputError):
+            evaluate_experiment_bundle(bundle)
+
+    def test_bundle_rejects_without_outcome_run_id_mismatch(self):
+        """RED: without_memory_outcome.run_id must equal comparison.first_run_id."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle, EvaluationInputError
+
+        bundle = self._valid_bundle()
+        bundle["without_memory_outcome"]["run_id"] = "run-x"
+        with self.assertRaises(EvaluationInputError):
+            evaluate_experiment_bundle(bundle)
+
+    def test_bundle_rejects_with_outcome_run_id_mismatch(self):
+        """RED: with_memory_outcome.run_id must equal comparison.second_run_id."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle, EvaluationInputError
+
+        bundle = self._valid_bundle()
+        bundle["with_memory_outcome"]["run_id"] = "run-x"
+        with self.assertRaises(EvaluationInputError):
+            evaluate_experiment_bundle(bundle)
+
+    def test_bundle_rejects_missing_outcome_score(self):
+        """RED: a missing outcome score must raise even when delta looks consistent."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle, EvaluationInputError
+
+        bundle = self._valid_bundle()
+        del bundle["without_memory_outcome"]["score"]
+        bundle["comparison"]["first_score"] = 0.0
+        bundle["comparison"]["score_delta"] = 0.5
+        with self.assertRaises(EvaluationInputError):
+            evaluate_experiment_bundle(bundle)
+
+    def test_bundle_rejects_non_finite_score(self):
+        """RED: NaN/Infinity scores must be rejected, not slip through delta math."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle, EvaluationInputError
+
+        for bad in (float("nan"), float("inf")):
+            bundle = self._valid_bundle()
+            bundle["with_memory_outcome"]["score"] = bad
+            bundle["comparison"]["second_score"] = bad
+            bundle["comparison"]["score_delta"] = bad
+            with self.subTest(bad=bad), self.assertRaises(EvaluationInputError):
+                evaluate_experiment_bundle(bundle)
+
+    def test_bundle_rejects_bool_score(self):
+        """RED: bool is not a valid score even though it is an int subtype."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle, EvaluationInputError
+
+        bundle = self._valid_bundle()
+        bundle["without_memory_outcome"]["score"] = False
+        bundle["comparison"]["first_score"] = False
+        bundle["comparison"]["score_delta"] = 0.5
+        with self.assertRaises(EvaluationInputError):
+            evaluate_experiment_bundle(bundle)
+
+    def test_bundle_rejects_comparison_score_tampering(self):
+        """RED: comparison first/second_score must equal the outcome scores."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle, EvaluationInputError
+
+        bundle = self._valid_bundle()
+        bundle["comparison"]["first_score"] = 0.4
+        bundle["comparison"]["second_score"] = 0.7
+        with self.assertRaises(EvaluationInputError):
+            evaluate_experiment_bundle(bundle)
