@@ -637,27 +637,32 @@ class LearningLoop:
             raise ValueError("require_nonempty_exclusion_evidence must be a boolean")
         first_run = self._load_run(first_run_id)
         second = self._load_run(second_run_id)
-        if first_run["task_id"] == second["task_id"]:
-            first_evidence = _read_json(self._artifact(first_run_id, "evidence.json"))
-            second_evidence = _read_json(self._artifact(second_run_id, "evidence.json"))
-            first_hashes = {item["sha256"] for item in first_evidence.get("inputs", [])}
-            second_hashes = {item["sha256"] for item in second_evidence.get("inputs", [])}
-            if first_hashes != second_hashes:
-                raise ValueError("compared runs have different input content")
-            first_task = first_run["task"]
-            second_task = second["task"]
-            for field in ("workspace", "project", "context_limit"):
-                if first_task.get(field) != second_task.get(field):
-                    raise ValueError(
-                        f"compared runs have different context experiment boundary: {field}"
-                    )
-            first_mc = first_task.get("memory_condition", "with_memory")
-            second_mc = second_task.get("memory_condition", "with_memory")
-            if first_mc == second_mc:
+        if first_run["task_id"] != second["task_id"]:
+            raise ValueError(
+                "compared runs have different task_id: "
+                f"{first_run['task_id']!r} vs {second['task_id']!r}"
+            )
+        task_id = first_run["task_id"]
+        first_evidence = _read_json(self._artifact(first_run_id, "evidence.json"))
+        second_evidence = _read_json(self._artifact(second_run_id, "evidence.json"))
+        first_hashes = {item["sha256"] for item in first_evidence.get("inputs", [])}
+        second_hashes = {item["sha256"] for item in second_evidence.get("inputs", [])}
+        if first_hashes != second_hashes:
+            raise ValueError("compared runs have different input content")
+        first_task = first_run["task"]
+        second_task = second["task"]
+        for field in ("workspace", "project", "context_limit"):
+            if first_task.get(field) != second_task.get(field):
                 raise ValueError(
-                    "compared runs have the same memory_condition: "
-                    f"{first_mc}; experiment requires different memory_condition"
+                    f"compared runs have different context experiment boundary: {field}"
                 )
+        first_mc = first_task.get("memory_condition", "with_memory")
+        second_mc = second_task.get("memory_condition", "with_memory")
+        if first_mc == second_mc:
+            raise ValueError(
+                "compared runs have the same memory_condition: "
+                f"{first_mc}; experiment requires different memory_condition"
+            )
         first_outcome = _read_json(self._artifact(first_run_id, "outcome.json"))
         second_outcome = _read_json(self._artifact(second_run_id, "outcome.json"))
         second_context = _read_json(self._artifact(second_run_id, "context.json"))
@@ -726,6 +731,7 @@ class LearningLoop:
         passed = all(checks.values())
         comparison = {
             "schema_version": 1,
+            "task_id": task_id,
             "first_run_id": first_run_id,
             "second_run_id": second_run_id,
             "first_score": first_outcome["score"],

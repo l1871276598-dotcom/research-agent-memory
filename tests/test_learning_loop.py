@@ -156,14 +156,19 @@ class LearningLoopTests(unittest.TestCase):
         backend = ImprovingBackend()
         loop = LearningLoop(self.data.name, self.state.name, self.work.name, backend)
 
-        first = loop.execute(task("run-one", "module_one.py"))
+        def first_task():
+            t = task("run-one", "module_one.py")
+            t["memory_condition"] = "without_memory"
+            return t
+
+        first = loop.execute(first_task())
         self.assertEqual(first["state"], "review_pending")
         self.assertEqual(first["score"], 1 / 3)
         self.assertEqual(len(first["candidate_ids"]), 2)
         first_run_path = Path(first["artifacts"]["run.json"])
         first_run_bytes = first_run_path.read_bytes()
 
-        pending_replay = loop.execute(task("run-one", "module_one.py"))
+        pending_replay = loop.execute(first_task())
         self.assertEqual(pending_replay["candidate_ids"], first["candidate_ids"])
         self.assertEqual(first_run_path.read_bytes(), first_run_bytes)
         self.assertEqual(backend.calls, 1)
@@ -194,9 +199,11 @@ class LearningLoopTests(unittest.TestCase):
 
         second_task = task(
             "run-two",
-            "module_two.py",
+            "module_one.py",
             query="fail-closed idempotency recovery module audit",
         )
+        second_task["task_id"] = "audit-run-one"
+        second_task["memory_condition"] = "with_memory"
         second_task["baseline_run_id"] = "run-one"
         second = loop.execute(second_task)
         self.assertEqual(second["state"], "completed")
@@ -219,7 +226,7 @@ class LearningLoopTests(unittest.TestCase):
         self.assertEqual(comparison["rejected_in_context"], [])
         self.assertEqual(loop.status("run-two")["state"], "verified")
 
-        replay = loop.execute(task("run-one", "module_one.py"))
+        replay = loop.execute(first_task())
         self.assertEqual(replay["candidate_ids"], first["candidate_ids"])
         self.assertEqual(backend.calls, 2)
 
@@ -234,7 +241,9 @@ class LearningLoopTests(unittest.TestCase):
     def test_nonempty_rejected_and_restricted_matches_are_excluded(self):
         backend = ImprovingBackend()
         loop = LearningLoop(self.data.name, self.state.name, self.work.name, backend)
-        first = loop.execute(task("adversarial-one", "module_one.py", workspace="work"))
+        first_task = task("adversarial-one", "module_one.py", workspace="work")
+        first_task["memory_condition"] = "without_memory"
+        first = loop.execute(first_task)
         accepted_id, rejected_id = first["candidate_ids"]
         loop.review("adversarial-one", accepted_id, "accept")
         loop.review("adversarial-one", rejected_id, "reject")
@@ -263,10 +272,12 @@ class LearningLoopTests(unittest.TestCase):
 
         second_task = task(
             "adversarial-two",
-            "module_two.py",
+            "module_one.py",
             workspace="work",
             query="fail-closed idempotency recovery module audit",
         )
+        second_task["task_id"] = "audit-adversarial-one"
+        second_task["memory_condition"] = "with_memory"
         second_task["baseline_run_id"] = "adversarial-one"
         second = loop.execute(second_task)
         context = json.loads(
@@ -524,6 +535,46 @@ class LearningLoopTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             loop.compare("mc-pair-a", "mc-pair-b")
+
+    # --- S5.1a RED tests: comparison lineage hardening ---
+
+    def test_compare_rejects_different_task_id(self):
+        """RED: compare() must reject runs with different task_id outright."""
+        backend = ImprovingBackend()
+        loop = LearningLoop(self.data.name, self.state.name, self.work.name, backend)
+
+        t_a = task("lineage-task-a", "module_one.py")
+        t_a["memory_condition"] = "without_memory"
+        first = loop.execute(t_a)
+        for cid in first["candidate_ids"]:
+            loop.review("lineage-task-a", cid, "accept")
+
+        t_b = task("lineage-task-b", "module_one.py")
+        t_b["memory_condition"] = "with_memory"
+        loop.execute(t_b)
+
+        with self.assertRaisesRegex(ValueError, "task"):
+            loop.compare("lineage-task-a", "lineage-task-b")
+
+    def test_comparison_carries_validated_task_id(self):
+        """RED: a valid experiment pair must produce a comparison with task_id."""
+        backend = ImprovingBackend()
+        loop = LearningLoop(self.data.name, self.state.name, self.work.name, backend)
+
+        t_a = task("lineage-pair-a", "module_one.py")
+        t_a["memory_condition"] = "without_memory"
+        first = loop.execute(t_a)
+        for cid in first["candidate_ids"]:
+            loop.review("lineage-pair-a", cid, "accept")
+
+        t_b = task("lineage-pair-b", "module_one.py")
+        t_b["task_id"] = t_a["task_id"]
+        t_b["memory_condition"] = "with_memory"
+        t_b["baseline_run_id"] = "lineage-pair-a"
+        loop.execute(t_b)
+
+        comparison = loop.compare("lineage-pair-a", "lineage-pair-b")
+        self.assertEqual(comparison["task_id"], t_a["task_id"])
 
     # --- S3.2 RED tests: evidence composition ---
 

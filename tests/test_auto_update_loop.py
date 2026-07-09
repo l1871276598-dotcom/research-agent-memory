@@ -83,6 +83,7 @@ class AutoUpdateLoopTests(unittest.TestCase):
         backend = Backend()
         loop, coordinator = self.build(backend)
         baseline = make_task("auto-one", "one.py")
+        baseline["memory_condition"] = "without_memory"
         pending = coordinator.advance(baseline)
         self.assertEqual(pending["state"], "awaiting_review")
         self.assertEqual([x["state"] for x in pending["state_history"]], [
@@ -93,7 +94,9 @@ class AutoUpdateLoopTests(unittest.TestCase):
         accepted, rejected = pending["candidate_ids"]
         loop.review("auto-one", accepted, "accept")
         loop.review("auto-one", rejected, "reject")
-        verification = make_task("auto-two", "two.py", "auto-one")
+        verification = make_task("auto-two", "one.py", "auto-one")
+        verification["task_id"] = "auto-one"
+        verification["memory_condition"] = "with_memory"
         result = coordinator.advance(baseline, verification_task=verification)
         self.assertEqual(result["state"], "verified")
         self.assertEqual(result["active_memory_ids"], [accepted])
@@ -142,11 +145,14 @@ class AutoUpdateLoopTests(unittest.TestCase):
         backend = Backend(fail_on=2)
         loop, coordinator = self.build(backend)
         baseline = make_task("verify-one", "one.py")
+        baseline["memory_condition"] = "without_memory"
         pending = coordinator.advance(baseline)
         accepted, rejected = pending["candidate_ids"]
         loop.review("verify-one", accepted, "accept")
         loop.review("verify-one", rejected, "reject")
-        verification = make_task("verify-two", "two.py", "verify-one")
+        verification = make_task("verify-two", "one.py", "verify-one")
+        verification["task_id"] = "verify-one"
+        verification["memory_condition"] = "with_memory"
         with self.assertRaisesRegex(RuntimeError, "interruption"):
             coordinator.advance(baseline, verification_task=verification)
         self.assertEqual(coordinator.status("verify-one")["state"], "verification_scheduled")
