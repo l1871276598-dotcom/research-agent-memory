@@ -3,6 +3,44 @@
 Pure functions only. No I/O, no LLM, no mutation.
 """
 
+import hashlib
+import json
+
+# Frozen identity whitelist (Phase 5 v4.2.1 §2.3): only the semantic facts
+# that determine the evaluation enter the ID. Derived fields (utility,
+# sufficiency, verdict) and adapter metadata are excluded. Any future
+# threshold that affects verdict/sufficiency MUST be added here in the
+# same change that introduces it.
+_IDENTITY_THRESHOLD_KEYS = ("utility_delta_min", "verified_ratio_min", "defined_before_run")
+
+
+def _evaluation_identity(experiment, utility, summary, thresholds):
+    payload = {
+        "schema_version": 2,
+        "experiment": {
+            "task_id": experiment.get("task_id", ""),
+            "without_memory_run_id": experiment.get("without_memory_run_id", ""),
+            "with_memory_run_id": experiment.get("with_memory_run_id", ""),
+        },
+        "comparison": {
+            "first_score": utility["first_score"],
+            "second_score": utility["second_score"],
+            "score_delta": utility["pack_utility_delta"],
+        },
+        "evidence_composition": {
+            "verified": summary.get("verified", 0),
+            "unknown": summary.get("unknown", 0),
+            "contradicted": summary.get("contradicted", 0),
+        },
+        "thresholds": {
+            key: thresholds.get(key) for key in _IDENTITY_THRESHOLD_KEYS
+        },
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    return "eval_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
 
 def classify_memory_record(record):
     """Classify a memory record into a correctness stratum.
@@ -135,8 +173,10 @@ def build_utility_evaluation(experiment, comparison, composition, thresholds):
     )
     summary = composition.get("summary", {})
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "evaluation_id": _evaluation_identity(experiment, utility, summary, thresholds),
         "experiment": {
+            "task_id": experiment.get("task_id", ""),
             "with_memory_run_id": experiment.get("with_memory_run_id", ""),
             "without_memory_run_id": experiment.get("without_memory_run_id", ""),
         },

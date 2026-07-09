@@ -882,6 +882,98 @@ class LearningLoopTests(unittest.TestCase):
         for forbidden in ("trust", "ranking", "weight", "per_memory_utility", "recommendation"):
             self.assertNotIn(forbidden, serialized, f"'{forbidden}' must not appear in evaluation")
 
+    # --- S5.1c RED tests: deterministic evaluation identity (v4.2.1 §2.3) ---
+
+    def test_utility_evaluation_is_schema_v2_with_evaluation_id(self):
+        """RED: producer must emit schema v2 with eval_<sha256> and experiment.task_id."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+
+        result = evaluate_experiment_bundle(self._valid_bundle())
+        self.assertEqual(result["schema_version"], 2)
+        self.assertEqual(result["experiment"]["task_id"], "task-1")
+        self.assertRegex(result["evaluation_id"], r"^eval_[0-9a-f]{64}$")
+
+    def test_evaluation_id_is_deterministic(self):
+        """RED: the same semantic bundle must always produce the same ID."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+
+        first = evaluate_experiment_bundle(self._valid_bundle())
+        second = evaluate_experiment_bundle(self._valid_bundle())
+        self.assertEqual(first["evaluation_id"], second["evaluation_id"])
+
+    def test_evaluation_id_changes_with_identity_fields(self):
+        """RED: changing any identity field must produce a new ID."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+
+        base = evaluate_experiment_bundle(self._valid_bundle())["evaluation_id"]
+
+        tampered = self._valid_bundle()
+        tampered["experiment"]["task_id"] = "task-2"
+        tampered["comparison"]["task_id"] = "task-2"
+        self.assertNotEqual(
+            evaluate_experiment_bundle(tampered)["evaluation_id"], base
+        )
+
+        rewired = self._valid_bundle()
+        rewired["experiment"]["without_memory_run_id"] = "run-c"
+        rewired["comparison"]["first_run_id"] = "run-c"
+        rewired["without_memory_outcome"]["run_id"] = "run-c"
+        self.assertNotEqual(
+            evaluate_experiment_bundle(rewired)["evaluation_id"], base
+        )
+
+        rescored = self._valid_bundle()
+        rescored["without_memory_outcome"]["score"] = 0.1
+        rescored["comparison"]["first_score"] = 0.1
+        rescored["comparison"]["score_delta"] = 0.4
+        self.assertNotEqual(
+            evaluate_experiment_bundle(rescored)["evaluation_id"], base
+        )
+
+        rethresholded = self._valid_bundle()
+        rethresholded["thresholds"]["utility_delta_min"] = 0.2
+        self.assertNotEqual(
+            evaluate_experiment_bundle(rethresholded)["evaluation_id"], base
+        )
+
+        recomposed = self._valid_bundle()
+        recomposed["memory_records"].append(
+            {
+                "id": "memory-2",
+                "confidence": "inferred",
+                "status": "active",
+                "superseded_by": [],
+            }
+        )
+        self.assertNotEqual(
+            evaluate_experiment_bundle(recomposed)["evaluation_id"], base
+        )
+
+    def test_evaluation_id_ignores_non_identity_variation(self):
+        """RED: same aggregate composition and extra threshold keys keep the ID."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+
+        base = evaluate_experiment_bundle(self._valid_bundle())["evaluation_id"]
+
+        renamed_memory = self._valid_bundle()
+        renamed_memory["memory_records"] = [
+            {
+                "id": "memory-other",
+                "confidence": "confirmed",
+                "status": "active",
+                "superseded_by": [],
+            },
+        ]
+        self.assertEqual(
+            evaluate_experiment_bundle(renamed_memory)["evaluation_id"], base
+        )
+
+        extra_threshold = self._valid_bundle()
+        extra_threshold["thresholds"]["future_unpromoted_key"] = 42
+        self.assertEqual(
+            evaluate_experiment_bundle(extra_threshold)["evaluation_id"], base
+        )
+
     # --- S5.1b RED tests: adapter integrity (v4.2.1 §2.2) ---
 
     def test_bundle_rejects_missing_task_id(self):
