@@ -141,6 +141,10 @@ def validate_task(task):
     limit = task.get("context_limit", 8000)
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
         raise ValueError("context_limit must be a positive integer")
+    _MEMORY_CONDITIONS = {"with_memory", "without_memory"}
+    mc = task.get("memory_condition")
+    if mc is not None and mc not in _MEMORY_CONDITIONS:
+        raise ValueError("memory_condition must be with_memory or without_memory")
     baseline = task.get("baseline_run_id")
     if baseline is not None:
         _text(baseline, "baseline_run_id")
@@ -239,6 +243,18 @@ class LearningLoop:
         return "\n\n".join(rendered), evidence
 
     def _build_context(self, task):
+        if task.get("memory_condition") == "without_memory":
+            return {
+                "text": "",
+                "sources": [],
+                "limit": task.get("context_limit", 8000),
+                "used": 0,
+                "query": task["query"],
+                "workspace": task["workspace"],
+                "project": task.get("project"),
+                "source_records": [],
+                "restricted_source_count": 0,
+            }
         context = self.context_builder.build(
             task["query"],
             limit=task.get("context_limit", 8000),
@@ -619,8 +635,29 @@ class LearningLoop:
             raise ValueError("minimum_improvement must be a non-negative number")
         if not isinstance(require_nonempty_exclusion_evidence, bool):
             raise ValueError("require_nonempty_exclusion_evidence must be a boolean")
-        self._load_run(first_run_id)
+        first_run = self._load_run(first_run_id)
         second = self._load_run(second_run_id)
+        if first_run["task_id"] == second["task_id"]:
+            first_evidence = _read_json(self._artifact(first_run_id, "evidence.json"))
+            second_evidence = _read_json(self._artifact(second_run_id, "evidence.json"))
+            first_hashes = {item["sha256"] for item in first_evidence.get("inputs", [])}
+            second_hashes = {item["sha256"] for item in second_evidence.get("inputs", [])}
+            if first_hashes != second_hashes:
+                raise ValueError("compared runs have different input content")
+            first_task = first_run["task"]
+            second_task = second["task"]
+            for field in ("workspace", "project", "context_limit"):
+                if first_task.get(field) != second_task.get(field):
+                    raise ValueError(
+                        f"compared runs have different context experiment boundary: {field}"
+                    )
+            first_mc = first_task.get("memory_condition", "with_memory")
+            second_mc = second_task.get("memory_condition", "with_memory")
+            if first_mc == second_mc:
+                raise ValueError(
+                    "compared runs have the same memory_condition: "
+                    f"{first_mc}; experiment requires different memory_condition"
+                )
         first_outcome = _read_json(self._artifact(first_run_id, "outcome.json"))
         second_outcome = _read_json(self._artifact(second_run_id, "outcome.json"))
         second_context = _read_json(self._artifact(second_run_id, "context.json"))
