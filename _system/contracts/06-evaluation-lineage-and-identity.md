@@ -1,9 +1,10 @@
 # Phase 5 Contract — Evaluation Lineage & Identity
 
-**Version**: 0.1.0
+**Version**: 0.2.0
 **Status**: frozen
 **Frozen**: 2026-07-10
-**Source**: Phase 5 Design Draft v4.2.1 (Lineage Hardening Amendment)
+**Source**: Phase 5 Design Draft v4.2.1 (Lineage Hardening Amendment); amended by
+Phase 5 Design Baseline v4.3 amendments A1/A2/A3 (approved 2026-07-10)
 
 ---
 
@@ -61,6 +62,10 @@ Pre-existing memory-direction gate is unchanged: `without` run must have empty
 - Single producer: `build_utility_evaluation()` (evidence.py). The producer
   itself rejects missing/mismatched `experiment.task_id` / `comparison.task_id`
   — lineage holds at the producer boundary, not only behind the adapter.
+- Count integrity (A2): the producer requires all four composition counts
+  (`total`, `verified`, `unknown`, `contradicted`) to be non-negative integers
+  with `total == verified + unknown + contradicted`. This keeps every derived
+  field (ratio, sufficiency, verdict) fully determined by identity facts.
 - Output: `schema_version: 2`, `evaluation_id`, `experiment.task_id`.
 - `evaluation_id = "eval_" + SHA-256(canonical JSON of identity payload)`,
   full digest, never truncated.
@@ -126,8 +131,13 @@ formal v2 evaluation → enriched dict with **exactly two fields**:
 - `source_evaluation_snapshot` is a canonical object copy equal to the input.
   Copy-only: no recomputation, no dropping, no addition of Phase 4 facts.
 - Rejects non-v2 input, missing `evaluation_id`, NaN/Infinity values.
-- **No `source_evaluation_hash`**: not authorized by v4.2.1 §2.4. Adding it
-  requires amending the controlling design first.
+- **No `source_evaluation_hash`**: the enrichment artifact itself never carries
+  a hash field. A1 (approved 2026-07-10) authorizes Phase 5 **consumers** to
+  compute `snap_<sha256>` over the canonical `source_evaluation_snapshot` as an
+  instance anchor recorded in downstream artifacts (reflection, queue request)
+  and directory paths — because `evaluation_id` deliberately excludes adapter
+  metadata and unpromoted thresholds and therefore does not uniquely determine
+  the snapshot instance. The enrichment artifact stays exactly two fields.
 - No I/O, no file naming, no on-disk immutability enforcement at this layer.
 
 ## 5. Non-Goals (frozen)
@@ -136,8 +146,10 @@ formal v2 evaluation → enriched dict with **exactly two fields**:
 - No persistence of Phase 4 runtime internals; the adapter performs no I/O.
 - No change to utility formula, evidence composition, validation verdict, or
   Memory lifecycle.
-- No automated reflection, queue consumption, rule learning, or
-  promotion/deletion.
+- No autonomous/self-triggered reflection, no LLM or generative claim
+  production, and no automated queue consumption (A3 clarification: an
+  explicitly invoked, purely deterministic reflection builder — the v4.1
+  frozen pipeline — is permitted). No rule learning or promotion/deletion.
 - No trust / ranking / recommendation / auto-governance fields in any
   comparison, evaluation, or enrichment artifact (cross-cutting invariant).
 
@@ -145,3 +157,10 @@ formal v2 evaluation → enriched dict with **exactly two fields**:
 
 Phase 5 Human Review Queue item identity uses `review_queue_item_id`.
 Phase 3's `review_id` (conversation review session) is untouched.
+
+## 7. Amendment History
+
+| Version | Date | Change |
+|---|---|---|
+| 0.1.0 | 2026-07-10 | Initial freeze from v4.2.1 + S5.1 converged contract |
+| 0.2.0 | 2026-07-10 | Baseline v4.3 amendments: A1 consumer-side snapshot instance digest (`snap_`) authorized (§4); A2 producer count-integrity gate (§3, implemented in commit 83cd20c); A3 "automated reflection" non-goal clarified to autonomous/generative/queue-consuming (§5) |
