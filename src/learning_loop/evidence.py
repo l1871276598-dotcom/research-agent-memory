@@ -174,6 +174,20 @@ def build_utility_evaluation(experiment, comparison, composition, thresholds):
             f"comparison.task_id {comparison_task_id!r}"
         )
 
+    summary_input = composition.get("summary", {})
+    counts = {}
+    for field in ("total", "verified", "unknown", "contradicted"):
+        value = summary_input.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"composition summary.{field} must be a non-negative integer"
+            )
+        counts[field] = value
+    if counts["total"] != counts["verified"] + counts["unknown"] + counts["contradicted"]:
+        raise ValueError(
+            "composition summary.total must equal verified + unknown + contradicted"
+        )
+
     utility = evaluate_pack_utility(comparison)
     sufficiency = check_evidence_sufficiency(
         composition, thresholds.get("verified_ratio_min", 0.0)

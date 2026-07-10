@@ -1035,6 +1035,30 @@ class LearningLoopTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "input"):
             loop.compare("path-iso-a", "path-iso-b")
 
+    # --- S5.1e RED: composition total integrity (baseline v4.3 amendment A2) ---
+
+    def test_build_utility_evaluation_rejects_inconsistent_total(self):
+        """RED: summary.total must exist and equal verified+unknown+contradicted."""
+        from src.learning_loop.evidence import build_utility_evaluation
+
+        def call(summary):
+            return build_utility_evaluation(
+                experiment={"task_id": "task-1", "with_memory_run_id": "run-b", "without_memory_run_id": "run-a"},
+                comparison={"task_id": "task-1", "first_score": 0.2, "second_score": 0.5, "score_delta": 0.3},
+                composition={"summary": summary},
+                thresholds={"utility_delta_min": 0.1, "verified_ratio_min": 0.5, "defined_before_run": True},
+            )
+
+        for label, summary in (
+            ("missing_total", {"verified": 1, "unknown": 0, "contradicted": 0}),
+            ("mismatched_total", {"total": 5, "verified": 1, "unknown": 0, "contradicted": 0}),
+            ("negative_total", {"total": -1, "verified": 0, "unknown": 0, "contradicted": 0}),
+            ("bool_total", {"total": True, "verified": 1, "unknown": 0, "contradicted": 0}),
+            ("negative_count", {"total": 0, "verified": 1, "unknown": 0, "contradicted": -1}),
+        ):
+            with self.subTest(case=label), self.assertRaises(ValueError):
+                call(summary)
+
     # --- S5.1 review-fix hardening: contract locks ---
 
     def test_adapter_rejects_full_score_tamper_matrix(self):
