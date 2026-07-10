@@ -11,6 +11,8 @@ import json
 import math
 from collections import namedtuple
 
+from .reflection_builder import ReflectionInputError, build_reflection
+
 
 _FSMRow = namedtuple("_FSMRow", ("case_id", "verdict", "contradicted_gt0", "unknown_gt0", "status"))
 
@@ -115,23 +117,26 @@ def _fsm_lookup(reflection, enriched):
     matched_case = matches[0].case_id
     eligibility_status = matches[0].status
 
-    # reasons — from verified facts, NOT from matched_case
+    # reasons — from verified facts, NOT from matched_case, with frozen appendix B literals
     reasons = []
     # verdict reasons
     if verdict in ("A", "B"):
-        reasons.append(f"R-{verdict}")
+        if verdict == "A":
+            reasons.append("verdict A: pack_utility_delta exceeds the frozen utility_delta_min; disposition review is available.")
+        else:
+            reasons.append("verdict B: pack_utility_delta does not exceed the frozen utility_delta_min; disposition review is available.")
     else:
         source_snap = enriched["source_evaluation_snapshot"]
         frozen = source_snap["thresholds"]["defined_before_run"]
         status = outcome["evidence_sufficiency"]["status"]
         if not frozen:
-            reasons.append("R-C1")
+            reasons.append("verdict C: thresholds were not frozen before the run (defined_before_run is false).")
         if status == "insufficient":
-            reasons.append("R-C2")
+            reasons.append("verdict C: evidence sufficiency is insufficient.")
     if unknown_gt0:
-        reasons.append("R-U")
+        reasons.append(f"unknown records present: unknown={_canonical_json(comp['unknown'])}.")
     if contradicted_gt0:
-        reasons.append("R-X")
+        reasons.append(f"contradicted records present: contradicted={_canonical_json(comp['contradicted'])}.")
 
     source_reflection_id = reflection["reflection_id"]
     eligibility_payload = {
@@ -197,8 +202,6 @@ def _validate_source(enriched):
 
     Returns the expected reflection (canonical, trusted) for upstream comparison.
     """
-    from .reflection_builder import ReflectionInputError, build_reflection
-
     try:
         return build_reflection(enriched)
     except ReflectionInputError:
@@ -256,6 +259,10 @@ def _validate_preconditions(reflection, enriched):
 
     # P5 — A semantics
     delta = outcome["pack_utility_delta"]
+    if isinstance(delta, bool) or not isinstance(delta, (int, float)):
+        raise EligibilityInputError(gate="preconditions", check="P5", message=f"delta is not a finite number: {delta!r}")
+    if not math.isfinite(delta):
+        raise EligibilityInputError(gate="preconditions", check="P5", message=f"delta must be finite: {delta!r}")
     delta_min = source_snap["thresholds"]["utility_delta_min"]
     if verdict == "A" and not (delta > delta_min):
         raise EligibilityInputError(gate="preconditions", check="P5", message=f"A requires delta>{delta_min}")

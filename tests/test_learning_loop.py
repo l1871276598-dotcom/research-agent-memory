@@ -1751,11 +1751,6 @@ print("EVENTS:" + ",".join(events))
         from src.learning_loop.evaluation import evaluate_experiment_bundle, EvaluationInputError
 
         bundle = self._valid_bundle()
-    def test_bundle_rejects_comparison_score_tampering(self):
-        """RED: comparison first/second_score must equal the outcome scores."""
-        from src.learning_loop.evaluation import evaluate_experiment_bundle, EvaluationInputError
-
-        bundle = self._valid_bundle()
         bundle["comparison"]["first_score"] = 0.4
         bundle["comparison"]["second_score"] = 0.7
         with self.assertRaises(EvaluationInputError):
@@ -2074,6 +2069,64 @@ class S53EligibilityTests(unittest.TestCase):
             },
         }
 
+    def _full_producer_enriched(self, **bundle_overrides):
+        """Return enriched built via real Phase 4 chains: evaluation -> enrichment."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+        from src.learning_loop.enrichment import build_enriched_utility_evaluation
+        bundle = self._valid_bundle(**bundle_overrides)
+        return build_enriched_utility_evaluation(evaluate_experiment_bundle(bundle))
+
+    def _full_producer_eligibility(self, **bundle_overrides):
+        """Return eligibility artifact through full producer chain."""
+        from src.learning_loop.reflection_builder import build_reflection
+        from src.learning_loop.eligibility import build_eligibility
+        enr = self._full_producer_enriched(**bundle_overrides)
+        ref = build_reflection(enr)
+        return build_eligibility(ref, enr)
+
+    def _valid_bundle(self, **overrides):
+        """Return a minimal valid experiment bundle for S3.5 tests."""
+        bundle = {
+            "experiment": {
+                "task_id": "task-full-producer",
+                "without_memory_run_id": "run-a",
+                "with_memory_run_id": "run-b",
+            },
+            "without_memory_outcome": {
+                "run_id": "run-a",
+                "score": 0.2,
+                "used_memory_ids": [],
+            },
+            "with_memory_outcome": {
+                "run_id": "run-b",
+                "score": 0.5,
+                "used_memory_ids": ["memory-1"],
+            },
+            "comparison": {
+                "task_id": "task-full-producer",
+                "first_run_id": "run-a",
+                "second_run_id": "run-b",
+                "first_score": 0.2,
+                "second_score": 0.5,
+                "score_delta": 0.3,
+            },
+            "memory_records": [
+                {
+                    "id": "memory-1",
+                    "confidence": "confirmed",
+                    "status": "active",
+                    "superseded_by": [],
+                },
+            ],
+            "thresholds": {
+                "utility_delta_min": 0.1,
+                "verified_ratio_min": 0.5,
+                "defined_before_run": True,
+            },
+        }
+        bundle.update(overrides)
+        return bundle
+
     def test_source_tampered_schema_version(self):
         """RED-4: non-v2 schema_version -> gate=source."""
         from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
@@ -2306,6 +2359,48 @@ class S53EligibilityTests(unittest.TestCase):
         self.assertEqual(ctx.exception.gate, "preconditions")
         self.assertEqual(ctx.exception.check, "P7")
 
+    def test_preconditions_delta_bool(self):
+        """RED-5: bool delta -> gate=preconditions check=P5."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["outcome_snapshot"]["pack_utility_delta"] = True
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "preconditions")
+        self.assertEqual(ctx.exception.check, "P5")
+
+    def test_preconditions_delta_str(self):
+        """RED-5: string delta -> gate=preconditions check=P5."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["outcome_snapshot"]["pack_utility_delta"] = "0.3"
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "preconditions")
+        self.assertEqual(ctx.exception.check, "P5")
+
+    def test_preconditions_delta_nan(self):
+        """RED-5: NaN delta -> gate=preconditions check=P5."""
+        import math
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["outcome_snapshot"]["pack_utility_delta"] = math.nan
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "preconditions")
+        self.assertEqual(ctx.exception.check, "P5")
+
+    def test_preconditions_delta_inf(self):
+        """RED-5: Infinity delta -> gate=preconditions check=P5."""
+        import math
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["outcome_snapshot"]["pack_utility_delta"] = math.inf
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "preconditions")
+        self.assertEqual(ctx.exception.check, "P5")
+
     def test_preconditions_P8_task_id_mismatch(self):
         """RED-5: outcome_snapshot.task_id != source task_id -> gate=preconditions check=P8."""
         from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
@@ -2463,7 +2558,7 @@ class S53EligibilityTests(unittest.TestCase):
         self.assertEqual(result["eligibility_status"], "eligible")
 
     def test_fsm_lookup_verdict_C_matches_correct_case(self):
-        """RED-8: verdict C with contradicted=0, unknown=0 -> case_09."""
+        """RED-8: verdict C with contradicted=1, unknown=0 -> case_11."""
         from src.learning_loop.eligibility import build_eligibility
         snap = dict(self._enriched_valid_for_source()["source_evaluation_snapshot"])
         snap["evidence_composition"] = {"verified": 0, "unknown": 0, "contradicted": 1}
@@ -2481,11 +2576,13 @@ class S53EligibilityTests(unittest.TestCase):
     # --- S5.3 Task 8: RED-9 reasons ---
 
     def test_reasons_A_no_unknown_no_contradicted(self):
-        """RED-9: verdict A, no unknowns, no contradictions -> [R-A]."""
+        """RED-9: verdict A, no unknowns, no contradictions -> single verdict A reason."""
         from src.learning_loop.eligibility import build_eligibility
         ref, enr = self._valid_pair_through_gates()
         result = build_eligibility(ref, enr)
-        self.assertEqual(result["reasons"], ["R-A"])
+        self.assertEqual(result["reasons"], [
+            "verdict A: pack_utility_delta exceeds the frozen utility_delta_min; disposition review is available.",
+        ])
 
     def test_reasons_A_with_unknown(self):
         """RED-9: verdict A with unknowns -> [R-A, R-U]."""
@@ -2500,10 +2597,33 @@ class S53EligibilityTests(unittest.TestCase):
         from src.learning_loop.reflection_builder import build_reflection
         ref = build_reflection(enr)
         result = build_eligibility(ref, enr)
-        self.assertEqual(result["reasons"], ["R-A", "R-U"])
+        self.assertEqual(result["reasons"], [
+            "verdict A: pack_utility_delta exceeds the frozen utility_delta_min; disposition review is available.",
+            "unknown records present: unknown=1.",
+        ])
+
+    def test_reasons_B_with_contradicted(self):
+        """RED-9: verdict B with contradictions -> [R-B, R-X]."""
+        from src.learning_loop.eligibility import build_eligibility
+        snap = dict(self._enriched_valid_for_source()["source_evaluation_snapshot"])
+        # B requires delta<=min, sufficient, frozen. Contradicted=1, but ratio remains >=min.
+        snap["evidence_composition"] = {"verified": 6, "unknown": 0, "contradicted": 1}
+        snap["evidence_sufficiency"] = {"status": "sufficient", "verified_ratio": 6 / 7}
+        snap["validation_verdict"] = "B"
+        snap["utility"]["pack_utility_delta"] = 0.05
+        snap["memory_record_source"] = "run_snapshot"
+        snap["staleness_warning"] = False
+        enr = {"source_evaluation_id": snap["evaluation_id"], "source_evaluation_snapshot": snap}
+        from src.learning_loop.reflection_builder import build_reflection
+        ref = build_reflection(enr)
+        result = build_eligibility(ref, enr)
+        self.assertEqual(result["reasons"], [
+            "verdict B: pack_utility_delta does not exceed the frozen utility_delta_min; disposition review is available.",
+            "contradicted records present: contradicted=1.",
+        ])
 
     def test_reasons_C_both_not_frozen_and_insufficient(self):
-        """RED-9: C with both not-frozen and insufficient -> [R-C1, R-C2, ...]."""
+        """RED-9: C with both not-frozen and insufficient -> [R-C1, R-C2, R-U, R-X]."""
         from src.learning_loop.eligibility import build_eligibility
         snap = dict(self._enriched_valid_for_source()["source_evaluation_snapshot"])
         snap["evidence_composition"] = {"verified": 0, "unknown": 1, "contradicted": 1}
@@ -2517,7 +2637,12 @@ class S53EligibilityTests(unittest.TestCase):
         from src.learning_loop.reflection_builder import build_reflection
         ref = build_reflection(enr)
         result = build_eligibility(ref, enr)
-        self.assertEqual(result["reasons"], ["R-C1", "R-C2", "R-U", "R-X"])
+        self.assertEqual(result["reasons"], [
+            "verdict C: thresholds were not frozen before the run (defined_before_run is false).",
+            "verdict C: evidence sufficiency is insufficient.",
+            "unknown records present: unknown=1.",
+            "contradicted records present: contradicted=1.",
+        ])
 
     def test_reasons_C_only_not_frozen_sufficient(self):
         """RED-9: C only not-frozen, still sufficient -> [R-C1]."""
@@ -2533,7 +2658,28 @@ class S53EligibilityTests(unittest.TestCase):
         from src.learning_loop.reflection_builder import build_reflection
         ref = build_reflection(enr)
         result = build_eligibility(ref, enr)
-        self.assertEqual(result["reasons"], ["R-C1"])
+        self.assertEqual(result["reasons"], [
+            "verdict C: thresholds were not frozen before the run (defined_before_run is false).",
+        ])
+
+    def test_reasons_C_only_insufficient_frozen(self):
+        """RED-9: C only insufficient, frozen -> [R-C2]."""
+        from src.learning_loop.eligibility import build_eligibility
+        snap = dict(self._enriched_valid_for_source()["source_evaluation_snapshot"])
+        snap["evidence_composition"] = {"verified": 0, "unknown": 0, "contradicted": 0}
+        snap["evidence_sufficiency"] = {"status": "insufficient", "verified_ratio": 0.0}
+        snap["validation_verdict"] = "C"
+        snap["utility"]["pack_utility_delta"] = -0.1
+        snap["thresholds"]["defined_before_run"] = True
+        snap["memory_record_source"] = "run_snapshot"
+        snap["staleness_warning"] = False
+        enr = {"source_evaluation_id": snap["evaluation_id"], "source_evaluation_snapshot": snap}
+        from src.learning_loop.reflection_builder import build_reflection
+        ref = build_reflection(enr)
+        result = build_eligibility(ref, enr)
+        self.assertEqual(result["reasons"], [
+            "verdict C: evidence sufficiency is insufficient.",
+        ])
 
     # --- S5.3 Task 8: RED-10 eligibility ID ---
 
@@ -2727,3 +2873,140 @@ class S53EligibilityTests(unittest.TestCase):
             {"schema_version", "eligibility_id", "source_reflection_id",
              "fsm_matrix_version", "matched_case", "eligibility_status", "reasons"},
         )
+
+    # --- S5.3 cross-cutting: no-I/O audit (fresh process) ---
+
+    def test_eligibility_no_filesystem_io(self):
+        """RED-12: zero filesystem audit events on success and failure paths."""
+        import subprocess
+        import sys
+
+        script = r"""
+import json, sys
+sys.path.insert(0, ".")
+sys.path.insert(0, "src")
+
+from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+
+snapshot = {
+    "schema_version": 2,
+    "evaluation_id": "eval_" + "d" * 64,
+    "experiment": {"task_id": "t", "without_memory_run_id": "a", "with_memory_run_id": "b"},
+    "utility": {"pack_utility_delta": 0.3},
+    "evidence_composition": {"verified": 1, "unknown": 0, "contradicted": 0},
+    "thresholds": {"utility_delta_min": 0.1, "verified_ratio_min": 0.5, "defined_before_run": True},
+    "evidence_sufficiency": {"status": "sufficient", "verified_ratio": 1.0},
+    "validation_verdict": "A",
+    "memory_record_source": "run_snapshot",
+    "staleness_warning": False,
+}
+enr = {"source_evaluation_id": snapshot["evaluation_id"], "source_evaluation_snapshot": snapshot}
+
+# Build a valid reflection via the only import-time path (no audit hook yet)
+from src.learning_loop.reflection_builder import build_reflection
+ref = build_reflection(enr)
+
+events = []
+def hook(event, args):
+    if event == "open" or event.startswith("os.") or event.startswith("shutil."):
+        events.append(event)
+sys.addaudithook(hook)
+
+# Success path
+result = build_eligibility(ref, enr)
+assert "eligibility_id" in result
+
+# Shape failure
+try:
+    build_eligibility([], enr)
+except EligibilityInputError:
+    pass
+
+# Source failure
+bad_enr = {"source_evaluation_id": "x"}
+try:
+    build_eligibility(ref, bad_enr)
+except EligibilityInputError:
+    pass
+
+# Preconditions failure
+bad_ref = dict(ref)
+bad_ref["outcome_snapshot"] = dict(ref["outcome_snapshot"])
+bad_ref["outcome_snapshot"]["evidence_sufficiency"] = dict(ref["outcome_snapshot"]["evidence_sufficiency"])
+bad_ref["outcome_snapshot"]["evidence_composition"] = dict(ref["outcome_snapshot"]["evidence_composition"])
+bad_ref["outcome_snapshot"]["validation_verdict"] = "D"
+try:
+    build_eligibility(bad_ref, enr)
+except EligibilityInputError:
+    pass
+
+print("EVENTS:" + ",".join(events))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        self.assertEqual(completed.returncode, 0, f"stderr: {completed.stderr}")
+        self.assertIn("EVENTS:", completed.stdout)
+        self.assertEqual(completed.stdout.strip().split("EVENTS:")[-1], "",
+                         f"IO events detected: {completed.stdout}")
+
+    # --- S5.3 cross-cutting: full producer integration ---
+
+    def test_full_producer_A(self):
+        """RED-11: full producer chain produces verdict A artifact."""
+        result = self._full_producer_eligibility()
+        self.assertEqual(result["eligibility_status"], "eligible")
+        self.assertEqual(result["matched_case"], "case_01")
+
+    def test_full_producer_B(self):
+        """RED-11: full producer chain with lower delta produces verdict B."""
+        bundle = dict(self._valid_bundle())
+        bundle["comparison"]["score_delta"] = 0.0
+        bundle["comparison"]["first_score"] = 0.5
+        bundle["comparison"]["second_score"] = 0.5
+        bundle["without_memory_outcome"]["score"] = 0.5
+        bundle["with_memory_outcome"]["score"] = 0.5
+        bundle["thresholds"]["utility_delta_min"] = 0.1
+        result = self._full_producer_eligibility(**bundle)
+        self.assertEqual(result["eligibility_status"], "eligible")
+        self.assertEqual(result["matched_case"], "case_05")
+
+    def test_full_producer_C1_only(self):
+        """RED-11: C1-only via defined_before_run=False."""
+        bundle = dict(self._valid_bundle())
+        bundle["thresholds"]["defined_before_run"] = False
+        result = self._full_producer_eligibility(**bundle)
+        self.assertEqual(result["eligibility_status"], "ineligible")
+        # C1 only: not-frozen, but still sufficient
+        self.assertIn("thresholds were not frozen", result["reasons"][0])
+
+    def test_full_producer_C2_only(self):
+        """RED-11: C2-only via insufficient evidence."""
+        bundle = dict(self._valid_bundle())
+        bundle["memory_records"] = [
+            {"id": "m1", "confidence": "confirmed", "status": "active", "superseded_by": []},
+            {"id": "m2", "confidence": "inferred", "status": "active", "superseded_by": []},
+            {"id": "m3", "confidence": "uncertain", "status": "active", "superseded_by": []},
+        ]
+        bundle["thresholds"]["verified_ratio_min"] = 0.8
+        bundle["thresholds"]["defined_before_run"] = True
+        result = self._full_producer_eligibility(**bundle)
+        self.assertEqual(result["eligibility_status"], "ineligible")
+        self.assertIn("evidence sufficiency is insufficient", result["reasons"][0])
+
+    def test_full_producer_C1_plus_C2(self):
+        """RED-11: both C1 and C2 triggers via not-frozen + insufficient."""
+        bundle = dict(self._valid_bundle())
+        bundle["memory_records"] = [
+            {"id": "m1", "confidence": "confirmed", "status": "active", "superseded_by": []},
+            {"id": "m2", "confidence": "inferred", "status": "active", "superseded_by": []},
+            {"id": "m3", "confidence": "uncertain", "status": "active", "superseded_by": []},
+        ]
+        bundle["thresholds"]["verified_ratio_min"] = 0.8
+        bundle["thresholds"]["defined_before_run"] = False
+        result = self._full_producer_eligibility(**bundle)
+        self.assertEqual(result["eligibility_status"], "ineligible")
+        # Both C1 and C2 should appear
+        self.assertIn("thresholds were not frozen", result["reasons"][0])
+        self.assertIn("evidence sufficiency is insufficient", result["reasons"][1])
