@@ -1035,6 +1035,475 @@ class LearningLoopTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "input"):
             loop.compare("path-iso-a", "path-iso-b")
 
+    # --- S5.2 RED: reflection builder (baseline v4.3 §4, appendices A/C) ---
+
+    def _valid_enriched(self, **bundle_overrides):
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+        from src.learning_loop.enrichment import build_enriched_utility_evaluation
+
+        bundle = self._valid_bundle(**bundle_overrides)
+        return build_enriched_utility_evaluation(evaluate_experiment_bundle(bundle))
+
+    def _enriched_with_records(self, extra_records):
+        bundle = self._valid_bundle()
+        bundle["memory_records"] = bundle["memory_records"] + extra_records
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+        from src.learning_loop.enrichment import build_enriched_utility_evaluation
+
+        return build_enriched_utility_evaluation(evaluate_experiment_bundle(bundle))
+
+    def test_reflection_matches_frozen_template_set(self):
+        """Acceptance 1: exact template set, order, literals, interpolation."""
+        from src.learning_loop.reflection_builder import build_reflection, canonical_json
+
+        enriched = self._valid_enriched()
+        snapshot = enriched["source_evaluation_snapshot"]
+        result = build_reflection(enriched)
+
+        self.assertEqual(result["schema_version"], 1)
+        self.assertEqual(result["template_version"], 1)
+        self.assertEqual(result["source_evaluation_id"], enriched["source_evaluation_id"])
+        self.assertEqual(
+            result["outcome_snapshot"],
+            {
+                "task_id": "task-1",
+                "without_memory_run_id": "run-a",
+                "with_memory_run_id": "run-b",
+                "validation_verdict": "A",
+                "pack_utility_delta": 0.3,
+                "evidence_composition": {"verified": 1, "unknown": 0, "contradicted": 0},
+                "evidence_sufficiency": {"status": "sufficient", "verified_ratio": 1.0},
+            },
+        )
+        self.assertEqual(
+            result["claims"],
+            [
+                {"claim_id": "CL-1", "statement": "pack_utility_delta is 0.3.",
+                 "evidence_ref": "outcome_snapshot.pack_utility_delta"},
+                {"claim_id": "CL-2", "statement": 'validation_verdict is "A".',
+                 "evidence_ref": "outcome_snapshot.validation_verdict"},
+                {"claim_id": "CL-3",
+                 "statement": "evidence composition is verified=1, unknown=0, contradicted=0.",
+                 "evidence_ref": "outcome_snapshot.evidence_composition"},
+                {"claim_id": "CL-4",
+                 "statement": 'evidence sufficiency is "sufficient" with verified_ratio 1.0.',
+                 "evidence_ref": "outcome_snapshot.evidence_sufficiency"},
+                {"claim_id": "CL-5",
+                 "statement": "thresholds were utility_delta_min=0.1, verified_ratio_min=0.5, defined_before_run=true.",
+                 "evidence_ref": "source_evaluation_snapshot.thresholds"},
+            ],
+        )
+        self.assertEqual(
+            result["uncertainties"],
+            [
+                {"claim_id": "U-3",
+                 "statement": "memory records may be stale; staleness_warning is true.",
+                 "evidence_ref": "source_evaluation_snapshot.staleness_warning"},
+            ],
+        )
+        self.assertEqual(
+            result["missing_information"],
+            [
+                {"claim_id": "M-1",
+                 "statement": "memory records were caller_provided and not re-verified from a run snapshot.",
+                 "evidence_ref": "source_evaluation_snapshot.memory_record_source"},
+            ],
+        )
+        self.assertEqual(
+            result["non_conclusions"],
+            [
+                {"claim_id": "N-1",
+                 "statement": "pack-level utility delta cannot attribute contribution to any individual memory record.",
+                 "contract_ref": "baseline-v4.3 §2"},
+                {"claim_id": "N-2",
+                 "statement": "the validation verdict does not justify any memory lifecycle action.",
+                 "contract_ref": "baseline-v4.3 §2"},
+                {"claim_id": "N-3",
+                 "statement": "evidence counts do not constitute reliability or weighting of memory records.",
+                 "contract_ref": "contracts/06 §3-exclusions"},
+                {"claim_id": "N-4",
+                 "statement": "coverage between memory_records and used_memory_ids was not checked; no per-memory attribution is provided.",
+                 "contract_ref": "contracts/06 §2-not-gates"},
+            ],
+        )
+        self.assertEqual(canonical_json(snapshot), canonical_json(json.loads(canonical_json(snapshot))))
+
+    def test_reflection_is_replay_deterministic(self):
+        """Acceptance 2: same input -> identical canonical bytes and rf_ id."""
+        from src.learning_loop.reflection_builder import build_reflection, canonical_json
+
+        first = build_reflection(self._valid_enriched())
+        second = build_reflection(self._valid_enriched())
+        self.assertEqual(canonical_json(first), canonical_json(second))
+        self.assertEqual(first["reflection_id"], second["reflection_id"])
+
+    def test_reflection_distinguishes_snapshot_instances(self):
+        """Acceptance 3: same evaluation_id, different snapshot -> new digest and rf_."""
+        from src.learning_loop.reflection_builder import build_reflection
+
+        base = build_reflection(self._valid_enriched())
+
+        flipped = self._valid_enriched()
+        flipped["source_evaluation_snapshot"]["staleness_warning"] = False
+        flipped_result = build_reflection(flipped)
+
+        extra = self._valid_enriched()
+        extra["source_evaluation_snapshot"]["thresholds"]["future_unpromoted_key"] = 42
+        extra_result = build_reflection(extra)
+
+        for variant in (flipped_result, extra_result):
+            self.assertEqual(variant["source_evaluation_id"], base["source_evaluation_id"])
+            self.assertNotEqual(variant["source_snapshot_digest"], base["source_snapshot_digest"])
+            self.assertNotEqual(variant["reflection_id"], base["reflection_id"])
+
+    def test_reflection_tamper_matrix(self):
+        """Acceptance 4: every rejection point independently refuses the input."""
+        from src.learning_loop.reflection_builder import build_reflection, ReflectionInputError
+
+        def tampered(mutate):
+            enriched = self._valid_enriched()
+            mutate(enriched, enriched["source_evaluation_snapshot"])
+            return enriched
+
+        def set_consistent(snap, verified, unknown, contradicted, ratio, status, verdict):
+            snap["evidence_composition"] = {
+                "verified": verified, "unknown": unknown, "contradicted": contradicted,
+            }
+            snap["evidence_sufficiency"] = {"status": status, "verified_ratio": ratio}
+            snap["validation_verdict"] = verdict
+
+        cases = {
+            "enriched_not_dict": lambda e, s: None,
+            "missing_source_id": lambda e, s: e.pop("source_evaluation_id"),
+            "missing_snapshot": lambda e, s: e.pop("source_evaluation_snapshot"),
+            "extra_enriched_field": lambda e, s: e.__setitem__("extra", 1),
+            "snapshot_not_dict": lambda e, s: e.__setitem__("source_evaluation_snapshot", []),
+            "snapshot_unknown_field": lambda e, s: s.__setitem__("surprise", 1),
+            "schema_v1": lambda e, s: s.__setitem__("schema_version", 1),
+            "schema_str": lambda e, s: s.__setitem__("schema_version", "2"),
+            "eval_id_uppercase": lambda e, s: (
+                s.__setitem__("evaluation_id", "eval_" + "A" * 64),
+                e.__setitem__("source_evaluation_id", "eval_" + "A" * 64),
+            ),
+            "eval_id_short": lambda e, s: (
+                s.__setitem__("evaluation_id", "eval_" + "0" * 63),
+                e.__setitem__("source_evaluation_id", "eval_" + "0" * 63),
+            ),
+            "eval_id_not_str": lambda e, s: (
+                s.__setitem__("evaluation_id", 42),
+                e.__setitem__("source_evaluation_id", 42),
+            ),
+            "task_id_empty": lambda e, s: s["experiment"].__setitem__("task_id", ""),
+            "run_id_not_str": lambda e, s: s["experiment"].__setitem__("with_memory_run_id", 7),
+            "delta_bool": lambda e, s: s["utility"].__setitem__("pack_utility_delta", True),
+            "delta_nan": lambda e, s: s["utility"].__setitem__("pack_utility_delta", float("nan")),
+            "delta_inf": lambda e, s: s["utility"].__setitem__("pack_utility_delta", float("inf")),
+            "delta_str": lambda e, s: s["utility"].__setitem__("pack_utility_delta", "0.3"),
+            "count_negative": lambda e, s: s["evidence_composition"].__setitem__("verified", -1),
+            "count_bool": lambda e, s: s["evidence_composition"].__setitem__("unknown", False),
+            "count_float": lambda e, s: s["evidence_composition"].__setitem__("verified", 1.0),
+            "threshold_missing": lambda e, s: s["thresholds"].pop("utility_delta_min"),
+            "ratio_min_out_of_range": lambda e, s: s["thresholds"].__setitem__("verified_ratio_min", 1.5),
+            "frozen_not_bool": lambda e, s: s["thresholds"].__setitem__("defined_before_run", 1),
+            "delta_min_bool": lambda e, s: s["thresholds"].__setitem__("utility_delta_min", True),
+            "source_not_str": lambda e, s: s.__setitem__("memory_record_source", 3),
+            "staleness_not_bool": lambda e, s: s.__setitem__("staleness_warning", "yes"),
+            "status_illegal_enum": lambda e, s: s["evidence_sufficiency"].__setitem__("status", "partial"),
+            "verdict_illegal_enum": lambda e, s: s.__setitem__("validation_verdict", "D"),
+            "zero_sum_forged_sufficient": lambda e, s: set_consistent(
+                s, 0, 0, 0, 0.0, "sufficient", "A"
+            ),
+            "ratio_tolerance_attack": lambda e, s: set_consistent(
+                s, 1, 1, 0, 0.4999999995, "insufficient", "C"
+            ),
+            "ratio_forged_up": lambda e, s: set_consistent(
+                s, 1, 1, 0, 1.0, "sufficient", "A"
+            ),
+            "verdict_A_at_threshold_boundary": lambda e, s: s["utility"].__setitem__(
+                "pack_utility_delta", 0.1
+            ),
+            "A_with_insufficient": lambda e, s: set_consistent(
+                s, 0, 1, 0, 0.0, "insufficient", "A"
+            ),
+            "B_with_not_frozen": lambda e, s: (
+                s["thresholds"].__setitem__("defined_before_run", False),
+                s.__setitem__("validation_verdict", "B"),
+            ),
+            "C_with_sufficient_and_frozen": lambda e, s: s.__setitem__("validation_verdict", "C"),
+            "ratio_negative_zero_token": lambda e, s: set_consistent(
+                s, 0, 1, 0, -0.0, "insufficient", "C"
+            ),
+            "ratio_int_zero_token": lambda e, s: set_consistent(
+                s, 0, 1, 0, 0, "insufficient", "C"
+            ),
+            "e1_outer_inner_mismatch": lambda e, s: e.__setitem__(
+                "source_evaluation_id", "eval_" + "f" * 64
+            ),
+            "extra_threshold_nan": lambda e, s: s["thresholds"].__setitem__(
+                "future_key", float("nan")
+            ),
+            "forbidden_extra_threshold_key": lambda e, s: s["thresholds"].__setitem__(
+                "trust_boost", 1
+            ),
+        }
+        for label, mutate in cases.items():
+            if label == "enriched_not_dict":
+                with self.subTest(case=label), self.assertRaises(ReflectionInputError):
+                    build_reflection([])
+                continue
+            with self.subTest(case=label), self.assertRaises(ReflectionInputError):
+                build_reflection(tampered(mutate))
+
+    def test_reflection_gate_order_observable(self):
+        """Acceptance 5: combined faults report the earliest gate identifier."""
+        from src.learning_loop.reflection_builder import build_reflection, ReflectionInputError
+
+        both_shape_and_closure = self._valid_enriched()
+        both_shape_and_closure["extra"] = 1
+        both_shape_and_closure["source_evaluation_snapshot"]["schema_version"] = 1
+        with self.assertRaisesRegex(ReflectionInputError, "gate:shape"):
+            build_reflection(both_shape_and_closure)
+
+        both_closure_and_recompute = self._valid_enriched()
+        snap = both_closure_and_recompute["source_evaluation_snapshot"]
+        snap["evaluation_id"] = "eval_" + "Z" * 64
+        both_closure_and_recompute["source_evaluation_id"] = snap["evaluation_id"]
+        snap["evidence_sufficiency"]["verified_ratio"] = 0.25
+        with self.assertRaisesRegex(ReflectionInputError, "gate:type-closure"):
+            build_reflection(both_closure_and_recompute)
+
+        both_recompute_and_e1 = self._valid_enriched()
+        snap = both_recompute_and_e1["source_evaluation_snapshot"]
+        snap["evidence_sufficiency"]["verified_ratio"] = 0.25
+        both_recompute_and_e1["source_evaluation_id"] = "eval_" + "f" * 64
+        with self.assertRaisesRegex(ReflectionInputError, "gate:recompute"):
+            build_reflection(both_recompute_and_e1)
+
+    def test_reflection_refs_resolve_and_equations_hold(self):
+        """Acceptance 6: evidence_ref resolution, contract_ref whitelist, E1-E4."""
+        import hashlib
+
+        from src.learning_loop.reflection_builder import build_reflection, canonical_json
+
+        enriched = self._valid_enriched()
+        result = build_reflection(enriched)
+        snapshot = enriched["source_evaluation_snapshot"]
+
+        def resolve(ref):
+            root, _, path = ref.partition(".")
+            node = {"outcome_snapshot": result["outcome_snapshot"],
+                    "source_evaluation_snapshot": snapshot}[root]
+            for part in path.split("."):
+                node = node[part]
+            return node
+
+        interpolated = {"CL-1", "CL-2", "CL-3", "CL-4", "CL-5", "U-1", "U-2"}
+        for entry in result["claims"] + result["uncertainties"] + result["missing_information"]:
+            value = resolve(entry["evidence_ref"])
+            if entry["claim_id"] in interpolated and not isinstance(value, dict):
+                self.assertIn(canonical_json(value), entry["statement"])
+
+        whitelist = {"baseline-v4.3 §2", "contracts/06 §3-exclusions", "contracts/06 §2-not-gates"}
+        for entry in result["non_conclusions"]:
+            self.assertIn(entry["contract_ref"], whitelist)
+
+        self.assertEqual(enriched["source_evaluation_id"], snapshot["evaluation_id"])
+        self.assertEqual(result["source_evaluation_id"], enriched["source_evaluation_id"])
+        recomputed = "snap_" + hashlib.sha256(canonical_json(snapshot).encode("utf-8")).hexdigest()
+        self.assertEqual(result["source_snapshot_digest"], recomputed)
+        projection = result["outcome_snapshot"]
+        self.assertEqual(canonical_json(projection["task_id"]), canonical_json(snapshot["experiment"]["task_id"]))
+        self.assertEqual(canonical_json(projection["pack_utility_delta"]),
+                         canonical_json(snapshot["utility"]["pack_utility_delta"]))
+        self.assertEqual(canonical_json(projection["evidence_composition"]),
+                         canonical_json(snapshot["evidence_composition"]))
+        self.assertEqual(canonical_json(projection["evidence_sufficiency"]),
+                         canonical_json(snapshot["evidence_sufficiency"]))
+
+    def test_reflection_ids_match_independent_oracle(self):
+        """Acceptance 7: snap_/rf_ recomputed independently, full-length lowercase."""
+        import hashlib
+        import re
+
+        from src.learning_loop.reflection_builder import build_reflection
+
+        enriched = self._valid_enriched()
+        result = build_reflection(enriched)
+
+        canonical = lambda value: json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+        )
+        snap_expected = "snap_" + hashlib.sha256(
+            canonical(enriched["source_evaluation_snapshot"]).encode("utf-8")
+        ).hexdigest()
+        rf_payload = {
+            "schema_version": 1,
+            "template_version": 1,
+            "source_evaluation_id": enriched["source_evaluation_id"],
+            "source_snapshot_digest": snap_expected,
+        }
+        rf_expected = "rf_" + hashlib.sha256(canonical(rf_payload).encode("utf-8")).hexdigest()
+
+        self.assertEqual(result["source_snapshot_digest"], snap_expected)
+        self.assertEqual(result["reflection_id"], rf_expected)
+        self.assertRegex(result["source_snapshot_digest"], r"^snap_[0-9a-f]{64}$")
+        self.assertRegex(result["reflection_id"], r"^rf_[0-9a-f]{64}$")
+
+    def test_canonicalizer_golden_vectors(self):
+        """Acceptance 8: numeric goldens, escaping, key order, NaN/BOM/newline rules."""
+        from src.learning_loop.reflection_builder import canonical_json
+
+        for value, expected in (
+            (0.3, "0.3"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (1 / 3, "0.3333333333333333"),
+            (-0.0, "-0.0"),
+            (1e300, "1e+300"),
+            (0.5, "0.5"),
+            (0, "0"),
+            (True, "true"),
+            (False, "false"),
+        ):
+            with self.subTest(value=repr(value)):
+                self.assertEqual(canonical_json(value), expected)
+        self.assertEqual(canonical_json({"任务": "值"}), '{"\\u4efb\\u52a1":"\\u503c"}')
+        self.assertEqual(canonical_json({"b": 1, "a": {"d": 2, "c": 3}}), '{"a":{"c":3,"d":2},"b":1}')
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(bad=repr(bad)), self.assertRaises(ValueError):
+                canonical_json(bad)
+        rendered = canonical_json({"a": 1})
+        self.assertFalse(rendered.startswith("﻿"))
+        self.assertFalse(rendered.endswith("\n"))
+
+    def test_reflection_conditional_templates_iff(self):
+        """Acceptance 9: U-1/U-2/U-3/M-1 present iff their condition holds."""
+        from src.learning_loop.reflection_builder import build_reflection
+
+        def ids(result, key):
+            return [entry["claim_id"] for entry in result[key]]
+
+        base = build_reflection(self._valid_enriched())
+        self.assertEqual(ids(base, "uncertainties"), ["U-3"])
+        self.assertEqual(ids(base, "missing_information"), ["M-1"])
+
+        with_unknown = build_reflection(self._enriched_with_records([
+            {"id": "memory-2", "confidence": "inferred", "status": "active", "superseded_by": []},
+        ]))
+        self.assertEqual(ids(with_unknown, "uncertainties"), ["U-1", "U-3"])
+
+        with_contradicted = build_reflection(self._enriched_with_records([
+            {"id": "memory-3", "confidence": "confirmed", "status": "conflicted", "superseded_by": []},
+        ]))
+        self.assertEqual(ids(with_contradicted, "uncertainties"), ["U-2", "U-3"])
+
+        with_both = build_reflection(self._enriched_with_records([
+            {"id": "memory-2", "confidence": "inferred", "status": "active", "superseded_by": []},
+            {"id": "memory-3", "confidence": "confirmed", "status": "conflicted", "superseded_by": []},
+        ]))
+        self.assertEqual(ids(with_both, "uncertainties"), ["U-1", "U-2", "U-3"])
+        self.assertEqual(with_both["outcome_snapshot"]["validation_verdict"], "C")
+
+        stale_off = self._valid_enriched()
+        stale_off["source_evaluation_snapshot"]["staleness_warning"] = False
+        self.assertEqual(ids(build_reflection(stale_off), "uncertainties"), [])
+
+        other_source = self._valid_enriched()
+        other_source["source_evaluation_snapshot"]["memory_record_source"] = "run_snapshot"
+        self.assertEqual(ids(build_reflection(other_source), "missing_information"), [])
+
+    def test_reflection_forbidden_scan_domain(self):
+        """Acceptance 10: caller values may contain forbidden words; key names may not."""
+        from src.learning_loop.reflection_builder import build_reflection
+
+        bundle = self._valid_bundle()
+        bundle["experiment"]["task_id"] = "trust-delete-audit-task"
+        bundle["comparison"]["task_id"] = "trust-delete-audit-task"
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+        from src.learning_loop.enrichment import build_enriched_utility_evaluation
+
+        enriched = build_enriched_utility_evaluation(evaluate_experiment_bundle(bundle))
+        result = build_reflection(enriched)
+        self.assertEqual(result["outcome_snapshot"]["task_id"], "trust-delete-audit-task")
+
+        def keys(node):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    yield key
+                    yield from keys(value)
+            elif isinstance(node, list):
+                for item in node:
+                    yield from keys(item)
+
+        forbidden = ("trust", "ranking", "weight", "per_memory_utility",
+                     "recommendation", "remove", "delete")
+        for key in keys(result):
+            for term in forbidden:
+                self.assertNotIn(term, key.casefold())
+
+    def test_reflection_no_filesystem_io(self):
+        """Acceptance 11: zero filesystem audit events on success and failure paths."""
+        import subprocess
+        import sys
+
+        script = r"""
+import json, sys
+sys.path.insert(0, ".")
+sys.path.insert(0, "src")
+from src.learning_loop.reflection_builder import build_reflection, ReflectionInputError
+
+snapshot = {
+    "schema_version": 2,
+    "evaluation_id": "eval_" + "0" * 64,
+    "experiment": {"task_id": "t", "without_memory_run_id": "a", "with_memory_run_id": "b"},
+    "utility": {"pack_utility_delta": 0.3},
+    "evidence_composition": {"verified": 1, "unknown": 0, "contradicted": 0},
+    "thresholds": {"utility_delta_min": 0.1, "verified_ratio_min": 0.5, "defined_before_run": True},
+    "evidence_sufficiency": {"status": "sufficient", "verified_ratio": 1.0},
+    "validation_verdict": "A",
+    "memory_record_source": "caller_provided",
+    "staleness_warning": True,
+}
+enriched = {"source_evaluation_id": snapshot["evaluation_id"], "source_evaluation_snapshot": snapshot}
+bad = {"source_evaluation_id": snapshot["evaluation_id"]}
+
+events = []
+def hook(event, args):
+    if event == "open" or event.startswith("os.") or event.startswith("shutil."):
+        events.append(event)
+sys.addaudithook(hook)
+
+build_reflection(json.loads(json.dumps(enriched)))
+try:
+    build_reflection(bad)
+except ReflectionInputError:
+    pass
+print("EVENTS:" + ",".join(events))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("EVENTS:", completed.stdout)
+        self.assertEqual(completed.stdout.strip().split("EVENTS:")[-1], "")
+
+    def test_reflection_no_aliasing(self):
+        """Acceptance 12: no shared mutable references in either direction."""
+        from src.learning_loop.reflection_builder import build_reflection, canonical_json
+
+        enriched = self._valid_enriched()
+        result = build_reflection(enriched)
+        result_bytes = canonical_json(result)
+        enriched_bytes = canonical_json(enriched)
+
+        enriched["source_evaluation_snapshot"]["experiment"]["task_id"] = "mutated"
+        self.assertEqual(canonical_json(result), result_bytes)
+
+        enriched2 = self._valid_enriched()
+        result2 = build_reflection(enriched2)
+        result2["outcome_snapshot"]["evidence_composition"]["verified"] = 99
+        self.assertEqual(canonical_json(enriched2), enriched_bytes)
+
     # --- S5.1e RED: composition total integrity (baseline v4.3 amendment A2) ---
 
     def test_build_utility_evaluation_rejects_inconsistent_total(self):
