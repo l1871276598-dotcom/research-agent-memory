@@ -30,4 +30,5 @@ backups/
 *.pdf
 
 TASK.md
-_system/
+_system/*
+!_system/contracts/
