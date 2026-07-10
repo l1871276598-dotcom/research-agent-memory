@@ -2770,33 +2770,45 @@ class S53EligibilityTests(unittest.TestCase):
         return ref, enr
 
     def test_12_case_contract_layer_all_cases(self):
-        """RED-11: 12 frozen fixtures each produce expected case and status."""
+        """RED-11: 12 frozen fixtures each produce expected case, status, reasons."""
         from src.learning_loop.eligibility import build_eligibility
+
+        R_A = "verdict A: pack_utility_delta exceeds the frozen utility_delta_min; disposition review is available."
+        R_B = "verdict B: pack_utility_delta does not exceed the frozen utility_delta_min; disposition review is available."
+        R_C2 = "verdict C: evidence sufficiency is insufficient."
+        R_U1 = "unknown records present: unknown=1."
+        R_X1 = "contradicted records present: contradicted=1."
+
         cases = [
-            ("case_01", "A", 0, 0, "eligible"),
-            ("case_02", "A", 0, 1, "eligible"),
-            ("case_03", "A", 1, 0, "eligible"),
-            ("case_04", "A", 1, 1, "eligible"),
-            ("case_05", "B", 0, 0, "eligible"),
-            ("case_06", "B", 0, 1, "eligible"),
-            ("case_07", "B", 1, 0, "eligible"),
-            ("case_08", "B", 1, 1, "eligible"),
-            ("case_09", "C", 0, 0, "ineligible"),
-            ("case_10", "C", 0, 1, "ineligible"),
-            ("case_11", "C", 1, 0, "ineligible"),
-            ("case_12", "C", 1, 1, "ineligible"),
+            ("case_01", "A", 0, 0, "eligible", [R_A]),
+            ("case_02", "A", 0, 1, "eligible", [R_A, R_U1]),
+            ("case_03", "A", 1, 0, "eligible", [R_A, R_X1]),
+            ("case_04", "A", 1, 1, "eligible", [R_A, R_U1, R_X1]),
+            ("case_05", "B", 0, 0, "eligible", [R_B]),
+            ("case_06", "B", 0, 1, "eligible", [R_B, R_U1]),
+            ("case_07", "B", 1, 0, "eligible", [R_B, R_X1]),
+            ("case_08", "B", 1, 1, "eligible", [R_B, R_U1, R_X1]),
+            ("case_09", "C", 0, 0, "ineligible", [R_C2]),
+            ("case_10", "C", 0, 1, "ineligible", [R_C2, R_U1]),
+            ("case_11", "C", 1, 0, "ineligible", [R_C2, R_X1]),
+            ("case_12", "C", 1, 1, "ineligible", [R_C2, R_U1, R_X1]),
         ]
-        for expected_case, verdict, c, u, expected_status in cases:
+        for expected_case, verdict, c, u, expected_status, expected_reasons in cases:
             ref, enr = self._case_fixture(verdict, int(c), int(u))
             result = build_eligibility(ref, enr)
             with self.subTest(case=expected_case):
-                self.assertEqual(result["matched_case"], expected_case)
-                self.assertEqual(result["eligibility_status"], expected_status)
-                self.assertEqual(result["fsm_matrix_version"], 1)
-                self.assertEqual(result["schema_version"], 1)
-                self.assertEqual(result["source_reflection_id"], ref["reflection_id"])
-                self.assertIsInstance(result["reasons"], list)
-                self.assertTrue(len(result["reasons"]) >= 1)
+                self.assertEqual(result["matched_case"], expected_case,
+                                 f"{expected_case}: wrong matched_case")
+                self.assertEqual(result["eligibility_status"], expected_status,
+                                 f"{expected_case}: wrong status")
+                self.assertEqual(result["fsm_matrix_version"], 1,
+                                 f"{expected_case}: wrong fsm_version")
+                self.assertEqual(result["schema_version"], 1,
+                                 f"{expected_case}: wrong schema_version")
+                self.assertEqual(result["reasons"], expected_reasons,
+                                 f"{expected_case}: wrong reasons")
+                self.assertEqual(result["source_reflection_id"], ref["reflection_id"],
+                                 f"{expected_case}: wrong reflection_id")
 
     def test_eligibility_replay_deterministic(self):
         """RED-11: same input -> same bytes and ID across calls."""
@@ -2877,12 +2889,12 @@ class S53EligibilityTests(unittest.TestCase):
     # --- S5.3 cross-cutting: no-I/O audit (fresh process) ---
 
     def test_eligibility_no_filesystem_io(self):
-        """RED-12: zero filesystem audit events on success and failure paths."""
+        """RED-12: zero filesystem audit events on success AND all 4 failure gates."""
         import subprocess
         import sys
 
         script = r"""
-import json, sys
+import copy, json, sys
 sys.path.insert(0, ".")
 sys.path.insert(0, "src")
 
@@ -2900,9 +2912,9 @@ snapshot = {
     "memory_record_source": "run_snapshot",
     "staleness_warning": False,
 }
+
 enr = {"source_evaluation_id": snapshot["evaluation_id"], "source_evaluation_snapshot": snapshot}
 
-# Build a valid reflection via the only import-time path (no audit hook yet)
 from src.learning_loop.reflection_builder import build_reflection
 ref = build_reflection(enr)
 
@@ -2912,33 +2924,43 @@ def hook(event, args):
         events.append(event)
 sys.addaudithook(hook)
 
-# Success path
+def check_gate(label, expected_gate, fn):
+    try:
+        fn()
+    except EligibilityInputError as e:
+        if e.gate != expected_gate:
+            print(f"FAIL: {label} expected gate={expected_gate!r}, got {e.gate!r}")
+            sys.exit(1)
+    except Exception as e:
+        print(f"FAIL: {label} raised {type(e).__name__}: {e}")
+        sys.exit(1)
+    else:
+        print(f"FAIL: {label} did not raise")
+        sys.exit(1)
+
+# 1 — success
 result = build_eligibility(ref, enr)
 assert "eligibility_id" in result
 
-# Shape failure
-try:
-    build_eligibility([], enr)
-except EligibilityInputError:
-    pass
+# 2 — shape: non-dict reflection
+check_gate("shape", "shape", lambda: build_eligibility([], enr))
 
-# Source failure
-bad_enr = {"source_evaluation_id": "x"}
-try:
-    build_eligibility(ref, bad_enr)
-except EligibilityInputError:
-    pass
+# 3 — source: passes shape, fails S5.2 producer
+bad_source = copy.deepcopy(enr)
+bad_source["source_evaluation_snapshot"]["schema_version"] = 1
+check_gate("source", "source", lambda: build_eligibility(ref, bad_source))
 
-# Preconditions failure
-bad_ref = dict(ref)
-bad_ref["outcome_snapshot"] = dict(ref["outcome_snapshot"])
-bad_ref["outcome_snapshot"]["evidence_sufficiency"] = dict(ref["outcome_snapshot"]["evidence_sufficiency"])
-bad_ref["outcome_snapshot"]["evidence_composition"] = dict(ref["outcome_snapshot"]["evidence_composition"])
-bad_ref["outcome_snapshot"]["validation_verdict"] = "D"
-try:
-    build_eligibility(bad_ref, enr)
-except EligibilityInputError:
-    pass
+# 4 — preconditions: passes shape+source, tamper verdict to "D"
+bad_pre = copy.deepcopy(ref)
+bad_pre["outcome_snapshot"]["validation_verdict"] = "D"
+check_gate("preconditions", "preconditions", lambda: build_eligibility(bad_pre, enr))
+
+# 5 — upstream: passes all earlier gates, tamper claim statement
+bad_up = copy.deepcopy(ref)
+bad_up["claims"] = copy.deepcopy(ref["claims"])
+bad_up["claims"][0] = dict(ref["claims"][0])
+bad_up["claims"][0]["statement"] = "tampered claim"
+check_gate("upstream", "upstream", lambda: build_eligibility(bad_up, enr))
 
 print("EVENTS:" + ",".join(events))
 """
