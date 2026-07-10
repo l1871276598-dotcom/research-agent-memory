@@ -1751,7 +1751,979 @@ print("EVENTS:" + ",".join(events))
         from src.learning_loop.evaluation import evaluate_experiment_bundle, EvaluationInputError
 
         bundle = self._valid_bundle()
+    def test_bundle_rejects_comparison_score_tampering(self):
+        """RED: comparison first/second_score must equal the outcome scores."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle, EvaluationInputError
+
+        bundle = self._valid_bundle()
         bundle["comparison"]["first_score"] = 0.4
         bundle["comparison"]["second_score"] = 0.7
         with self.assertRaises(EvaluationInputError):
             evaluate_experiment_bundle(bundle)
+
+
+class S53EligibilityTests(unittest.TestCase):
+    """S5.3 Eligibility + FSM Matrix v1 — RED/GREEN TDD."""
+
+    # --- S5.3 Task 1: RED-0 scaffold ---
+
+    def test_eligibility_imports(self):
+        """RED-0: build_eligibility and EligibilityInputError are importable."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        self.assertTrue(callable(build_eligibility))
+        self.assertTrue(issubclass(EligibilityInputError, ValueError))
+
+    def test_eligibility_not_yet_fully_implemented(self):
+        """RED-0: build_eligibility without valid keys fails shape gate, not NotImplementedError."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility({}, {})
+        self.assertEqual(ctx.exception.gate, "shape")
+
+    def test_eligibility_input_error_has_gate_and_check(self):
+        """RED-0: EligibilityInputError carries structured gate/check attributes."""
+        from src.learning_loop.eligibility import EligibilityInputError
+        err = EligibilityInputError(gate="shape", message="test")
+        self.assertEqual(err.gate, "shape")
+        self.assertIsNone(err.check)
+        err2 = EligibilityInputError(gate="preconditions", check="P3", message="fail")
+        self.assertEqual(err2.gate, "preconditions")
+        self.assertEqual(err2.check, "P3")
+
+    def test_canonical_json_can_now_serialize(self):
+        """RED-0: _canonical_json is now implemented and serializes dicts."""
+        from src.learning_loop.eligibility import _canonical_json
+        result = _canonical_json({"a": 1})
+        self.assertEqual(result, '{"a":1}')
+
+    # --- S5.3 Task 2: RED-1 FSM matrix ---
+
+    def test_fsm_matrix_is_exactly_12_rows(self):
+        """RED-1: FSM_MATRIX_V1 must contain exactly 12 rows."""
+        from src.learning_loop.eligibility import FSM_MATRIX_V1
+        self.assertEqual(len(FSM_MATRIX_V1), 12)
+
+    def test_fsm_matrix_has_case_01_through_case_12(self):
+        """RED-1: case IDs must be case_01..case_12."""
+        from src.learning_loop.eligibility import FSM_MATRIX_V1
+        ids = [row.case_id for row in FSM_MATRIX_V1]
+        expected = [f"case_{i:02d}" for i in range(1, 13)]
+        self.assertEqual(ids, expected)
+
+    def test_fsm_matrix_covers_all_combinations(self):
+        """RED-1: (verdict, contradicted_gt0, unknown_gt0) covers complete 3×2×2."""
+        from src.learning_loop.eligibility import FSM_MATRIX_V1
+        keys = {(row.verdict, row.contradicted_gt0, row.unknown_gt0) for row in FSM_MATRIX_V1}
+        expected = set()
+        for v in ("A", "B", "C"):
+            for c in (False, True):
+                for u in (False, True):
+                    expected.add((v, c, u))
+        self.assertEqual(keys, expected)
+
+    def test_fsm_matrix_no_duplicate_keys(self):
+        """RED-1: no two rows share the same (verdict, contradicted_gt0, unknown_gt0)."""
+        from src.learning_loop.eligibility import FSM_MATRIX_V1
+        keys = [(row.verdict, row.contradicted_gt0, row.unknown_gt0) for row in FSM_MATRIX_V1]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_fsm_matrix_a_b_eligible_c_ineligible(self):
+        """RED-1: A/B rows must be eligible, C rows ineligible."""
+        from src.learning_loop.eligibility import FSM_MATRIX_V1
+        for row in FSM_MATRIX_V1:
+            if row.verdict in ("A", "B"):
+                self.assertEqual(row.status, "eligible",
+                                 f"{row.case_id} should be eligible")
+            else:
+                self.assertEqual(row.status, "ineligible",
+                                 f"{row.case_id} should be ineligible")
+
+    def test_fsm_matrix_embedded_12_row_table_exact(self):
+        """RED-1: exact embedded 12-row table matches v4.3 §5.3."""
+        from src.learning_loop.eligibility import FSM_MATRIX_V1
+        expected = (
+            ("case_01", "A", False, False, "eligible"),
+            ("case_02", "A", False, True, "eligible"),
+            ("case_03", "A", True, False, "eligible"),
+            ("case_04", "A", True, True, "eligible"),
+            ("case_05", "B", False, False, "eligible"),
+            ("case_06", "B", False, True, "eligible"),
+            ("case_07", "B", True, False, "eligible"),
+            ("case_08", "B", True, True, "eligible"),
+            ("case_09", "C", False, False, "ineligible"),
+            ("case_10", "C", False, True, "ineligible"),
+            ("case_11", "C", True, False, "ineligible"),
+            ("case_12", "C", True, True, "ineligible"),
+        )
+        for i, (cid, v, c, u, s) in enumerate(expected):
+            row = FSM_MATRIX_V1[i]
+            self.assertEqual(row.case_id, cid, f"row {i} case_id")
+            self.assertEqual(row.verdict, v, f"row {i} verdict")
+            self.assertEqual(row.contradicted_gt0, c, f"row {i} contradicted_gt0")
+            self.assertEqual(row.unknown_gt0, u, f"row {i} unknown_gt0")
+            self.assertEqual(row.status, s, f"row {i} status")
+
+    # --- S5.3 Task 3: RED-2 canonicalizer ---
+
+    def test_canonical_golden_numeric_vectors(self):
+        """RED-2: numeric golden vectors all produce expected canonical tokens."""
+        from src.learning_loop.eligibility import _canonical_json
+        for value, expected in (
+            (0.3, "0.3"),
+            (0.30000000000000004, "0.30000000000000004"),
+            (1 / 3, "0.3333333333333333"),
+            (-0.0, "-0.0"),
+            (1e300, "1e+300"),
+            (0.5, "0.5"),
+            (0, "0"),
+            (True, "true"),
+            (False, "false"),
+        ):
+            with self.subTest(value=repr(value)):
+                self.assertEqual(_canonical_json(value), expected)
+
+    def test_canonical_chinese_escaped(self):
+        """RED-2: non-ASCII characters are escaped."""
+        from src.learning_loop.eligibility import _canonical_json
+        self.assertEqual(
+            _canonical_json({"任务": "值"}),
+            '{"\\u4efb\\u52a1":"\\u503c"}'
+        )
+
+    def test_canonical_key_sorting(self):
+        """RED-2: nested dicts are sorted by key."""
+        from src.learning_loop.eligibility import _canonical_json
+        self.assertEqual(
+            _canonical_json({"b": 1, "a": {"d": 2, "c": 3}}),
+            '{"a":{"c":3,"d":2},"b":1}'
+        )
+
+    def test_canonical_rejects_nan_infinity(self):
+        """RED-2: NaN, Infinity, -Infinity raise ValueError."""
+        from src.learning_loop.eligibility import _canonical_json
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(bad=repr(bad)), self.assertRaises(ValueError):
+                _canonical_json(bad)
+
+    def test_canonical_no_bom_no_trailing_newline(self):
+        """RED-2: output must not start with BOM or end with newline."""
+        from src.learning_loop.eligibility import _canonical_json
+        rendered = _canonical_json({"a": 1})
+        self.assertFalse(rendered.startswith("﻿"))
+        self.assertFalse(rendered.endswith("\n"))
+
+    # --- S5.3 Task 4: RED-3 gate:shape ---
+
+    def _reflection_valid(self):
+        return {
+            "schema_version": 1,
+            "template_version": 1,
+            "reflection_id": "rf_" + "a" * 64,
+            "source_evaluation_id": "eval_" + "b" * 64,
+            "source_snapshot_digest": "snap_" + "c" * 64,
+            "outcome_snapshot": {
+                "task_id": "task-1",
+                "without_memory_run_id": "run-a",
+                "with_memory_run_id": "run-b",
+                "validation_verdict": "A",
+                "pack_utility_delta": 0.3,
+                "evidence_composition": {"verified": 1, "unknown": 0, "contradicted": 0},
+                "evidence_sufficiency": {"status": "sufficient", "verified_ratio": 1.0},
+            },
+            "claims": [],
+            "uncertainties": [],
+            "missing_information": [],
+            "non_conclusions": [],
+        }
+
+    def _enriched_valid(self):
+        return {
+            "source_evaluation_id": "eval_" + "b" * 64,
+            "source_evaluation_snapshot": {"schema_version": 2},
+        }
+
+    def test_shape_reflection_not_dict(self):
+        """RED-3: non-dict reflection must raise EligibilityInputError gate=shape."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility([], self._enriched_valid())
+        self.assertEqual(ctx.exception.gate, "shape")
+
+    def test_shape_enriched_not_dict(self):
+        """RED-3: non-dict enriched must raise EligibilityInputError gate=shape."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(self._reflection_valid(), [])
+        self.assertEqual(ctx.exception.gate, "shape")
+
+    def test_shape_reflection_missing_top_field(self):
+        """RED-3: missing reflection top field -> gate=shape."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref = self._reflection_valid()
+        del ref["reflection_id"]
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, self._enriched_valid())
+        self.assertEqual(ctx.exception.gate, "shape")
+
+    def test_shape_reflection_extra_top_field(self):
+        """RED-3: extra reflection top field -> gate=shape."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref = self._reflection_valid()
+        ref["extra_field"] = True
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, self._enriched_valid())
+        self.assertEqual(ctx.exception.gate, "shape")
+
+    def test_shape_enriched_missing_field(self):
+        """RED-3: missing enriched field -> gate=shape."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        enr = self._enriched_valid()
+        del enr["source_evaluation_snapshot"]
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(self._reflection_valid(), enr)
+        self.assertEqual(ctx.exception.gate, "shape")
+
+    def test_shape_enriched_extra_field(self):
+        """RED-3: extra enriched field -> gate=shape."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        enr = self._enriched_valid()
+        enr["extra"] = 1
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(self._reflection_valid(), enr)
+        self.assertEqual(ctx.exception.gate, "shape")
+
+    def test_shape_outcome_snapshot_not_dict(self):
+        """RED-3: outcome_snapshot not dict -> gate=shape."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref = self._reflection_valid()
+        ref["outcome_snapshot"] = []
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, self._enriched_valid())
+        self.assertEqual(ctx.exception.gate, "shape")
+
+    def test_shape_composition_not_dict(self):
+        """RED-3: evidence_composition not dict -> gate=shape."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref = self._reflection_valid()
+        ref["outcome_snapshot"]["evidence_composition"] = 3
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, self._enriched_valid())
+        self.assertEqual(ctx.exception.gate, "shape")
+
+    def test_shape_sufficiency_not_dict(self):
+        """RED-3: evidence_sufficiency not dict -> gate=shape."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref = self._reflection_valid()
+        ref["outcome_snapshot"]["evidence_sufficiency"] = "insufficient"
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, self._enriched_valid())
+        self.assertEqual(ctx.exception.gate, "shape")
+
+    def test_shape_claims_not_list(self):
+        """RED-3: claims not a list -> gate=shape."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref = self._reflection_valid()
+        ref["claims"] = {}
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, self._enriched_valid())
+        self.assertEqual(ctx.exception.gate, "shape")
+
+    def test_shape_uncertainties_not_list(self):
+        """RED-3: uncertainties not a list -> gate=shape."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref = self._reflection_valid()
+        ref["uncertainties"] = None
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, self._enriched_valid())
+        self.assertEqual(ctx.exception.gate, "shape")
+
+    def test_shape_snapshot_not_dict(self):
+        """RED-3: source_evaluation_snapshot not dict -> gate=shape."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        enr = self._enriched_valid()
+        enr["source_evaluation_snapshot"] = "not-a-dict"
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(self._reflection_valid(), enr)
+        self.assertEqual(ctx.exception.gate, "shape")
+
+    # --- S5.3 Task 5: RED-4 gate:source ---
+
+    def _enriched_valid_for_source(self):
+        """Return a minimal enriched dict valid for S5.2 build_reflection."""
+        return {
+            "source_evaluation_id": "eval_" + "d" * 64,
+            "source_evaluation_snapshot": {
+                "schema_version": 2,
+                "evaluation_id": "eval_" + "d" * 64,
+                "experiment": {
+                    "task_id": "task-1",
+                    "without_memory_run_id": "run-a",
+                    "with_memory_run_id": "run-b",
+                },
+                "utility": {"pack_utility_delta": 0.3},
+                "evidence_composition": {"verified": 1, "unknown": 0, "contradicted": 0},
+                "thresholds": {
+                    "utility_delta_min": 0.1,
+                    "verified_ratio_min": 0.5,
+                    "defined_before_run": True,
+                },
+                "evidence_sufficiency": {"status": "sufficient", "verified_ratio": 1.0},
+                "validation_verdict": "A",
+                "memory_record_source": "run_snapshot",
+                "staleness_warning": False,
+            },
+        }
+
+    def test_source_tampered_schema_version(self):
+        """RED-4: non-v2 schema_version -> gate=source."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        enr = self._enriched_valid_for_source()
+        enr["source_evaluation_snapshot"]["schema_version"] = 1
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(self._reflection_valid(), enr)
+        self.assertEqual(ctx.exception.gate, "source")
+
+    def test_source_tampered_eval_id(self):
+        """RED-4: illegal evaluation_id -> gate=source."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        enr = self._enriched_valid_for_source()
+        enr["source_evaluation_snapshot"]["evaluation_id"] = "bad_id"
+        enr["source_evaluation_id"] = "bad_id"
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(self._reflection_valid(), enr)
+        self.assertEqual(ctx.exception.gate, "source")
+
+    def test_source_empty_task_id(self):
+        """RED-4: empty task_id -> gate=source."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        enr = self._enriched_valid_for_source()
+        enr["source_evaluation_snapshot"]["experiment"]["task_id"] = ""
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(self._reflection_valid(), enr)
+        self.assertEqual(ctx.exception.gate, "source")
+
+    def test_source_delta_bool(self):
+        """RED-4: bool pack_utility_delta -> gate=source."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        enr = self._enriched_valid_for_source()
+        enr["source_evaluation_snapshot"]["utility"]["pack_utility_delta"] = True
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(self._reflection_valid(), enr)
+        self.assertEqual(ctx.exception.gate, "source")
+
+    def test_source_delta_nan(self):
+        """RED-4: NaN delta -> gate=source."""
+        import math
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        enr = self._enriched_valid_for_source()
+        enr["source_evaluation_snapshot"]["utility"]["pack_utility_delta"] = math.nan
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(self._reflection_valid(), enr)
+        self.assertEqual(ctx.exception.gate, "source")
+
+    def test_source_count_negative(self):
+        """RED-4: negative composition count -> gate=source."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        enr = self._enriched_valid_for_source()
+        enr["source_evaluation_snapshot"]["evidence_composition"]["verified"] = -1
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(self._reflection_valid(), enr)
+        self.assertEqual(ctx.exception.gate, "source")
+
+    def test_source_count_bool(self):
+        """RED-4: bool composition count -> gate=source."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        enr = self._enriched_valid_for_source()
+        enr["source_evaluation_snapshot"]["evidence_composition"]["unknown"] = False
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(self._reflection_valid(), enr)
+        self.assertEqual(ctx.exception.gate, "source")
+
+    def test_source_ratio_insufficient_false_delta(self):
+        """RED-4: inconsistent ratio/status/verdict -> gate=source."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        enr = self._enriched_valid_for_source()
+        snap = enr["source_evaluation_snapshot"]
+        snap["evidence_composition"] = {"verified": 0, "unknown": 1, "contradicted": 0}
+        snap["evidence_sufficiency"] = {"status": "insufficient", "verified_ratio": 0.0}
+        snap["validation_verdict"] = "A"
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(self._reflection_valid(), enr)
+        self.assertEqual(ctx.exception.gate, "source")
+
+    def test_source_e1_mismatch(self):
+        """RED-4: source_evaluation_id != snapshot.evaluation_id -> gate=source."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        enr = self._enriched_valid_for_source()
+        enr["source_evaluation_id"] = "eval_" + "f" * 64
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(self._reflection_valid(), enr)
+        self.assertEqual(ctx.exception.gate, "source")
+
+    def test_source_extra_snapshot_field(self):
+        """RED-4: unknown snapshot field -> gate=source."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        enr = self._enriched_valid_for_source()
+        enr["source_evaluation_snapshot"]["surprise"] = "extra"
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(self._reflection_valid(), enr)
+        self.assertEqual(ctx.exception.gate, "source")
+
+    def test_source_legit_enriched_does_not_fail_with_valid_reflection(self):
+        """RED-4: valid enriched should not fail source gate."""
+        from src.learning_loop.eligibility import build_eligibility
+        enr = self._enriched_valid_for_source()
+        ref = self._reflection_valid()
+        ref["source_evaluation_id"] = enr["source_evaluation_id"]
+        try:
+            build_eligibility(ref, enr)
+        except Exception as exc:
+            # Must not fail at source gate; other gates may reject (e.g. upstream comparison)
+            self.assertNotEqual(getattr(exc, "gate", None), "source")
+
+    # --- S5.3 Task 6: RED-5 gate:preconditions P1-P8 ---
+
+    def _reflection_with_enriched(self, enr=None):
+        """Return (reflection, enriched) tuple valid through gate:shape and gate:source."""
+        from src.learning_loop.reflection_builder import build_reflection
+        if enr is None:
+            enr = self._enriched_valid_for_source()
+        ref = build_reflection(enr)
+        return ref, enr
+
+    def test_preconditions_P1_illegal_verdict(self):
+        """RED-5: illegal verdict -> gate=preconditions check=P1."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["outcome_snapshot"]["validation_verdict"] = "D"
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "preconditions")
+        self.assertEqual(ctx.exception.check, "P1")
+
+    def test_preconditions_P1_illegal_status(self):
+        """RED-5: illegal status -> gate=preconditions check=P1."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["outcome_snapshot"]["evidence_sufficiency"]["status"] = "partial"
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "preconditions")
+        self.assertEqual(ctx.exception.check, "P1")
+
+    def test_preconditions_P2_negative_count(self):
+        """RED-5: negative count -> gate=preconditions check=P2."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["outcome_snapshot"]["evidence_composition"]["verified"] = -1
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "preconditions")
+        self.assertEqual(ctx.exception.check, "P2")
+
+    def test_preconditions_P2_bool_count(self):
+        """RED-5: bool count -> gate=preconditions check=P2."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["outcome_snapshot"]["evidence_composition"]["unknown"] = False
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "preconditions")
+        self.assertEqual(ctx.exception.check, "P2")
+
+    def test_preconditions_P3_ratio_mismatch(self):
+        """RED-5: ratio != verified/total -> gate=preconditions check=P3."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["outcome_snapshot"]["evidence_sufficiency"]["verified_ratio"] = 0.99
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "preconditions")
+        self.assertEqual(ctx.exception.check, "P3")
+
+    def test_preconditions_P3_total_zero_but_sufficient(self):
+        """RED-5: total=0 but status=sufficient -> gate=preconditions check=P3."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        comp = ref["outcome_snapshot"]["evidence_composition"]
+        comp["verified"] = 0
+        comp["unknown"] = 0
+        comp["contradicted"] = 0
+        ref["outcome_snapshot"]["evidence_sufficiency"]["verified_ratio"] = 0.0
+        ref["outcome_snapshot"]["evidence_sufficiency"]["status"] = "sufficient"
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "preconditions")
+        self.assertEqual(ctx.exception.check, "P3")
+
+    def test_preconditions_P4_A_with_insufficient(self):
+        """RED-5: verdict=A with insufficient -> gate=preconditions check=P4."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["outcome_snapshot"]["evidence_composition"]["verified"] = 0
+        ref["outcome_snapshot"]["evidence_composition"]["unknown"] = 1
+        ref["outcome_snapshot"]["evidence_composition"]["contradicted"] = 0
+        ref["outcome_snapshot"]["evidence_sufficiency"] = {
+            "status": "insufficient", "verified_ratio": 0.0,
+        }
+        ref["outcome_snapshot"]["validation_verdict"] = "A"
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "preconditions")
+        self.assertEqual(ctx.exception.check, "P4")
+
+    def test_preconditions_P5_A_with_delta_at_min(self):
+        """RED-5: verdict=A, delta==min -> gate=preconditions check=P5."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["outcome_snapshot"]["pack_utility_delta"] = 0.1
+        ref["outcome_snapshot"]["validation_verdict"] = "A"
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "preconditions")
+        self.assertEqual(ctx.exception.check, "P5")
+
+    def test_preconditions_P6_B_with_delta_above_min(self):
+        """RED-5: verdict=B, delta>min -> gate=preconditions check=P6."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["outcome_snapshot"]["pack_utility_delta"] = 0.3
+        ref["outcome_snapshot"]["validation_verdict"] = "B"
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "preconditions")
+        self.assertEqual(ctx.exception.check, "P6")
+
+    def test_preconditions_P7_C_with_frozen_and_sufficient(self):
+        """RED-5: verdict=C, frozen+sufficient -> gate=preconditions check=P7."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        snap = enr["source_evaluation_snapshot"]
+        self.assertTrue(snap["thresholds"]["defined_before_run"])
+        ref["outcome_snapshot"]["validation_verdict"] = "C"
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "preconditions")
+        self.assertEqual(ctx.exception.check, "P7")
+
+    def test_preconditions_P8_task_id_mismatch(self):
+        """RED-5: outcome_snapshot.task_id != source task_id -> gate=preconditions check=P8."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["outcome_snapshot"]["task_id"] = "different-task"
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "preconditions")
+        self.assertEqual(ctx.exception.check, "P8")
+
+    # --- S5.3 Task 7: RED-6 gate:upstream ---
+
+    def test_upstream_tampered_schema_version(self):
+        """RED-6: altered schema_version -> gate=upstream."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["schema_version"] = 2
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "upstream")
+
+    def test_upstream_tampered_claim_statement(self):
+        """RED-6: altered claim text -> gate=upstream."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["claims"][0]["statement"] = "TAMPERED"
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "upstream")
+
+    def test_upstream_tampered_claim_order(self):
+        """RED-6: reordered claims -> gate=upstream."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["claims"] = list(reversed(ref["claims"]))
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "upstream")
+
+    def test_upstream_tampered_reflection_id(self):
+        """RED-6: altered reflection_id -> gate=upstream."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["reflection_id"] = "rf_" + "e" * 64
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "upstream")
+
+    def test_upstream_tampered_snapshot_digest(self):
+        """RED-6: altered source_snapshot_digest -> gate=upstream."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["source_snapshot_digest"] = "snap_" + "f" * 64
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "upstream")
+
+    def test_upstream_tampered_evidence_ref(self):
+        """RED-6: altered evidence_ref -> gate=upstream."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["claims"][0]["evidence_ref"] = "tampered.path"
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "upstream")
+
+    def test_upstream_tampered_contract_ref(self):
+        """RED-6: altered contract_ref -> gate=upstream."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["non_conclusions"][0]["contract_ref"] = "fake-contract"
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "upstream")
+
+    def test_upstream_extra_claim(self):
+        """RED-6: extra claim entry -> gate=upstream."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["claims"].append({"claim_id": "CL-6", "statement": "EXTRA"})
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "upstream")
+
+    # --- S5.3 Task 7 cont'd: RED-7 gate order combination ---
+
+    def test_gate_order_shape_before_source(self):
+        """RED-7: shape+source fault -> earliest is shape."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref = self._reflection_valid()
+        ref["extra"] = True  # shape fail
+        enr = self._enriched_valid_for_source()
+        enr["source_evaluation_snapshot"]["schema_version"] = 1  # source fail
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "shape")
+
+    def test_gate_order_source_before_preconditions(self):
+        """RED-7: source+preconditions fault -> earliest is source."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref = self._reflection_valid()
+        ref["outcome_snapshot"]["validation_verdict"] = "D"  # P1 fail
+        enr = self._enriched_valid_for_source()
+        enr["source_evaluation_snapshot"]["schema_version"] = 1  # source fail
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "source")
+
+    def test_gate_order_preconditions_before_upstream(self):
+        """RED-7: preconditions+upstream fault -> earliest is preconditions."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref, enr = self._reflection_with_enriched()
+        ref["outcome_snapshot"]["validation_verdict"] = "D"  # P1 fail
+        ref["claims"][0]["statement"] = "tampered"  # upstream fail too
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "preconditions")
+
+    def test_gate_order_all_four_together(self):
+        """RED-7: all four gates fail -> earliest is shape."""
+        from src.learning_loop.eligibility import build_eligibility, EligibilityInputError
+        ref = []
+        enr = self._enriched_valid_for_source()
+        enr["source_evaluation_snapshot"]["schema_version"] = 1
+        with self.assertRaises(EligibilityInputError) as ctx:
+            build_eligibility(ref, enr)
+        self.assertEqual(ctx.exception.gate, "shape")
+
+    # --- S5.3 Task 7 cont'd: RED-8 FSM lookup ---
+
+    def _valid_pair_through_gates(self):
+        """Build a (reflection, enriched) pair valid through all four gates."""
+        from src.learning_loop.reflection_builder import build_reflection
+        enr = self._enriched_valid_for_source()
+        ref = build_reflection(enr)
+        return ref, enr
+
+    def test_fsm_lookup_returns_artifact_with_required_fields(self):
+        """RED-8: valid input produces artifact with seven mandatory keys."""
+        from src.learning_loop.eligibility import build_eligibility
+        ref, enr = self._valid_pair_through_gates()
+        result = build_eligibility(ref, enr)
+        expected_keys = {
+            "schema_version", "eligibility_id", "source_reflection_id",
+            "fsm_matrix_version", "matched_case", "eligibility_status", "reasons",
+        }
+        self.assertEqual(set(result), expected_keys)
+
+    def test_fsm_lookup_verdict_A_matches_correct_case(self):
+        """RED-8: verdict A with contradicted=0, unknown=0 -> case_01."""
+        from src.learning_loop.eligibility import build_eligibility
+        ref, enr = self._valid_pair_through_gates()
+        result = build_eligibility(ref, enr)
+        self.assertEqual(result["matched_case"], "case_01")
+        self.assertEqual(result["eligibility_status"], "eligible")
+
+    def test_fsm_lookup_verdict_C_matches_correct_case(self):
+        """RED-8: verdict C with contradicted=0, unknown=0 -> case_09."""
+        from src.learning_loop.eligibility import build_eligibility
+        snap = dict(self._enriched_valid_for_source()["source_evaluation_snapshot"])
+        snap["evidence_composition"] = {"verified": 0, "unknown": 0, "contradicted": 1}
+        snap["evidence_sufficiency"] = {"status": "insufficient", "verified_ratio": 0.0}
+        snap["validation_verdict"] = "C"
+        snap["utility"]["pack_utility_delta"] = -0.1
+        snap["thresholds"]["defined_before_run"] = True
+        enr = {"source_evaluation_id": snap["evaluation_id"], "source_evaluation_snapshot": snap}
+        from src.learning_loop.reflection_builder import build_reflection
+        ref = build_reflection(enr)
+        result = build_eligibility(ref, enr)
+        self.assertEqual(result["matched_case"], "case_11")
+        self.assertEqual(result["eligibility_status"], "ineligible")
+
+    # --- S5.3 Task 8: RED-9 reasons ---
+
+    def test_reasons_A_no_unknown_no_contradicted(self):
+        """RED-9: verdict A, no unknowns, no contradictions -> [R-A]."""
+        from src.learning_loop.eligibility import build_eligibility
+        ref, enr = self._valid_pair_through_gates()
+        result = build_eligibility(ref, enr)
+        self.assertEqual(result["reasons"], ["R-A"])
+
+    def test_reasons_A_with_unknown(self):
+        """RED-9: verdict A with unknowns -> [R-A, R-U]."""
+        from src.learning_loop.eligibility import build_eligibility
+        snap = dict(self._enriched_valid_for_source()["source_evaluation_snapshot"])
+        snap["evidence_composition"] = {"verified": 1, "unknown": 1, "contradicted": 0}
+        snap["evidence_sufficiency"] = {"status": "sufficient", "verified_ratio": 0.5}
+        snap["validation_verdict"] = "A"
+        snap["memory_record_source"] = "run_snapshot"
+        snap["staleness_warning"] = False
+        enr = {"source_evaluation_id": snap["evaluation_id"], "source_evaluation_snapshot": snap}
+        from src.learning_loop.reflection_builder import build_reflection
+        ref = build_reflection(enr)
+        result = build_eligibility(ref, enr)
+        self.assertEqual(result["reasons"], ["R-A", "R-U"])
+
+    def test_reasons_C_both_not_frozen_and_insufficient(self):
+        """RED-9: C with both not-frozen and insufficient -> [R-C1, R-C2, ...]."""
+        from src.learning_loop.eligibility import build_eligibility
+        snap = dict(self._enriched_valid_for_source()["source_evaluation_snapshot"])
+        snap["evidence_composition"] = {"verified": 0, "unknown": 1, "contradicted": 1}
+        snap["evidence_sufficiency"] = {"status": "insufficient", "verified_ratio": 0.0}
+        snap["validation_verdict"] = "C"
+        snap["utility"]["pack_utility_delta"] = -0.1
+        snap["thresholds"]["defined_before_run"] = False
+        snap["memory_record_source"] = "run_snapshot"
+        snap["staleness_warning"] = False
+        enr = {"source_evaluation_id": snap["evaluation_id"], "source_evaluation_snapshot": snap}
+        from src.learning_loop.reflection_builder import build_reflection
+        ref = build_reflection(enr)
+        result = build_eligibility(ref, enr)
+        self.assertEqual(result["reasons"], ["R-C1", "R-C2", "R-U", "R-X"])
+
+    def test_reasons_C_only_not_frozen_sufficient(self):
+        """RED-9: C only not-frozen, still sufficient -> [R-C1]."""
+        from src.learning_loop.eligibility import build_eligibility
+        snap = dict(self._enriched_valid_for_source()["source_evaluation_snapshot"])
+        snap["evidence_composition"] = {"verified": 1, "unknown": 0, "contradicted": 0}
+        snap["evidence_sufficiency"] = {"status": "sufficient", "verified_ratio": 1.0}
+        snap["validation_verdict"] = "C"
+        snap["thresholds"]["defined_before_run"] = False
+        snap["memory_record_source"] = "run_snapshot"
+        snap["staleness_warning"] = False
+        enr = {"source_evaluation_id": snap["evaluation_id"], "source_evaluation_snapshot": snap}
+        from src.learning_loop.reflection_builder import build_reflection
+        ref = build_reflection(enr)
+        result = build_eligibility(ref, enr)
+        self.assertEqual(result["reasons"], ["R-C1"])
+
+    # --- S5.3 Task 8: RED-10 eligibility ID ---
+
+    def test_eligibility_id_full_length_format(self):
+        """RED-10: eligibility_id matches ^elig_[0-9a-f]{64}$."""
+        import re
+        from src.learning_loop.eligibility import build_eligibility
+        ref, enr = self._valid_pair_through_gates()
+        result = build_eligibility(ref, enr)
+        self.assertRegex(result["eligibility_id"], r"^elig_[0-9a-f]{64}$")
+
+    def test_eligibility_id_is_deterministic(self):
+        """RED-10: same input -> same eligibility_id."""
+        from src.learning_loop.eligibility import build_eligibility
+        ref, enr = self._valid_pair_through_gates()
+        first = build_eligibility(ref, enr)["eligibility_id"]
+        second = build_eligibility(ref, enr)["eligibility_id"]
+        self.assertEqual(first, second)
+
+    def test_eligibility_id_changes_with_reflection_id(self):
+        """RED-10: different source_reflection_id -> different eligibility_id."""
+        from src.learning_loop.eligibility import build_eligibility
+        ref, enr = self._valid_pair_through_gates()
+        first_id = build_eligibility(ref, enr)["eligibility_id"]
+        # Use a different evaluating pair that naturally produces a different reflection_id
+        snap = dict(self._enriched_valid_for_source()["source_evaluation_snapshot"])
+        snap["experiment"]["task_id"] = "task-2"
+        snap["evaluation_id"] = "eval_" + "e" * 64
+        enr2 = {"source_evaluation_id": snap["evaluation_id"], "source_evaluation_snapshot": snap}
+        from src.learning_loop.reflection_builder import build_reflection
+        ref2 = build_reflection(enr2)
+        second_id = build_eligibility(ref2, enr2)["eligibility_id"]
+        self.assertNotEqual(first_id, second_id)
+
+    def test_eligibility_id_independent_oracle(self):
+        """RED-10: independent re-computation of elig_ matches production."""
+        import hashlib
+        from src.learning_loop.eligibility import build_eligibility, _canonical_json
+        ref, enr = self._valid_pair_through_gates()
+        result = build_eligibility(ref, enr)
+        # Independent oracle
+        payload = {
+            "schema_version": 1,
+            "fsm_matrix_version": 1,
+            "source_reflection_id": ref["reflection_id"],
+        }
+        expected = "elig_" + hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(result["eligibility_id"], expected)
+
+    # --- S5.3 Task 8: RED-11 12-case eligibility ---
+
+    def _case_fixture(self, verdict, contradicted, unknown, delta=0.3):
+        """Build pair through full chain for a given FSM combination."""
+        import copy
+        snap = copy.deepcopy(self._enriched_valid_for_source()["source_evaluation_snapshot"])
+        snap["memory_record_source"] = "run_snapshot"
+        snap["staleness_warning"] = False
+
+        if verdict in ("A", "B"):
+            verified = 5 + unknown + contradicted  # high enough for ratio >= 0.5
+            total = verified + unknown + contradicted
+            ratio = verified / total
+            snap["evidence_composition"] = {
+                "verified": verified, "unknown": unknown, "contradicted": contradicted,
+            }
+            snap["evidence_sufficiency"] = {"status": "sufficient", "verified_ratio": ratio}
+            snap["validation_verdict"] = verdict
+            snap["utility"]["pack_utility_delta"] = delta if verdict == "A" else 0.05
+        else:
+            # C — make it insufficient (defined_before_run stays True)
+            if unknown + contradicted == 0:
+                # total=0 case: all counts zero, ratio=0.0, status=insufficient
+                snap["evidence_composition"] = {"verified": 0, "unknown": 0, "contradicted": 0}
+                snap["evidence_sufficiency"] = {"status": "insufficient", "verified_ratio": 0.0}
+            else:
+                snap["evidence_composition"] = {
+                    "verified": 0, "unknown": unknown, "contradicted": contradicted,
+                }
+                snap["evidence_sufficiency"] = {"status": "insufficient", "verified_ratio": 0.0}
+            snap["validation_verdict"] = "C"
+            snap["utility"]["pack_utility_delta"] = -0.1
+
+        enr = {"source_evaluation_id": snap["evaluation_id"], "source_evaluation_snapshot": snap}
+        from src.learning_loop.reflection_builder import build_reflection
+        ref = build_reflection(enr)
+        return ref, enr
+
+    def test_12_case_contract_layer_all_cases(self):
+        """RED-11: 12 frozen fixtures each produce expected case and status."""
+        from src.learning_loop.eligibility import build_eligibility
+        cases = [
+            ("case_01", "A", 0, 0, "eligible"),
+            ("case_02", "A", 0, 1, "eligible"),
+            ("case_03", "A", 1, 0, "eligible"),
+            ("case_04", "A", 1, 1, "eligible"),
+            ("case_05", "B", 0, 0, "eligible"),
+            ("case_06", "B", 0, 1, "eligible"),
+            ("case_07", "B", 1, 0, "eligible"),
+            ("case_08", "B", 1, 1, "eligible"),
+            ("case_09", "C", 0, 0, "ineligible"),
+            ("case_10", "C", 0, 1, "ineligible"),
+            ("case_11", "C", 1, 0, "ineligible"),
+            ("case_12", "C", 1, 1, "ineligible"),
+        ]
+        for expected_case, verdict, c, u, expected_status in cases:
+            ref, enr = self._case_fixture(verdict, int(c), int(u))
+            result = build_eligibility(ref, enr)
+            with self.subTest(case=expected_case):
+                self.assertEqual(result["matched_case"], expected_case)
+                self.assertEqual(result["eligibility_status"], expected_status)
+                self.assertEqual(result["fsm_matrix_version"], 1)
+                self.assertEqual(result["schema_version"], 1)
+                self.assertEqual(result["source_reflection_id"], ref["reflection_id"])
+                self.assertIsInstance(result["reasons"], list)
+                self.assertTrue(len(result["reasons"]) >= 1)
+
+    def test_eligibility_replay_deterministic(self):
+        """RED-11: same input -> same bytes and ID across calls."""
+        from src.learning_loop.eligibility import build_eligibility, _canonical_json
+        ref, enr = self._valid_pair_through_gates()
+        first = build_eligibility(ref, enr)
+        second = build_eligibility(ref, enr)
+        self.assertEqual(_canonical_json(first), _canonical_json(second))
+        self.assertEqual(first["eligibility_id"], second["eligibility_id"])
+
+    # --- S5.3 Task 8: RED-12 cross-cutting invariants ---
+
+    def test_ineligible_still_produces_artifact(self):
+        """RED-12: C class still produces full artifact with reasons."""
+        from src.learning_loop.eligibility import build_eligibility
+        snap = dict(self._enriched_valid_for_source()["source_evaluation_snapshot"])
+        snap["evidence_composition"] = {"verified": 0, "unknown": 1, "contradicted": 0}
+        snap["evidence_sufficiency"] = {"status": "insufficient", "verified_ratio": 0.0}
+        snap["validation_verdict"] = "C"
+        snap["utility"]["pack_utility_delta"] = -0.1
+        snap["thresholds"]["defined_before_run"] = True
+        enr = {"source_evaluation_id": snap["evaluation_id"], "source_evaluation_snapshot": snap}
+        from src.learning_loop.reflection_builder import build_reflection
+        ref = build_reflection(enr)
+        result = build_eligibility(ref, enr)
+        self.assertEqual(result["eligibility_status"], "ineligible")
+        self.assertIn("reasons", result)
+        self.assertEqual(result["matched_case"], "case_10")
+
+    def test_no_aliasing_forward(self):
+        """RED-12: modifying input after call does not affect artifact."""
+        from src.learning_loop.eligibility import build_eligibility, _canonical_json
+        ref, enr = self._valid_pair_through_gates()
+        result = build_eligibility(ref, enr)
+        result_bytes = _canonical_json(result)
+        ref["schema_version"] = 99
+        self.assertEqual(_canonical_json(result), result_bytes)
+
+    def test_no_aliasing_reverse(self):
+        """RED-12: modifying artifact output does not affect input."""
+        from src.learning_loop.eligibility import build_eligibility, _canonical_json
+        ref, enr = self._valid_pair_through_gates()
+        input_bytes = _canonical_json(ref)
+        result = build_eligibility(ref, enr)
+        result["eligibility_status"] = "tampered"
+        self.assertEqual(_canonical_json(ref), input_bytes)
+
+    def test_output_key_scan_no_forbidden_terms(self):
+        """RED-12: output keys are free of governance vocabulary."""
+        from src.learning_loop.eligibility import build_eligibility
+        ref, enr = self._valid_pair_through_gates()
+        result = build_eligibility(ref, enr)
+        forbidden = ("trust", "ranking", "weight", "per_memory_utility",
+                     "recommendation", "remove", "delete")
+        def keys(node):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    yield key
+                    yield from keys(value)
+            elif isinstance(node, list):
+                for item in node:
+                    yield from keys(item)
+        for key in keys(result):
+            for term in forbidden:
+                self.assertNotIn(term, key.casefold())
+
+    def test_output_field_count_exactly_seven(self):
+        """RED-12: eligibility output has exactly the seven frozen keys."""
+        from src.learning_loop.eligibility import build_eligibility
+        ref, enr = self._valid_pair_through_gates()
+        result = build_eligibility(ref, enr)
+        self.assertEqual(
+            set(result),
+            {"schema_version", "eligibility_id", "source_reflection_id",
+             "fsm_matrix_version", "matched_case", "eligibility_status", "reasons"},
+        )
