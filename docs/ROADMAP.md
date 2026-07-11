@@ -15,13 +15,26 @@
 
 ## 当前发布范围
 
-- 当前正式版本为 `v0.9.0`。
+- 当前正式版本为 `v0.10.0`。
 - 当前实现、集成、验收和发布范围仅承诺 macOS 与 Python 3.11 或更高版本；Linux 和 Windows 兼容性后置到独立阶段。
 - 文献系统不再作为内置路线阶段推进；未来如有需要，只通过 External Adapter 接口接入。
 - 当前路线不把大型自主 Agent、完整 Meta Planner 或多 Agent 自主协商作为交付目标。
 - 规则型协调器只负责受约束推进，不直接写 active memory，不绕过 Review Gate。
 
-## 当前 Gate：v0.9.0 正式源码发布已完成
+## 当前 Gate：v0.10.0 正式源码发布已完成
+
+v0.10.0 发布准备、四轮外部发布评审与正式发布记录在：
+
+```text
+docs/progress/2026-07-11-v0.10.0-release-preparation.md
+```
+
+- 发布范围：v0.9.0 后四条特性流（原子 vault 晋升、Phase 4 评估基础、Handoff 能力、Phase 5 学习链 S5.1–S5.4）。
+- 全量回归 879 项通过；发布评审四轮收敛至 GO，三个真实缺陷（handoff workspace 隔离、文档命令引导、API 兼容性回归）在 tag 前修复。
+- PR #39 合并，`v0.10.0` tag 已创建，GitHub Release 已发布（非 prerelease，纯源码发布，deployment 为 not_applicable）。
+- Phase 5 设计权威（基线 v4.3.1 含修正案 A4）快照入库 `docs/design/phase-5/`。
+
+## 上一 Gate：v0.9.0 正式源码发布已完成
 
 Stage 17 本地 macOS 整合验收、发布准备与正式发布记录在：
 

@@ -1,7 +1,6 @@
 {
-  "version": "v0.9.0",
+  "version": "v0.10.0",
   "schema_version": 3,
-  "release_readiness": "passed",
   "v0.8_release_readiness": "passed",
   "active_platform_scope": "macos_only",
   "minimum_python_version": "3.11",
@@ -131,5 +130,20 @@
   "gui": "not_implemented",
   "large_coordinator": "not_implemented",
   "built_in_literature_system_expansion": "out_of_scope",
-  "future_literature_capability": "external_interface_only"
+  "future_literature_capability": "external_interface_only",
+  "v0.9_release_readiness": "passed",
+  "release_readiness": "passed",
+  "v0.10_release_review_rounds": 4,
+  "v0.10_release_review_final": "GO",
+  "v0.10_full_regression_test_count": 879,
+  "v0.10_release_pr": 39,
+  "v0.10_tag": "created",
+  "v0.10_github_release": "published",
+  "phase_5_learning_chain": "implemented",
+  "phase_5_design_baseline": "v4.3.1",
+  "phase_5_queue_request_persistence": "implemented",
+  "phase_5_e5_obligation": "closed",
+  "handoff_workspace_isolation": "enforced",
+  "atomic_vault_promotion": "implemented",
+  "runtime_agent_count": 12
 }
