@@ -3408,3 +3408,1149 @@ class S54QueueRequestTests(unittest.TestCase):
         eligibility, reflection, enriched = self._full_chain()
         rq = build_review_queue_request(eligibility, reflection, enriched)
         self.assertEqual(_canonical_json(rq), self._oracle_canonical(rq))
+
+
+class _Crash(Exception):
+    """Injected crash marker for S5.4 persistence fault-injection tests."""
+
+
+class S54PersistenceTests(unittest.TestCase):
+    """S5.4 persistence layer (state_dir chain E->R->El->Q) — RED/GREEN TDD.
+
+    Plan: S5.4 Implementation Plan r7.1 (baseline v4.3.1, amendment A4 in effect).
+    Frozen public surface under test:
+      persist_learning_chain(state_dir, enriched, *, forbidden_roots=())
+      resume_learning_chain(state_dir, evaluation_id, source_snapshot_digest, *, forbidden_roots=())
+      PersistenceError(ValueError) with .gate/.code
+      module-level I/O shim `_io` exposing exactly the 12 frozen ops
+    """
+
+    maxDiff = None
+
+    _SHIM_OPS = (
+        "lstat", "scandir_names", "read_bytes", "open_exclusive", "write_all",
+        "close", "fsync_file", "fsync_dir", "mkdir", "link", "unlink",
+        "resolve_path",
+    )
+
+    # --- fixtures ---
+
+    def _valid_bundle(self, **overrides):
+        bundle = {
+            "experiment": {
+                "task_id": "task-persist",
+                "without_memory_run_id": "run-a",
+                "with_memory_run_id": "run-b",
+            },
+            "without_memory_outcome": {
+                "run_id": "run-a", "score": 0.2, "used_memory_ids": [],
+            },
+            "with_memory_outcome": {
+                "run_id": "run-b", "score": 0.5, "used_memory_ids": ["memory-1"],
+            },
+            "comparison": {
+                "task_id": "task-persist",
+                "first_run_id": "run-a",
+                "second_run_id": "run-b",
+                "first_score": 0.2,
+                "second_score": 0.5,
+                "score_delta": 0.3,
+            },
+            "memory_records": [
+                {
+                    "id": "memory-1", "confidence": "confirmed",
+                    "status": "active", "superseded_by": [],
+                },
+            ],
+            "thresholds": {
+                "utility_delta_min": 0.1,
+                "verified_ratio_min": 0.5,
+                "defined_before_run": True,
+            },
+        }
+        bundle.update(overrides)
+        return bundle
+
+    def _enriched(self, **bundle_overrides):
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+        from src.learning_loop.enrichment import build_enriched_utility_evaluation
+        bundle = self._valid_bundle(**bundle_overrides)
+        return build_enriched_utility_evaluation(evaluate_experiment_bundle(bundle))
+
+    def _ineligible_enriched(self):
+        bundle = self._valid_bundle()
+        bundle["thresholds"]["defined_before_run"] = False
+        return self._enriched(**bundle)
+
+    @staticmethod
+    def _oracle_canonical(value):
+        import json
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True, allow_nan=False,
+        )
+
+    def _state_dir(self):
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="s54-state-")
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        return tmp
+
+    def _paths(self, state_dir, enriched):
+        """Oracle-computed layout paths for a chain."""
+        import hashlib
+        from pathlib import Path
+        snap = enriched["source_evaluation_snapshot"]
+        eval_id = enriched["source_evaluation_id"]
+        digest = "snap_" + hashlib.sha256(
+            self._oracle_canonical(snap).encode("utf-8")
+        ).hexdigest()
+        digest_dir = Path(state_dir) / "evaluations" / eval_id / digest
+        return {
+            "eval_id": eval_id,
+            "digest": digest,
+            "digest_dir": digest_dir,
+            "E": digest_dir / "enriched_utility_evaluation.json",
+            "R": digest_dir / "reflection.json",
+            "El": digest_dir / "eligibility.json",
+            "queue_dir": Path(state_dir) / "review_queue",
+        }
+
+    def _rq_path(self, state_dir, eligibility_id):
+        import hashlib
+        from pathlib import Path
+        payload = self._oracle_canonical({"source_eligibility_id": eligibility_id})
+        rq_id = "rq_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return Path(state_dir) / "review_queue" / (rq_id + ".json")
+
+    def _persist(self, state_dir, enriched, **kw):
+        from src.learning_loop.persistence import persist_learning_chain
+        return persist_learning_chain(state_dir, enriched, **kw)
+
+    def _resume(self, state_dir, eval_id, digest, **kw):
+        from src.learning_loop.persistence import resume_learning_chain
+        return resume_learning_chain(state_dir, eval_id, digest, **kw)
+
+    def _tree_bytes(self, state_dir):
+        """Map of relative path -> bytes for every regular file under state_dir."""
+        from pathlib import Path
+        out = {}
+        for p in sorted(Path(state_dir).rglob("*")):
+            if p.is_file() and not p.is_symlink():
+                out[str(p.relative_to(state_dir))] = p.read_bytes()
+        return out
+
+    def _record_ops(self):
+        """Patch every shim op to record (name, first-arg) while calling through."""
+        from unittest import mock
+        from src.learning_loop import persistence
+        calls = []
+        def wrap(name, real):
+            def inner(*args, **kwargs):
+                calls.append((name, args[0] if args else None))
+                return real(*args, **kwargs)
+            return inner
+        for name in self._SHIM_OPS:
+            real = getattr(persistence._io, name)
+            patcher = mock.patch.object(persistence._io, name, wrap(name, real))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return calls
+
+    def _err(self):
+        from src.learning_loop.persistence import PersistenceError
+        return PersistenceError
+
+    # --- S5.4 RED-2: fs preconditions and path gate ---
+
+    def test_persistence_imports(self):
+        """RED-2: entries, error type, and 12-op shim are importable/frozen."""
+        from src.learning_loop.persistence import (
+            persist_learning_chain, resume_learning_chain, PersistenceError, _io,
+        )
+        self.assertTrue(callable(persist_learning_chain))
+        self.assertTrue(callable(resume_learning_chain))
+        self.assertTrue(issubclass(PersistenceError, ValueError))
+        for op in self._SHIM_OPS:
+            self.assertTrue(callable(getattr(_io, op)), op)
+
+    def test_persistence_error_gate_code(self):
+        """RED-2: PersistenceError carries gate and code."""
+        err = self._err()(gate="path", code="missing_state_dir", message="x")
+        self.assertEqual(err.gate, "path")
+        self.assertEqual(err.code, "missing_state_dir")
+
+    def test_state_dir_must_exist_and_not_be_created(self):
+        """RED-2 (r6-M1): missing state_dir -> gate=path, root not created."""
+        import os
+        state = self._state_dir()
+        missing = os.path.join(state, "does-not-exist")
+        with self.assertRaises(self._err()) as ctx:
+            self._persist(missing, self._enriched())
+        self.assertEqual(ctx.exception.gate, "path")
+        self.assertFalse(os.path.exists(missing))
+
+    def test_state_dir_file_rejected(self):
+        """RED-2 (r6-M1): state_dir that is a regular file -> gate=path."""
+        import os
+        state = self._state_dir()
+        f = os.path.join(state, "afile")
+        open(f, "w").close()
+        with self.assertRaises(self._err()) as ctx:
+            self._persist(f, self._enriched())
+        self.assertEqual(ctx.exception.gate, "path")
+
+    def test_state_dir_symlink_rejected(self):
+        """RED-2 (r3ext-D3): symlinked state_dir -> gate=path."""
+        import os
+        state = self._state_dir()
+        real = os.path.join(state, "real")
+        os.mkdir(real)
+        link = os.path.join(state, "link")
+        os.symlink(real, link)
+        with self.assertRaises(self._err()) as ctx:
+            self._persist(link, self._enriched())
+        self.assertEqual(ctx.exception.gate, "path")
+
+    def test_forbidden_roots_rejected(self):
+        """RED-2 (r4-C2): state_dir under caller-provided forbidden root -> gate=path."""
+        import os
+        parent = self._state_dir()
+        state = os.path.join(parent, "state")
+        os.mkdir(state)
+        with self.assertRaises(self._err()) as ctx:
+            self._persist(state, self._enriched(), forbidden_roots=(parent,))
+        self.assertEqual(ctx.exception.gate, "path")
+
+    def test_forbidden_root_symlink_escape_detected(self):
+        """RED-2 (r3ext-D3): textual path outside, resolving inside forbidden root -> gate=path."""
+        import os
+        parent = self._state_dir()
+        inner = os.path.join(parent, "inner")
+        os.mkdir(inner)
+        outside = self._state_dir()
+        alias = os.path.join(outside, "alias")
+        os.symlink(inner, alias)
+        with self.assertRaises(self._err()) as ctx:
+            self._persist(alias, self._enriched(), forbidden_roots=(parent,))
+        self.assertEqual(ctx.exception.gate, "path")
+
+    def test_repository_root_rejected(self):
+        """RED-2 (r4-C2/r7-M1): state_dir inside the repository -> gate=path (lexical self-detect)."""
+        import os, tempfile
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(
+            __import__("src.learning_loop", fromlist=["__file__"]).__file__
+        )))
+        state = tempfile.mkdtemp(prefix="s54-in-repo-", dir=repo_root)
+        self.addCleanup(__import__("shutil").rmtree, state, True)
+        with self.assertRaises(self._err()) as ctx:
+            self._persist(state, self._enriched())
+        self.assertEqual(ctx.exception.gate, "path")
+
+    def test_child_symlink_directory_rejected(self):
+        """RED-2 (r4-C1): symlinked evaluations/ component -> gate=path, no traversal."""
+        import os
+        state = self._state_dir()
+        elsewhere = self._state_dir()
+        os.symlink(elsewhere, os.path.join(state, "evaluations"))
+        with self.assertRaises(self._err()) as ctx:
+            self._persist(state, self._enriched())
+        self.assertEqual(ctx.exception.gate, "path")
+        self.assertEqual(os.listdir(elsewhere), [])
+
+    def test_probe_leaves_no_residue_on_success(self):
+        """RED-2 (r7-m1): successful persist leaves no .tmp.* anywhere (probe dual-unlink)."""
+        from pathlib import Path
+        state = self._state_dir()
+        self._persist(state, self._enriched())
+        residues = [p for p in Path(state).rglob(".tmp.*")]
+        self.assertEqual(residues, [])
+
+    def test_probe_never_runs_on_corrupt_chain(self):
+        """RED-2 (r3ext-D2): corrupt state -> zero mutating ops (probe suppressed)."""
+        import os
+        state = self._state_dir()
+        paths = self._paths(state, self._enriched())
+        os.makedirs(paths["digest_dir"])
+        paths["R"].write_bytes(b"{}")  # downstream without upstream E = non-prefix
+        calls = self._record_ops()
+        with self.assertRaises(self._err()):
+            self._persist(state, self._enriched())
+        mutating = [c for c in calls if c[0] in
+                    ("open_exclusive", "write_all", "mkdir", "link")]
+        self.assertEqual(mutating, [])
+        unlinks = [c for c in calls if c[0] == "unlink"]
+        for _, target in unlinks:
+            self.assertIn(".tmp.", str(target))
+
+    # --- S5.4 RED-3: typed preflight ---
+
+    def test_persist_eligible_full_chain_layout(self):
+        """RED-3: eligible persist writes E/R/El in digest dir and exactly one rq."""
+        state = self._state_dir()
+        enriched = self._enriched()
+        result = self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        for key in ("E", "R", "El"):
+            self.assertTrue(paths[key].is_file(), key)
+        rq = self._rq_path(state, result["eligibility"]["eligibility_id"])
+        self.assertTrue(rq.is_file())
+        queue_files = [p for p in paths["queue_dir"].iterdir() if p.suffix == ".json"]
+        self.assertEqual(queue_files, [rq])
+
+    def test_persist_ineligible_terminates_at_el(self):
+        """RED-3 (r1-1): ineligible persist ends at [E,R,El]; no queue artifact."""
+        state = self._state_dir()
+        enriched = self._ineligible_enriched()
+        result = self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        for key in ("E", "R", "El"):
+            self.assertTrue(paths[key].is_file(), key)
+        self.assertIsNone(result["review_queue_request"])
+        if paths["queue_dir"].exists():
+            self.assertEqual(
+                [p for p in paths["queue_dir"].iterdir() if p.suffix == ".json"], []
+            )
+
+    def test_persist_idempotent_byte_identical(self):
+        """RED-3: second persist over identical input is a byte-identical no-op."""
+        state = self._state_dir()
+        enriched = self._enriched()
+        self._persist(state, enriched)
+        before = self._tree_bytes(state)
+        result2 = self._persist(state, enriched)
+        self.assertEqual(self._tree_bytes(state), before)
+        self.assertIn("eligibility", result2)
+
+    def test_resume_converges_from_every_eligible_prefix(self):
+        """RED-3/RED-6: deleting any legal suffix then resume restores identical bytes."""
+        state = self._state_dir()
+        enriched = self._enriched()
+        result = self._persist(state, enriched)
+        reference = self._tree_bytes(state)
+        paths = self._paths(state, enriched)
+        rq = self._rq_path(state, result["eligibility"]["eligibility_id"])
+        suffixes = (
+            [rq],                        # [E,R,El] crash prefix
+            [rq, paths["El"]],           # [E,R]
+            [rq, paths["El"], paths["R"]],  # [E]
+        )
+        for to_delete in suffixes:
+            with self.subTest(prefix_missing=[p.name for p in to_delete]):
+                for p in to_delete:
+                    p.unlink()
+                self._resume(state, paths["eval_id"], paths["digest"])
+                self.assertEqual(self._tree_bytes(state), reference)
+
+    def test_resume_missing_e_fails_closed(self):
+        """RED-3 (r2-B1): E absent with downstream present = non-prefix -> gate=preflight."""
+        state = self._state_dir()
+        enriched = self._enriched()
+        self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        paths["E"].unlink()
+        with self.assertRaises(self._err()) as ctx:
+            self._resume(state, paths["eval_id"], paths["digest"])
+        self.assertEqual(ctx.exception.gate, "preflight")
+
+    def test_resume_on_empty_state_reports_missing_e(self):
+        """RED-3 (r2-B1): resume on legal ∅ fails closed (caller must persist)."""
+        state = self._state_dir()
+        enriched = self._enriched()
+        paths = self._paths(state, enriched)
+        with self.assertRaises(self._err()) as ctx:
+            self._resume(state, paths["eval_id"], paths["digest"])
+        self.assertEqual(ctx.exception.gate, "preflight")
+
+    def test_resume_rejects_bad_id_syntax(self):
+        """RED-1: malformed evaluation_id / digest -> gate=path before any traversal."""
+        state = self._state_dir()
+        with self.assertRaises(self._err()) as ctx:
+            self._resume(state, "eval_not-hex", "snap_" + "a" * 64)
+        self.assertEqual(ctx.exception.gate, "path")
+        with self.assertRaises(self._err()) as ctx2:
+            self._resume(state, "eval_" + "a" * 64, "SNAP_" + "A" * 64)
+        self.assertEqual(ctx2.exception.gate, "path")
+
+    def test_ineligible_with_q_is_corruption(self):
+        """RED-3 (r1-1): planted Q on an ineligible chain -> gate=preflight corruption."""
+        state = self._state_dir()
+        enriched = self._ineligible_enriched()
+        result = self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        rq = self._rq_path(state, result["eligibility"]["eligibility_id"])
+        rq.parent.mkdir(exist_ok=True)
+        rq.write_bytes(b"{}")
+        with self.assertRaises(self._err()) as ctx:
+            self._resume(state, paths["eval_id"], paths["digest"])
+        self.assertEqual(ctx.exception.gate, "preflight")
+
+    def test_tampered_artifact_detected_and_untouched(self):
+        """RED-3 (r1-10): byte-mismatched R -> error; existing file bytes unchanged."""
+        state = self._state_dir()
+        enriched = self._enriched()
+        self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        tampered = paths["R"].read_bytes() + b" "
+        paths["R"].write_bytes(tampered)
+        with self.assertRaises(self._err()) as ctx:
+            self._resume(state, paths["eval_id"], paths["digest"])
+        self.assertEqual(ctx.exception.gate, "preflight")
+        self.assertEqual(paths["R"].read_bytes(), tampered)
+
+    def test_noncanonical_e_rejected(self):
+        """RED-3 (r2-B5): semantically equal but non-canonical E bytes -> gate=preflight."""
+        import json
+        state = self._state_dir()
+        enriched = self._enriched()
+        self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        loose = json.dumps(json.loads(paths["E"].read_bytes()), indent=2).encode()
+        paths["E"].write_bytes(loose)
+        with self.assertRaises(self._err()) as ctx:
+            self._resume(state, paths["eval_id"], paths["digest"])
+        self.assertEqual(ctx.exception.gate, "preflight")
+
+    def test_path_binding_implanted_e_rejected(self):
+        """RED-1 (r2-B2): valid E implanted under a different eval id dir -> error."""
+        import shutil
+        state = self._state_dir()
+        enriched = self._enriched()
+        self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        other_eval = "eval_" + "9" * 64
+        other_dir = paths["digest_dir"].parent.parent / other_eval / paths["digest"]
+        other_dir.mkdir(parents=True)
+        shutil.copy2(paths["E"], other_dir / "enriched_utility_evaluation.json")
+        with self.assertRaises(self._err()) as ctx:
+            self._resume(state, other_eval, paths["digest"])
+        self.assertEqual(ctx.exception.gate, "preflight")
+
+    def test_empty_directory_skeleton_equals_missing(self):
+        """RED-3/RED-11 (r6-m1): pre-created empty digest dir behaves as ∅."""
+        import os
+        state = self._state_dir()
+        enriched = self._enriched()
+        paths = self._paths(state, enriched)
+        os.makedirs(paths["digest_dir"])
+        self._persist(state, enriched)
+        self.assertTrue(paths["E"].is_file())
+
+    def test_unexpected_entry_in_digest_dir_is_corruption(self):
+        """RED-3 (r6-m1): non-allowed entry inside digest dir -> gate=preflight."""
+        import os
+        state = self._state_dir()
+        enriched = self._enriched()
+        paths = self._paths(state, enriched)
+        os.makedirs(paths["digest_dir"])
+        (paths["digest_dir"] / "stray.txt").write_bytes(b"x")
+        with self.assertRaises(self._err()) as ctx:
+            self._persist(state, enriched)
+        self.assertEqual(ctx.exception.gate, "preflight")
+
+    def test_zero_write_preflight_audit(self):
+        """RED-3 (r1-11): rejected preflight performs no mutation except .tmp.* unlink."""
+        state = self._state_dir()
+        enriched = self._enriched()
+        self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        paths["E"].unlink()  # non-prefix now
+        calls = self._record_ops()
+        with self.assertRaises(self._err()):
+            self._resume(state, paths["eval_id"], paths["digest"])
+        for name, target in calls:
+            if name in ("open_exclusive", "write_all", "mkdir", "link"):
+                self.fail(f"mutating op {name} during failed preflight")
+            if name == "unlink":
+                self.assertIn(".tmp.", str(target))
+
+    # --- S5.4 RED-4: temp lifecycle ---
+
+    def test_stale_temps_cleaned_everywhere(self):
+        """RED-4: stale .tmp.* in digest dir and review_queue are removed."""
+        import os
+        state = self._state_dir()
+        enriched = self._enriched()
+        paths = self._paths(state, enriched)
+        os.makedirs(paths["digest_dir"])
+        os.makedirs(paths["queue_dir"])
+        stale1 = paths["digest_dir"] / ".tmp.reflection.json.deadbeef"
+        stale2 = paths["queue_dir"] / ".tmp.rq_x.json.deadbeef"
+        stale1.write_bytes(b"junk")
+        stale2.write_bytes(b"junk")
+        self._persist(state, enriched)
+        self.assertFalse(stale1.exists())
+        self.assertFalse(stale2.exists())
+
+    def test_symlink_temp_leaf_unlink_no_deref(self):
+        """RED-4 (r5-4): symlinked .tmp.* leaf is unlinked; its target survives."""
+        import os
+        state = self._state_dir()
+        enriched = self._enriched()
+        paths = self._paths(state, enriched)
+        os.makedirs(paths["queue_dir"])
+        outside = self._state_dir()
+        target = os.path.join(outside, "victim.json")
+        with open(target, "w") as fh:
+            fh.write("precious")
+        sym = paths["queue_dir"] / ".tmp.victim.json.cafe"
+        os.symlink(target, sym)
+        self._persist(state, enriched)
+        self.assertFalse(sym.exists())
+        self.assertTrue(os.path.exists(target))
+        with open(target) as fh:
+            self.assertEqual(fh.read(), "precious")
+
+    def test_queue_temp_name_content_does_not_change_behaviour(self):
+        """RED-4 (r3ext-B1): cleanup blind to temp name content (real rq basename vs junk)."""
+        import os
+        outcomes = []
+        for name in (".tmp.zzzz-not-an-id.json.1234", None):
+            state = self._state_dir()
+            enriched = self._enriched()
+            paths = self._paths(state, enriched)
+            os.makedirs(paths["queue_dir"])
+            result_probe = self._persist(state, enriched)
+            real_rq = self._rq_path(state, result_probe["eligibility"]["eligibility_id"])
+            import shutil
+            shutil.rmtree(state)
+            os.mkdir(state)
+            os.makedirs(paths["queue_dir"])
+            temp_name = name or (".tmp." + real_rq.name + ".5678")
+            (paths["queue_dir"] / temp_name).write_bytes(b"junk")
+            result = self._persist(state, enriched)
+            outcomes.append(self._oracle_canonical(result))
+            self.assertEqual(
+                [p.name for p in paths["queue_dir"].iterdir() if p.suffix == ".json"],
+                [real_rq.name],
+            )
+        self.assertEqual(outcomes[0], outcomes[1])
+
+    # --- S5.4 RED-5: publish sequence (shim-op level) ---
+
+    def _record_full(self):
+        """Patch every shim op to record (name, args) while calling through."""
+        from unittest import mock
+        from src.learning_loop import persistence
+        calls = []
+        def wrap(name, real):
+            def inner(*args, **kwargs):
+                calls.append((name, args))
+                return real(*args, **kwargs)
+            return inner
+        for name in self._SHIM_OPS:
+            real = getattr(persistence._io, name)
+            patcher = mock.patch.object(persistence._io, name, wrap(name, real))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return calls
+
+    def test_publish_sequence_per_artifact(self):
+        """RED-5 (r6-m2): each artifact follows open_exclusive→write_all→fsync_file→close→readback→link→unlink→fsync_dir."""
+        state = self._state_dir()
+        calls = self._record_full()
+        self._persist(state, self._enriched())
+        pattern = ["open_exclusive", "write_all", "fsync_file", "close",
+                   "read_bytes", "link", "unlink", "fsync_dir"]
+        opens = [i for i, (n, _) in enumerate(calls)
+                 if n == "open_exclusive" and ".tmp.probe" not in str(calls[i][1][0])]
+        self.assertEqual(len(opens), 4)  # E, R, El, Q
+        for i in opens:
+            names = [n for n, _ in calls[i:i + len(pattern)]]
+            self.assertEqual(names, pattern, f"artifact publish at op {i}")
+            temp_path = str(calls[i][1][0])
+            link_args = calls[i + 5][1]
+            self.assertEqual(str(link_args[0]), temp_path)
+            base = temp_path.rsplit("/", 1)[-1]
+            target_name = str(link_args[1]).rsplit("/", 1)[-1]
+            self.assertTrue(base.startswith(".tmp." + target_name + "."),
+                            f"temp {base} vs target {target_name}")
+
+    def test_mkdir_followed_by_parent_fsync_root_to_leaf(self):
+        """RED-5: every mkdir is followed by fsync_dir of its parent."""
+        state = self._state_dir()
+        calls = self._record_full()
+        self._persist(state, self._enriched())
+        import os
+        for i, (name, args) in enumerate(calls):
+            if name != "mkdir":
+                continue
+            made = os.path.abspath(str(args[0]))
+            parent = os.path.dirname(made)
+            later = [os.path.abspath(str(a[0])) for n, a in calls[i + 1:]
+                     if n == "fsync_dir"]
+            self.assertIn(parent, later, f"mkdir {made} lacks parent fsync")
+
+    def test_short_write_never_reaches_link(self):
+        """RED-5 (r6-m2): partial os.write is looped to completion; bytes still exact."""
+        import os
+        from unittest import mock
+        state = self._state_dir()
+        enriched = self._enriched()
+        real_write = os.write
+        def partial_write(fd, data):
+            return real_write(fd, bytes(data)[:5]) if len(data) > 5 else real_write(fd, data)
+        with mock.patch("os.write", side_effect=partial_write):
+            self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        import json
+        parsed = json.loads(paths["E"].read_bytes())
+        self.assertEqual(parsed["source_evaluation_id"], enriched["source_evaluation_id"])
+        self.assertEqual(
+            paths["E"].read_bytes().decode(),
+            self._oracle_canonical(parsed),
+        )
+
+    def test_no_os_replace_in_source(self):
+        """RED-5 (r1-10): os.replace must not appear in persistence source."""
+        import inspect
+        from src.learning_loop import persistence
+        self.assertNotIn("os.replace", inspect.getsource(persistence))
+
+    def test_conflicting_target_untouched_on_error(self):
+        """RED-5/RED-3 (r2-B3-10): link-exists with different bytes -> error, target intact."""
+        state = self._state_dir()
+        enriched = self._enriched()
+        self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        forged = b'{"forged":true}'
+        paths["El"].write_bytes(forged)
+        with self.assertRaises(self._err()):
+            self._resume(state, paths["eval_id"], paths["digest"])
+        self.assertEqual(paths["El"].read_bytes(), forged)
+
+    # --- S5.4 RED-10: chain-level Q-last ordering ---
+
+    def test_queue_publication_strictly_after_el(self):
+        """RED-10 (r1-8): no review_queue publication op before El's final fsync_dir."""
+        state = self._state_dir()
+        calls = self._record_full()
+        self._persist(state, self._enriched())
+        import os
+        digest_dir = None
+        queue_first = None
+        el_fsync = None
+        for i, (name, args) in enumerate(calls):
+            arg0 = str(args[0]) if args else ""
+            if "review_queue" in arg0:
+                if name == "unlink" and ".tmp." in arg0:
+                    continue  # A4 cleanup exemption
+                if name in ("mkdir", "open_exclusive", "write_all", "link",
+                            "fsync_dir") and queue_first is None:
+                    queue_first = i
+            if name == "fsync_dir" and "evaluations" in arg0 and "snap_" in arg0:
+                el_fsync = i
+        self.assertIsNotNone(queue_first)
+        self.assertIsNotNone(el_fsync)
+        self.assertGreater(queue_first, el_fsync)
+
+    def test_queue_cleanup_at_empty_state_passes_with_qlast(self):
+        """RED-10 (r2-C1): stale queue temp at ∅ is cleaned early without violating Q-last."""
+        import os
+        state = self._state_dir()
+        enriched = self._enriched()
+        paths = self._paths(state, enriched)
+        os.makedirs(paths["queue_dir"])
+        stale = paths["queue_dir"] / ".tmp.stale.json.beef"
+        stale.write_bytes(b"junk")
+        result = self._persist(state, enriched)
+        self.assertFalse(stale.exists())
+        rq = self._rq_path(state, result["eligibility"]["eligibility_id"])
+        self.assertTrue(rq.is_file())
+
+    def test_no_visible_rq_before_q_link(self):
+        """RED-10: crash immediately before Q link leaves review_queue without targets."""
+        from unittest import mock
+        from src.learning_loop import persistence
+        state = self._state_dir()
+        enriched = self._enriched()
+        real_link = persistence._io.link
+        def crashing_link(src, dst, *a, **kw):
+            if "review_queue" in str(dst):
+                raise _Crash()
+            return real_link(src, dst, *a, **kw)
+        with mock.patch.object(persistence._io, "link", crashing_link):
+            with self.assertRaises((_Crash, self._err())):
+                self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        if paths["queue_dir"].exists():
+            self.assertEqual(
+                [p for p in paths["queue_dir"].iterdir() if p.suffix == ".json"], []
+            )
+
+    # --- S5.4 RED-6: crash-replay convergence matrix ---
+
+    def _run_with_crash(self, state, enriched, crash_at, after=False):
+        """Run persist with a crash injected at shim-op index crash_at."""
+        from unittest import mock
+        from src.learning_loop import persistence
+        counter = {"n": 0}
+        def wrap(real):
+            def inner(*args, **kwargs):
+                idx = counter["n"]
+                counter["n"] += 1
+                if idx == crash_at and not after:
+                    raise _Crash()
+                result = real(*args, **kwargs)
+                if idx == crash_at and after:
+                    raise _Crash()
+                return result
+            return inner
+        patchers = []
+        for name in self._SHIM_OPS:
+            p = mock.patch.object(persistence._io, name,
+                                  wrap(getattr(persistence._io, name)))
+            p.start()
+            patchers.append(p)
+        try:
+            with self.assertRaises(_Crash):
+                self._persist(state, enriched)
+        finally:
+            for p in patchers:
+                p.stop()
+
+    def _recover(self, state, enriched):
+        """State-observed routing: resume if E on disk, else persist (⚙-4)."""
+        paths = self._paths(state, enriched)
+        if paths["E"].is_file():
+            return self._resume(state, paths["eval_id"], paths["digest"])
+        return self._persist(state, enriched)
+
+    def _count_clean_ops(self, enriched):
+        state = self._state_dir()
+        calls = self._record_full()
+        self._persist(state, enriched)
+        return len(calls), self._tree_bytes(state)
+
+    def test_crash_sweep_depth1_converges(self):
+        """RED-6: crash before AND after every shim op -> recovery converges bytewise."""
+        enriched = self._enriched()
+        total, reference = self._count_clean_ops(enriched)
+        self.assertGreater(total, 10)
+        for after in (False, True):
+            for k in range(total):
+                with self.subTest(crash_at=k, after=after):
+                    state = self._state_dir()
+                    try:
+                        self._run_with_crash(state, enriched, k, after=after)
+                    except AssertionError:
+                        continue  # ops after publication finished; nothing to crash
+                    self._recover(state, enriched)
+                    self.assertEqual(self._tree_bytes(state), reference)
+
+    def test_crash_sweep_ineligible_chain(self):
+        """RED-6: crash sweep over the ineligible chain converges to [E,R,El]."""
+        enriched = self._ineligible_enriched()
+        total, reference = self._count_clean_ops(enriched)
+        for k in range(total):
+            with self.subTest(crash_at=k):
+                state = self._state_dir()
+                try:
+                    self._run_with_crash(state, enriched, k)
+                except AssertionError:
+                    continue
+                self._recover(state, enriched)
+                self.assertEqual(self._tree_bytes(state), reference)
+
+    def test_crash_depth2_recovery_convergence(self):
+        """RED-6 (r2-B6): crash during recovery, recover again (depth 2) -> converges."""
+        enriched = self._enriched()
+        total, reference = self._count_clean_ops(enriched)
+        from unittest import mock
+        from src.learning_loop import persistence
+        probe_points = list(range(0, total, 7)) or [0]
+        for k in probe_points:
+            state = self._state_dir()
+            try:
+                self._run_with_crash(state, enriched, k)
+            except AssertionError:
+                continue
+            for j in (0, 3, 9):
+                with self.subTest(first=k, second=j):
+                    counter = {"n": 0}
+                    def wrap(real):
+                        def inner(*args, **kwargs):
+                            idx = counter["n"]
+                            counter["n"] += 1
+                            if idx == j:
+                                raise _Crash()
+                            return real(*args, **kwargs)
+                        return inner
+                    patchers = [mock.patch.object(
+                        persistence._io, name,
+                        wrap(getattr(persistence._io, name)))
+                        for name in self._SHIM_OPS]
+                    for p in patchers:
+                        p.start()
+                    try:
+                        self._recover(state, enriched)
+                    except _Crash:
+                        pass
+                    finally:
+                        for p in patchers:
+                            p.stop()
+            self._recover(state, enriched)
+            self.assertEqual(self._tree_bytes(state), reference)
+
+    def test_link_window_dual_outcomes_per_artifact(self):
+        """RED-6 (r3ext-A1): ③–⑤ window for each artifact, entry survived vs lost."""
+        enriched = self._enriched()
+        _, reference = self._count_clean_ops(enriched)
+        basenames = ("enriched_utility_evaluation.json", "reflection.json",
+                     "eligibility.json", "queue")
+        from unittest import mock
+        from src.learning_loop import persistence
+        for base in basenames:
+            for lost in (False, True):
+                with self.subTest(artifact=base, entry_lost=lost):
+                    state = self._state_dir()
+                    linked = {}
+                    real_link = persistence._io.link
+                    def crash_after_link(src, dst, *a, **kw):
+                        result = real_link(src, dst, *a, **kw)
+                        name = str(dst)
+                        match = (base in name) if base != "queue" else ("review_queue" in name)
+                        if match and ".tmp.probe" not in name:
+                            linked["dst"] = name
+                            raise _Crash()
+                        return result
+                    with mock.patch.object(persistence._io, "link", crash_after_link):
+                        with self.assertRaises(_Crash):
+                            self._persist(state, enriched)
+                    if lost:
+                        import os
+                        if os.path.exists(linked["dst"]):
+                            os.unlink(linked["dst"])
+                    self._recover(state, enriched)
+                    self.assertEqual(self._tree_bytes(state), reference)
+
+    def test_recovery_refsyncs_surviving_dirs_and_targets(self):
+        """RED-6 (r4-B1/r5-1): idempotent resume re-fsyncs every publication dir level."""
+        import os
+        state = self._state_dir()
+        enriched = self._enriched()
+        self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        calls = self._record_full()
+        self._resume(state, paths["eval_id"], paths["digest"])
+        fsynced = {os.path.abspath(str(a[0])) for n, a in calls if n == "fsync_dir"}
+        expected = {
+            os.path.abspath(state),
+            os.path.abspath(os.path.join(state, "evaluations")),
+            os.path.abspath(str(paths["digest_dir"].parent)),
+            os.path.abspath(str(paths["digest_dir"])),
+            os.path.abspath(str(paths["queue_dir"])),
+        }
+        self.assertTrue(expected.issubset(fsynced),
+                        f"missing re-fsync: {expected - fsynced}")
+        el_fsyncs = [i for i, (n, a) in enumerate(calls) if n == "fsync_dir"
+                     and os.path.abspath(str(a[0])) == os.path.abspath(str(paths["digest_dir"]))]
+        queue_pubs = [i for i, (n, a) in enumerate(calls)
+                      if "review_queue" in str(a[0] if a else "")
+                      and n in ("open_exclusive", "link", "mkdir")]
+        if queue_pubs:
+            self.assertLess(min(el_fsyncs), min(queue_pubs))
+
+    # --- S5.4 RED-7: E5 closure (three components) ---
+
+    def test_e5_digest_directory_equality(self):
+        """RED-7 (E5-1): recomputed digest == dir segment == R.source_snapshot_digest."""
+        import hashlib, json
+        state = self._state_dir()
+        enriched = self._enriched()
+        self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        disk_e = json.loads(paths["E"].read_bytes())
+        recomputed = "snap_" + hashlib.sha256(
+            self._oracle_canonical(disk_e["source_evaluation_snapshot"]).encode()
+        ).hexdigest()
+        self.assertEqual(recomputed, paths["digest_dir"].name)
+        disk_r = json.loads(paths["R"].read_bytes())
+        self.assertEqual(recomputed, disk_r["source_snapshot_digest"])
+
+    def test_e5_derived_artifacts_rebuild_byte_identical(self):
+        """RED-7 (E5-2): R/El/Q rebuilt from disk E match disk bytes exactly."""
+        import json
+        from src.learning_loop.reflection_builder import build_reflection
+        from src.learning_loop.eligibility import build_eligibility
+        from src.learning_loop.queue_request import build_review_queue_request
+        state = self._state_dir()
+        enriched = self._enriched()
+        result = self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        disk_e = json.loads(paths["E"].read_bytes())
+        ref = build_reflection(disk_e)
+        elig = build_eligibility(ref, disk_e)
+        rq = build_review_queue_request(elig, ref, disk_e)
+        self.assertEqual(paths["R"].read_bytes().decode(), self._oracle_canonical(ref))
+        self.assertEqual(paths["El"].read_bytes().decode(), self._oracle_canonical(elig))
+        rq_path = self._rq_path(state, result["eligibility"]["eligibility_id"])
+        self.assertEqual(rq_path.read_bytes().decode(), self._oracle_canonical(rq))
+
+    def test_e5_e_canonical_self_check(self):
+        """RED-7 (E5-3): disk E bytes == canonical(parse(bytes))."""
+        import json
+        state = self._state_dir()
+        enriched = self._enriched()
+        self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        raw = paths["E"].read_bytes()
+        self.assertEqual(raw.decode(), self._oracle_canonical(json.loads(raw)))
+
+    def test_snapshot_instance_difference_coexists(self):
+        """RED-7 (§12-5): same evaluation_id, different snapshot -> disjoint digest dirs."""
+        import copy
+        state = self._state_dir()
+        enriched_a = self._enriched()
+        enriched_b = copy.deepcopy(enriched_a)
+        enriched_b["source_evaluation_snapshot"]["staleness_warning"] = True
+        self._persist(state, enriched_a)
+        self._persist(state, enriched_b)
+        pa = self._paths(state, enriched_a)
+        pb = self._paths(state, enriched_b)
+        self.assertEqual(pa["eval_id"], pb["eval_id"])
+        self.assertNotEqual(pa["digest"], pb["digest"])
+        self.assertTrue(pa["E"].is_file())
+        self.assertTrue(pb["E"].is_file())
+        self.assertNotEqual(pa["R"].read_bytes(), pb["R"].read_bytes())
+
+    # --- S5.4 RED-8: version fail-closed ---
+
+    def test_rq_version_drift_no_second_pending(self):
+        """RED-8: on-disk rq with different schema_version -> error, exactly one pending."""
+        import json
+        state = self._state_dir()
+        enriched = self._enriched()
+        result = self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        rq_path = self._rq_path(state, result["eligibility"]["eligibility_id"])
+        drifted = json.loads(rq_path.read_bytes())
+        drifted["schema_version"] = 2
+        rq_path.write_bytes(self._oracle_canonical(drifted).encode())
+        with self.assertRaises(self._err()) as ctx:
+            self._resume(state, paths["eval_id"], paths["digest"])
+        self.assertEqual(ctx.exception.gate, "preflight")
+        pendings = [p for p in paths["queue_dir"].iterdir() if p.suffix == ".json"]
+        self.assertEqual(len(pendings), 1)
+
+    def test_rf_version_drift_detected(self):
+        """RED-8: on-disk reflection with drifted template_version -> byte compare error."""
+        import json
+        state = self._state_dir()
+        enriched = self._enriched()
+        self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        drifted = json.loads(paths["R"].read_bytes())
+        drifted["template_version"] = 2
+        paths["R"].write_bytes(self._oracle_canonical(drifted).encode())
+        with self.assertRaises(self._err()) as ctx:
+            self._resume(state, paths["eval_id"], paths["digest"])
+        self.assertEqual(ctx.exception.gate, "preflight")
+
+    # --- S5.4 RED-9: I/O boundary audits ---
+
+    def test_queue_request_module_no_io(self):
+        """RED-9: build_review_queue_request performs zero fs I/O (audit-hook subprocess)."""
+        import subprocess, sys, os
+        script = r"""
+import sys
+sys.path.insert(0, ".")
+from src.learning_loop.evaluation import evaluate_experiment_bundle
+from src.learning_loop.enrichment import build_enriched_utility_evaluation
+from src.learning_loop.reflection_builder import build_reflection
+from src.learning_loop.eligibility import build_eligibility
+from src.learning_loop.queue_request import build_review_queue_request
+
+bundle = {
+    "experiment": {"task_id": "t", "without_memory_run_id": "a", "with_memory_run_id": "b"},
+    "without_memory_outcome": {"run_id": "a", "score": 0.2, "used_memory_ids": []},
+    "with_memory_outcome": {"run_id": "b", "score": 0.5, "used_memory_ids": ["m1"]},
+    "comparison": {"task_id": "t", "first_run_id": "a", "second_run_id": "b",
+                   "first_score": 0.2, "second_score": 0.5, "score_delta": 0.3},
+    "memory_records": [{"id": "m1", "confidence": "confirmed", "status": "active", "superseded_by": []}],
+    "thresholds": {"utility_delta_min": 0.1, "verified_ratio_min": 0.5, "defined_before_run": True},
+}
+enr = build_enriched_utility_evaluation(evaluate_experiment_bundle(bundle))
+ref = build_reflection(enr)
+elig = build_eligibility(ref, enr)
+
+events = []
+def hook(event, args):
+    if event == "open" or event.startswith("os.") or event.startswith("shutil."):
+        events.append(event)
+sys.addaudithook(hook)
+
+rq = build_review_queue_request(elig, ref, enr)
+assert rq["status"] == "pending"
+if events:
+    print("FAIL: I/O events:", events)
+    sys.exit(1)
+print("OK")
+"""
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_persistence_mutations_confined_to_state_dir(self):
+        """RED-9 (r7-M1): every mutating shim op targets the state_dir subtree."""
+        import os
+        state = self._state_dir()
+        calls = self._record_full()
+        self._persist(state, self._enriched())
+        root = os.path.realpath(state)
+        for name, args in calls:
+            if name in ("open_exclusive", "write_all", "fsync_file", "close"):
+                continue  # fd-based or covered via open_exclusive path below
+            if name in ("mkdir", "link", "unlink", "fsync_dir"):
+                for a in args:
+                    p = os.path.realpath(str(a))
+                    self.assertTrue(
+                        p == root or p.startswith(root + os.sep),
+                        f"{name} escaped state_dir: {p}",
+                    )
+        opens = [args[0] for name, args in calls if name == "open_exclusive"]
+        for a in opens:
+            p = os.path.realpath(os.path.dirname(str(a)))
+            self.assertTrue(p == root or p.startswith(root + os.sep))
+
+    def test_disk_queries_only_via_shim(self):
+        """RED-9 (r6-M2): no Path.exists/is_file/resolve/os.path.exists outside the _Io shim."""
+        import inspect, re
+        from src.learning_loop import persistence
+        source = inspect.getsource(persistence)
+        shim_match = re.search(r"class _Io\b.*?(?=\nclass |\Z)", source, re.S)
+        self.assertIsNotNone(shim_match, "shim must be a class named _Io")
+        outside = source.replace(shim_match.group(0), "")
+        for token in (".exists(", ".is_file(", ".is_dir(", ".resolve(",
+                      "os.path.exists", "os.path.isfile", "os.path.isdir",
+                      "os.stat(", "os.lstat(", "os.scandir", "os.listdir"):
+            self.assertNotIn(token, outside, f"disk query outside shim: {token}")
+
+    # --- S5.4 RED-11: API contract ---
+
+    def test_return_structure_identical_across_outcomes(self):
+        """RED-11 (r6-M3): first write, idempotent replay, resume return the same structure."""
+        state = self._state_dir()
+        enriched = self._enriched()
+        first = self._persist(state, enriched)
+        replay = self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        resumed = self._resume(state, paths["eval_id"], paths["digest"])
+        for result in (first, replay, resumed):
+            self.assertEqual(set(result.keys()), {"eligibility", "review_queue_request"})
+        self.assertEqual(self._oracle_canonical(first), self._oracle_canonical(replay))
+        self.assertEqual(self._oracle_canonical(first), self._oracle_canonical(resumed))
+        ineligible = self._ineligible_enriched()
+        state2 = self._state_dir()
+        res_inelig = self._persist(state2, ineligible)
+        self.assertEqual(set(res_inelig.keys()), {"eligibility", "review_queue_request"})
+        self.assertIsNone(res_inelig["review_queue_request"])
+
+    def test_return_value_alias_free(self):
+        """RED-11 (r6-M3): mutating a returned structure never affects later results."""
+        state = self._state_dir()
+        enriched = self._enriched()
+        first = self._persist(state, enriched)
+        canon = self._oracle_canonical(first)
+        first["eligibility"]["reasons"].append("tampered")
+        first["review_queue_request"]["status"] = "tampered"
+        second = self._persist(state, enriched)
+        self.assertEqual(self._oracle_canonical(second), canon)
+
+    def test_five_gates_each_triggerable(self):
+        """RED-11 (r6-M3): path/preflight/capability/publish/readback gates all reachable."""
+        import os
+        from unittest import mock
+        from src.learning_loop import persistence
+        enriched = self._enriched()
+        # path
+        state = self._state_dir()
+        with self.assertRaises(self._err()) as ctx:
+            self._persist(os.path.join(state, "nope"), enriched)
+        self.assertEqual(ctx.exception.gate, "path")
+        # preflight
+        state = self._state_dir()
+        self._persist(state, enriched)
+        paths = self._paths(state, enriched)
+        paths["E"].unlink()
+        with self.assertRaises(self._err()) as ctx:
+            self._resume(state, paths["eval_id"], paths["digest"])
+        self.assertEqual(ctx.exception.gate, "preflight")
+        # capability
+        state = self._state_dir()
+        real_link = persistence._io.link
+        def probe_fail(src, dst, *a, **kw):
+            if ".tmp.probe" in str(dst) or ".tmp.probe" in str(src):
+                raise OSError("no link support")
+            return real_link(src, dst, *a, **kw)
+        with mock.patch.object(persistence._io, "link", probe_fail):
+            with self.assertRaises(self._err()) as ctx:
+                self._persist(state, enriched)
+        self.assertEqual(ctx.exception.gate, "capability")
+        # publish
+        state = self._state_dir()
+        def artifact_fail(src, dst, *a, **kw):
+            if "evaluations" in str(dst):
+                raise OSError("boom")
+            return real_link(src, dst, *a, **kw)
+        with mock.patch.object(persistence._io, "link", artifact_fail):
+            with self.assertRaises(self._err()) as ctx:
+                self._persist(state, enriched)
+        self.assertEqual(ctx.exception.gate, "publish")
+        # readback
+        state = self._state_dir()
+        real_read = persistence._io.read_bytes
+        def garbled_read(path, *a, **kw):
+            data = real_read(path, *a, **kw)
+            return b"garbage" if ".tmp." in str(path) else data
+        with mock.patch.object(persistence._io, "read_bytes", garbled_read):
+            with self.assertRaises(self._err()) as ctx:
+                self._persist(state, enriched)
+        self.assertEqual(ctx.exception.gate, "readback")
+
+    def test_producer_errors_wrapped(self):
+        """RED-11 (r7-m3): invalid enriched -> PersistenceError(preflight, invalid_input)."""
+        state = self._state_dir()
+        bad = {"source_evaluation_id": "eval_" + "a" * 64,
+               "source_evaluation_snapshot": {"schema_version": 1}}
+        with self.assertRaises(self._err()) as ctx:
+            self._persist(state, bad)
+        self.assertEqual(ctx.exception.gate, "preflight")
+        self.assertEqual(ctx.exception.code, "invalid_input")
+        self.assertNotIn("EligibilityInputError", type(ctx.exception).__name__)
+        self.assertNotIn("ReflectionInputError", type(ctx.exception).__name__)
+
+    def test_persistence_canonicalizer_sole_authority(self):
+        """RED-11 (r6-M4): persistence must not import producer serializers for disk bytes."""
+        import inspect
+        from src.learning_loop import persistence
+        source = inspect.getsource(persistence)
+        for token in (
+            "from src.learning_loop.reflection_builder import canonical_json",
+            "reflection_builder.canonical_json",
+            "eligibility._canonical_json",
+            "queue_request._canonical_json",
+        ):
+            self.assertNotIn(token, source)
+        self.assertIn("_canonical_json", source)
+
+    def test_persistence_canonicalizer_golden_oracle(self):
+        """RED-11 (⚙-10): persistence's private canonicalizer matches Appendix C vectors."""
+        from src.learning_loop.persistence import _canonical_json
+        for value, expected in (
+            (0.3, "0.3"),
+            (0.30000000000000004, "0.30000000000000004"),
+            (1 / 3, "0.3333333333333333"),
+            (-0.0, "-0.0"),
+            (1e300, "1e+300"),
+            (0.5, "0.5"),
+            (0, "0"),
+            (True, "true"),
+            (False, "false"),
+        ):
+            with self.subTest(value=repr(value)):
+                self.assertEqual(_canonical_json(value), expected)
+        self.assertEqual(_canonical_json({"任务": "值"}), '{"\\u4efb\\u52a1":"\\u503c"}')
