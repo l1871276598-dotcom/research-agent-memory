@@ -4233,18 +4233,18 @@ class S54PersistenceTests(unittest.TestCase):
         paths = self._paths(state, enriched)
         calls = self._record_full()
         self._resume(state, paths["eval_id"], paths["digest"])
-        fsynced = {os.path.abspath(str(a[0])) for n, a in calls if n == "fsync_dir"}
+        fsynced = {os.path.realpath(str(a[0])) for n, a in calls if n == "fsync_dir"}
         expected = {
-            os.path.abspath(state),
-            os.path.abspath(os.path.join(state, "evaluations")),
-            os.path.abspath(str(paths["digest_dir"].parent)),
-            os.path.abspath(str(paths["digest_dir"])),
-            os.path.abspath(str(paths["queue_dir"])),
+            os.path.realpath(state),
+            os.path.realpath(os.path.join(state, "evaluations")),
+            os.path.realpath(str(paths["digest_dir"].parent)),
+            os.path.realpath(str(paths["digest_dir"])),
+            os.path.realpath(str(paths["queue_dir"])),
         }
         self.assertTrue(expected.issubset(fsynced),
                         f"missing re-fsync: {expected - fsynced}")
         el_fsyncs = [i for i, (n, a) in enumerate(calls) if n == "fsync_dir"
-                     and os.path.abspath(str(a[0])) == os.path.abspath(str(paths["digest_dir"]))]
+                     and os.path.realpath(str(a[0])) == os.path.realpath(str(paths["digest_dir"]))]
         queue_pubs = [i for i, (n, a) in enumerate(calls)
                       if "review_queue" in str(a[0] if a else "")
                       and n in ("open_exclusive", "link", "mkdir")]
@@ -4303,7 +4303,9 @@ class S54PersistenceTests(unittest.TestCase):
         state = self._state_dir()
         enriched_a = self._enriched()
         enriched_b = copy.deepcopy(enriched_a)
-        enriched_b["source_evaluation_snapshot"]["staleness_warning"] = True
+        enriched_b["source_evaluation_snapshot"]["staleness_warning"] = (
+            not enriched_a["source_evaluation_snapshot"]["staleness_warning"]
+        )
         self._persist(state, enriched_a)
         self._persist(state, enriched_b)
         pa = self._paths(state, enriched_a)
@@ -4355,6 +4357,7 @@ class S54PersistenceTests(unittest.TestCase):
         script = r"""
 import sys
 sys.path.insert(0, ".")
+sys.path.insert(0, "src")
 from src.learning_loop.evaluation import evaluate_experiment_bundle
 from src.learning_loop.enrichment import build_enriched_utility_evaluation
 from src.learning_loop.reflection_builder import build_reflection
