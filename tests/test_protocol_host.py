@@ -56,6 +56,14 @@ class Facade:
     def procedure_list(self, status="candidate"):
         return []
 
+    def handoff_write(self, project_slug, content, *, workspace, expected_sha256=None):
+        return {
+            "project_slug": project_slug,
+            "workspace": workspace,
+            "expected_sha256": expected_sha256,
+            "status": "created",
+        }
+
 
 def mcp_modules():
     module = types.ModuleType("mcp.server.fastmcp")
@@ -134,6 +142,40 @@ class ProtocolHostTests(unittest.TestCase):
             host = build_protocol_host(Facade(), server_options=options)
 
         self.assertEqual(host.options, options)
+
+
+class HandoffToolContractTests(unittest.TestCase):
+    def _host(self):
+        with mock.patch.dict(sys.modules, mcp_modules()):
+            return build_protocol_host(Facade())
+
+    def test_handoff_tool_workspace_required_sha_optional(self):
+        import inspect
+
+        host = self._host()
+        tool = host.tools["laos_handoff_write"]
+        params = inspect.signature(tool).parameters
+        self.assertIs(params["workspace"].default, inspect.Parameter.empty)
+        self.assertIsNone(params["expected_sha256"].default)
+
+    def test_handoff_tool_creates_without_expected_sha256(self):
+        host = self._host()
+        result = host.tools["laos_handoff_write"](
+            project_slug="research-agent-memory",
+            content="content",
+            workspace="personal",
+        )
+        self.assertEqual(result["status"], "created")
+        self.assertEqual(result["workspace"], "personal")
+        self.assertIsNone(result["expected_sha256"])
+
+    def test_handoff_tool_rejects_missing_workspace(self):
+        host = self._host()
+        with self.assertRaises(TypeError):
+            host.tools["laos_handoff_write"](
+                project_slug="research-agent-memory",
+                content="content",
+            )
 
 
 if __name__ == "__main__":

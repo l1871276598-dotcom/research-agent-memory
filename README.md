@@ -26,7 +26,7 @@ LAOS 是一个本地优先、可审计、人工审核受控的 Agent 记忆与�
 - restricted 内容默认不进入搜索、Context Pack 或外部调用上下文
 - Trusted Memory Loop、写前校验、事务回滚、重建索引和 durable journal
 
-### 统一 11 Agent JSON CLI
+### 统一 12 Agent JSON CLI
 
 `src/laos.py` 通过一个精确注册表提供：
 
@@ -41,6 +41,7 @@ LAOS 是一个本地优先、可审计、人工审核受控的 Agent 记忆与�
 - Loop Coordinator Agent
 - Conversation Review Agent
 - Reflection Record Agent
+- Handoff Agent（`handoff.write` / `handoff.update`，workspace 绑定的项目 handoff 写入）
 
 Orchestrator 只负责上下文准备、精确路由和结果校验，不承载审核或持久化业务逻辑。
 
@@ -83,6 +84,7 @@ finalize
 - MCP stdio 与回环 Streamable HTTP 服务
 - 显式 `laos_capture_checkpoint` 工具及验证流程
 - 只读、分区受控的 `memory_search` 工具
+- 写入受控的 `handoff` 工具（仅限 source-backed 且 workspace 匹配的活动项目，sha256 冲突检测，原子写入）
 - 自动更新 Loop 的真实 baseline → review → verification → comparison 验收入口
 - `tools/developer_bridge_adapter.py` 提供固定配置、固定作用域的 checkpoint 捕获、session 搜索和 session 读取入口
 

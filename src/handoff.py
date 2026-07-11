@@ -72,7 +72,7 @@ def _reject_symlink_ancestors(root, path):
             raise ValueError("invalid handoff path")
 
 
-def _require_source_backed_project(root, project_slug):
+def _require_source_backed_project(root, project_slug, workspace):
     from memory import collect_validated_records
 
     _, records, errors, _ = collect_validated_records(root)
@@ -80,8 +80,14 @@ def _require_source_backed_project(root, project_slug):
         raise ValueError("handoff project validation failed")
     for item in records:
         record = item["record"]
-        if record.get("type") == "project" and record.get("status") == "active" and record.get("project") == project_slug:
-            return
+        if (
+            record.get("type") == "project"
+            and record.get("status") == "active"
+            and record.get("project") == project_slug
+        ):
+            if record.get("workspace") == workspace:
+                return
+            raise ValueError("blocked: project_not_in_workspace")
     raise ValueError("blocked: project_slug_not_source_backed")
 
 
@@ -103,18 +109,20 @@ def _write_atomic(path, content):
         raise
 
 
-def update_project_handoff(root, project_slug, content, expected_sha256=None):
+def update_project_handoff(root, project_slug, content, expected_sha256=None, *, workspace):
     project_slug = _validate_project_slug(project_slug)
     expected_sha256 = _validate_sha256(expected_sha256)
     if not isinstance(content, str) or not content.strip():
         raise ValueError("handoff content must be a non-empty string")
+    if workspace not in {"personal", "work"}:
+        raise ValueError("workspace must be personal or work")
 
     root = Path(root).expanduser().resolve(strict=True)
     if not root.is_dir():
         raise ValueError("invalid handoff root")
     if (root / "LAOS_HANDOFF.md").is_symlink():
         raise ValueError("invalid legacy handoff")
-    _require_source_backed_project(root, project_slug)
+    _require_source_backed_project(root, project_slug, workspace)
 
     target_dir = root / "projects" / project_slug
     staging_dir = root / "_staging" / project_slug

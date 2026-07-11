@@ -39,8 +39,8 @@ def build_protocol_host(facade, *, server_options=None):
     def laos_handoff_write(
         project_slug: str,
         content: str,
+        workspace: str,
         expected_sha256: str | None = None,
-        workspace: str = "personal",
     ) -> dict:
         """Write one project handoff through the LAOS handoff gate.
 
@@ -48,7 +48,7 @@ def build_protocol_host(facade, *, server_options=None):
         through staging and publishes only to `projects/<project_slug>/handoff.md`.
         It does not write or overwrite root-level legacy handoff files.
         """
-        return facade.handoff_write(project_slug, content, expected_sha256, workspace)
+        return facade.handoff_write(project_slug, content, workspace=workspace, expected_sha256=expected_sha256)
 
     if checkpoint_enabled:
 
