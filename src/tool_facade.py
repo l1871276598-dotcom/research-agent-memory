@@ -38,7 +38,7 @@ class LaosToolFacade:
             raise RuntimeError("memory search returned an invalid result")
         return rows[:limit]
 
-    def handoff_write(self, project_slug, content, expected_sha256=None, workspace="personal"):
+    def handoff_write(self, project_slug, content, expected_sha256, workspace):
         if not isinstance(project_slug, str) or not project_slug.strip():
             raise ValueError("project_slug must be a non-empty string")
         if not isinstance(content, str) or not content.strip():

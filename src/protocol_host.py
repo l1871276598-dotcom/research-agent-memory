@@ -39,8 +39,8 @@ def build_protocol_host(facade, *, server_options=None):
     def laos_handoff_write(
         project_slug: str,
         content: str,
-        expected_sha256: str | None = None,
-        workspace: str = "personal",
+        expected_sha256: str | None,
+        workspace: str,
     ) -> dict:
         """Write one project handoff through the LAOS handoff gate.
 

@@ -109,7 +109,7 @@ def _write_atomic(path, content):
         raise
 
 
-def update_project_handoff(root, project_slug, content, expected_sha256=None, workspace="personal"):
+def update_project_handoff(root, project_slug, content, expected_sha256=None, *, workspace):
     project_slug = _validate_project_slug(project_slug)
     expected_sha256 = _validate_sha256(expected_sha256)
     if not isinstance(content, str) or not content.strip():
