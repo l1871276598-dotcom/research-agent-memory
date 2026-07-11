@@ -3032,3 +3032,379 @@ print("EVENTS:" + ",".join(events))
         # Both C1 and C2 should appear
         self.assertIn("thresholds were not frozen", result["reasons"][0])
         self.assertIn("evidence sufficiency is insufficient", result["reasons"][1])
+
+
+class S54QueueRequestTests(unittest.TestCase):
+    """S5.4 Queue Request producer (pure function) — RED/GREEN TDD.
+
+    Plan: S5.4 Implementation Plan r7.1 (baseline v4.3.1, amendment A4 in effect).
+    """
+
+    # --- shared fixtures (same idiom as S53EligibilityTests) ---
+
+    def _valid_bundle(self, **overrides):
+        bundle = {
+            "experiment": {
+                "task_id": "task-full-producer",
+                "without_memory_run_id": "run-a",
+                "with_memory_run_id": "run-b",
+            },
+            "without_memory_outcome": {
+                "run_id": "run-a",
+                "score": 0.2,
+                "used_memory_ids": [],
+            },
+            "with_memory_outcome": {
+                "run_id": "run-b",
+                "score": 0.5,
+                "used_memory_ids": ["memory-1"],
+            },
+            "comparison": {
+                "task_id": "task-full-producer",
+                "first_run_id": "run-a",
+                "second_run_id": "run-b",
+                "first_score": 0.2,
+                "second_score": 0.5,
+                "score_delta": 0.3,
+            },
+            "memory_records": [
+                {
+                    "id": "memory-1",
+                    "confidence": "confirmed",
+                    "status": "active",
+                    "superseded_by": [],
+                },
+            ],
+            "thresholds": {
+                "utility_delta_min": 0.1,
+                "verified_ratio_min": 0.5,
+                "defined_before_run": True,
+            },
+        }
+        bundle.update(overrides)
+        return bundle
+
+    def _full_chain(self, **bundle_overrides):
+        """Return (eligibility, reflection, enriched) through the frozen producer chain."""
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+        from src.learning_loop.enrichment import build_enriched_utility_evaluation
+        from src.learning_loop.reflection_builder import build_reflection
+        from src.learning_loop.eligibility import build_eligibility
+        bundle = self._valid_bundle(**bundle_overrides)
+        enriched = build_enriched_utility_evaluation(evaluate_experiment_bundle(bundle))
+        reflection = build_reflection(enriched)
+        eligibility = build_eligibility(reflection, enriched)
+        return eligibility, reflection, enriched
+
+    @staticmethod
+    def _oracle_canonical(value):
+        """Test-local independent canonicalizer (Appendix C oracle)."""
+        import json
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True, allow_nan=False,
+        )
+
+    # --- S5.4 RED-0: scaffold ---
+
+    def test_queue_request_imports(self):
+        """RED-0: build_review_queue_request and QueueRequestInputError are importable."""
+        from src.learning_loop.queue_request import (
+            build_review_queue_request,
+            QueueRequestInputError,
+        )
+        self.assertTrue(callable(build_review_queue_request))
+        self.assertTrue(issubclass(QueueRequestInputError, ValueError))
+
+    def test_input_error_has_gate_and_check(self):
+        """RED-0: QueueRequestInputError carries structured gate/check attributes."""
+        from src.learning_loop.queue_request import QueueRequestInputError
+        err = QueueRequestInputError(gate="shape", message="test")
+        self.assertEqual(err.gate, "shape")
+        self.assertIsNone(err.check)
+        err2 = QueueRequestInputError(gate="upstream", check="anchor-1", message="fail")
+        self.assertEqual(err2.gate, "upstream")
+        self.assertEqual(err2.check, "anchor-1")
+
+    def test_shape_rejects_non_dict_inputs(self):
+        """RED-0: structurally invalid inputs fail gate=shape."""
+        from src.learning_loop.queue_request import (
+            build_review_queue_request,
+            QueueRequestInputError,
+        )
+        with self.assertRaises(QueueRequestInputError) as ctx:
+            build_review_queue_request({}, {}, {})
+        self.assertEqual(ctx.exception.gate, "shape")
+
+    # --- S5.4 RED-0: schema and frozen fields (baseline v4.3.1 §6) ---
+
+    def test_schema_exact_12_keys(self):
+        """RED-0: artifact has exactly the 12 frozen top-level keys."""
+        from src.learning_loop.queue_request import build_review_queue_request
+        rq = build_review_queue_request(*self._full_chain())
+        self.assertEqual(
+            set(rq.keys()),
+            {
+                "schema_version", "template_version", "review_queue_item_id",
+                "source_eligibility_id", "source_evaluation_id",
+                "source_snapshot_digest", "experiment", "status", "summary",
+                "evidence_summary", "missing_information", "decision_options",
+            },
+        )
+
+    def test_status_pending_and_versions(self):
+        """RED-0: status is immutably "pending"; both versions are 1."""
+        from src.learning_loop.queue_request import build_review_queue_request
+        rq = build_review_queue_request(*self._full_chain())
+        self.assertEqual(rq["status"], "pending")
+        self.assertEqual(rq["schema_version"], 1)
+        self.assertEqual(rq["template_version"], 1)
+
+    def test_decision_options_frozen(self):
+        """RED-0: decision_options is exactly the frozen 4-item list in order."""
+        from src.learning_loop.queue_request import build_review_queue_request
+        rq = build_review_queue_request(*self._full_chain())
+        self.assertEqual(rq["decision_options"], ["accept", "reject", "defer", "revise"])
+
+    def test_anchor_fields_copy(self):
+        """RED-0: anchors copy from eligibility/reflection (§3.1 equalities 1,3,4)."""
+        from src.learning_loop.queue_request import build_review_queue_request
+        eligibility, reflection, enriched = self._full_chain()
+        rq = build_review_queue_request(eligibility, reflection, enriched)
+        self.assertEqual(rq["source_eligibility_id"], eligibility["eligibility_id"])
+        self.assertEqual(rq["source_evaluation_id"], reflection["source_evaluation_id"])
+        self.assertEqual(rq["source_snapshot_digest"], reflection["source_snapshot_digest"])
+
+    def test_experiment_copy_only(self):
+        """RED-0: experiment block copies the three snapshot fields verbatim."""
+        from src.learning_loop.queue_request import build_review_queue_request
+        eligibility, reflection, enriched = self._full_chain()
+        rq = build_review_queue_request(eligibility, reflection, enriched)
+        self.assertEqual(
+            rq["experiment"],
+            enriched["source_evaluation_snapshot"]["experiment"],
+        )
+
+    def test_evidence_summary_copy_only(self):
+        """RED-0: evidence_summary copies outcome_snapshot fields one-to-one."""
+        from src.learning_loop.queue_request import build_review_queue_request
+        eligibility, reflection, enriched = self._full_chain()
+        rq = build_review_queue_request(eligibility, reflection, enriched)
+        snap = reflection["outcome_snapshot"]
+        self.assertEqual(
+            rq["evidence_summary"],
+            {
+                "validation_verdict": snap["validation_verdict"],
+                "pack_utility_delta": snap["pack_utility_delta"],
+                "verified": snap["evidence_composition"]["verified"],
+                "unknown": snap["evidence_composition"]["unknown"],
+                "contradicted": snap["evidence_composition"]["contradicted"],
+            },
+        )
+
+    def test_missing_information_bytewise_copy(self):
+        """RED-0: missing_information equals reflection's array, same order."""
+        from src.learning_loop.queue_request import build_review_queue_request
+        eligibility, reflection, enriched = self._full_chain()
+        rq = build_review_queue_request(eligibility, reflection, enriched)
+        self.assertEqual(
+            self._oracle_canonical(rq["missing_information"]),
+            self._oracle_canonical(reflection["missing_information"]),
+        )
+
+    # --- S5.4 RED-0: identity (baseline v4.3.1 §8) ---
+
+    def test_rq_id_syntax(self):
+        """RED-0: review_queue_item_id matches ^rq_[0-9a-f]{64}$."""
+        import re
+        from src.learning_loop.queue_request import build_review_queue_request
+        rq = build_review_queue_request(*self._full_chain())
+        self.assertRegex(rq["review_queue_item_id"], r"^rq_[0-9a-f]{64}$")
+
+    def test_rq_id_payload_only_source_eligibility_id(self):
+        """RED-0: rq ID = sha256(canonical({source_eligibility_id})), versions excluded."""
+        import hashlib
+        from src.learning_loop.queue_request import build_review_queue_request
+        eligibility, reflection, enriched = self._full_chain()
+        rq = build_review_queue_request(eligibility, reflection, enriched)
+        payload = self._oracle_canonical(
+            {"source_eligibility_id": eligibility["eligibility_id"]}
+        )
+        expected = "rq_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        self.assertEqual(rq["review_queue_item_id"], expected)
+
+    def test_determinism_byte_identical(self):
+        """RED-0: two builds over the same inputs are canonically byte-identical."""
+        from src.learning_loop.queue_request import build_review_queue_request
+        eligibility, reflection, enriched = self._full_chain()
+        a = build_review_queue_request(eligibility, reflection, enriched)
+        b = build_review_queue_request(eligibility, reflection, enriched)
+        self.assertEqual(self._oracle_canonical(a), self._oracle_canonical(b))
+
+    # --- S5.4 RED-0: SUMMARY literal (Appendix A + C tokens) ---
+
+    def test_summary_frozen_literal(self):
+        """RED-0: SUMMARY renders the frozen template with JSON string tokens."""
+        from src.learning_loop.queue_request import build_review_queue_request
+        rq = build_review_queue_request(*self._full_chain())
+        self.assertEqual(
+            rq["summary"],
+            'experiment "task-full-producer": runs "run-a" -> "run-b", verdict "A".',
+        )
+
+    def test_summary_nonascii_task_id_escaped(self):
+        """RED-0: non-ASCII task_id renders as \\uXXXX JSON escapes (golden literal)."""
+        from src.learning_loop.queue_request import build_review_queue_request
+        bundle_exp = {
+            "task_id": "任务-1",
+            "without_memory_run_id": "run-a",
+            "with_memory_run_id": "run-b",
+        }
+        comparison = {
+            "task_id": "任务-1",
+            "first_run_id": "run-a",
+            "second_run_id": "run-b",
+            "first_score": 0.2,
+            "second_score": 0.5,
+            "score_delta": 0.3,
+        }
+        rq = build_review_queue_request(
+            *self._full_chain(experiment=bundle_exp, comparison=comparison)
+        )
+        self.assertEqual(
+            rq["summary"],
+            'experiment "\\u4efb\\u52a1-1": runs "run-a" -> "run-b", verdict "A".',
+        )
+
+    def test_summary_embedded_quote_escaped(self):
+        """RED-0: run_id with an embedded double quote is JSON-escaped in SUMMARY."""
+        from src.learning_loop.queue_request import build_review_queue_request
+        quoted = 'run-"b"'
+        bundle_exp = {
+            "task_id": "task-full-producer",
+            "without_memory_run_id": "run-a",
+            "with_memory_run_id": quoted,
+        }
+        overrides = {
+            "experiment": bundle_exp,
+            "with_memory_outcome": {
+                "run_id": quoted, "score": 0.5, "used_memory_ids": ["memory-1"],
+            },
+            "comparison": {
+                "task_id": "task-full-producer",
+                "first_run_id": "run-a",
+                "second_run_id": quoted,
+                "first_score": 0.2,
+                "second_score": 0.5,
+                "score_delta": 0.3,
+            },
+        }
+        rq = build_review_queue_request(*self._full_chain(**overrides))
+        self.assertEqual(
+            rq["summary"],
+            'experiment "task-full-producer": runs "run-a" -> "run-\\"b\\"", verdict "A".',
+        )
+
+    # --- S5.4 RED-0: gate:upstream and ineligible rejection ---
+
+    def test_ineligible_rejected(self):
+        """RED-0: ineligible eligibility (C chain) fails gate=ineligible."""
+        from src.learning_loop.queue_request import (
+            build_review_queue_request,
+            QueueRequestInputError,
+        )
+        bundle = self._valid_bundle()
+        bundle["thresholds"]["defined_before_run"] = False
+        eligibility, reflection, enriched = self._full_chain(**bundle)
+        self.assertEqual(eligibility["eligibility_status"], "ineligible")
+        with self.assertRaises(QueueRequestInputError) as ctx:
+            build_review_queue_request(eligibility, reflection, enriched)
+        self.assertEqual(ctx.exception.gate, "ineligible")
+
+    def test_upstream_tampered_status(self):
+        """RED-0: hand-flipped eligibility_status fails gate=upstream, not ineligible."""
+        from src.learning_loop.queue_request import (
+            build_review_queue_request,
+            QueueRequestInputError,
+        )
+        eligibility, reflection, enriched = self._full_chain()
+        eligibility = dict(eligibility)
+        eligibility["matched_case"] = "case_09"
+        with self.assertRaises(QueueRequestInputError) as ctx:
+            build_review_queue_request(eligibility, reflection, enriched)
+        self.assertEqual(ctx.exception.gate, "upstream")
+
+    def test_upstream_forged_eligibility_id(self):
+        """RED-0: forged eligibility_id fails gate=upstream."""
+        from src.learning_loop.queue_request import (
+            build_review_queue_request,
+            QueueRequestInputError,
+        )
+        eligibility, reflection, enriched = self._full_chain()
+        eligibility = dict(eligibility)
+        eligibility["eligibility_id"] = "elig_" + "f" * 64
+        with self.assertRaises(QueueRequestInputError) as ctx:
+            build_review_queue_request(eligibility, reflection, enriched)
+        self.assertEqual(ctx.exception.gate, "upstream")
+
+    def test_upstream_cross_pair_mismatch(self):
+        """RED-0: eligibility from a different chain fails gate=upstream."""
+        from src.learning_loop.queue_request import (
+            build_review_queue_request,
+            QueueRequestInputError,
+        )
+        elig_a, _, _ = self._full_chain()
+        _, ref_b, enr_b = self._full_chain(
+            thresholds={
+                "utility_delta_min": 0.4,
+                "verified_ratio_min": 0.5,
+                "defined_before_run": True,
+            }
+        )
+        with self.assertRaises(QueueRequestInputError) as ctx:
+            build_review_queue_request(elig_a, ref_b, enr_b)
+        self.assertEqual(ctx.exception.gate, "upstream")
+
+    # --- S5.4 RED-0: no-aliasing, forbidden words, oracle bytes ---
+
+    def test_alias_free_bidirectional(self):
+        """RED-0: deep-mutating inputs after build leaves output unchanged and vice versa."""
+        from src.learning_loop.queue_request import build_review_queue_request
+        eligibility, reflection, enriched = self._full_chain()
+        rq = build_review_queue_request(eligibility, reflection, enriched)
+        before = self._oracle_canonical(rq)
+        reflection["missing_information"][0]["statement"] = "tampered"
+        reflection["outcome_snapshot"]["validation_verdict"] = "B"
+        eligibility["reasons"].append("tampered")
+        self.assertEqual(self._oracle_canonical(rq), before)
+        rq["experiment"]["task_id"] = "tampered"
+        rq["missing_information"].append({"x": 1})
+        elig2, ref2, enr2 = self._full_chain()
+        rq2 = build_review_queue_request(elig2, ref2, enr2)
+        self.assertEqual(self._oracle_canonical(rq2), before)
+
+    def test_forbidden_words_absent_from_keys(self):
+        """RED-0: closed forbidden-word set absent from all artifact key names."""
+        from src.learning_loop.queue_request import build_review_queue_request
+        rq = build_review_queue_request(*self._full_chain())
+        forbidden = {
+            "trust", "ranking", "weight", "per_memory_utility",
+            "recommendation", "remove", "delete",
+        }
+        def scan(node):
+            if isinstance(node, dict):
+                for key, val in node.items():
+                    for word in forbidden:
+                        self.assertNotIn(word, key.casefold())
+                    scan(val)
+            elif isinstance(node, list):
+                for item in node:
+                    scan(item)
+        scan(rq)
+
+    def test_artifact_matches_independent_oracle_bytes(self):
+        """RED-0: module's canonical bytes for the artifact equal the test-local oracle."""
+        from src.learning_loop.queue_request import build_review_queue_request, _canonical_json
+        eligibility, reflection, enriched = self._full_chain()
+        rq = build_review_queue_request(eligibility, reflection, enriched)
+        self.assertEqual(_canonical_json(rq), self._oracle_canonical(rq))
