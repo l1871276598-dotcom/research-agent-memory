@@ -199,7 +199,7 @@ class HandoffUpdateTests(unittest.TestCase):
     def test_facade_end_to_end_rejects_cross_workspace(self):
         facade = self._facade()
         with self.assertRaisesRegex(ValueError, "project_not_in_workspace"):
-            facade.handoff_write("research-agent-memory", "content", None, "work")
+            facade.handoff_write("research-agent-memory", "content", workspace="work")
         self.assertFalse(
             (self.root / "projects/research-agent-memory/handoff.md").exists()
         )
@@ -207,17 +207,31 @@ class HandoffUpdateTests(unittest.TestCase):
     def test_facade_end_to_end_requires_workspace(self):
         facade = self._facade()
         with self.assertRaises(TypeError):
-            facade.handoff_write("research-agent-memory", "content", None)
+            facade.handoff_write("research-agent-memory", "content")
         with self.assertRaisesRegex(ValueError, "workspace must be personal or work"):
-            facade.handoff_write("research-agent-memory", "content", None, "internal")
+            facade.handoff_write("research-agent-memory", "content", workspace="internal")
 
     def test_facade_end_to_end_matching_workspace_writes(self):
         facade = self._facade()
-        result = facade.handoff_write("research-agent-memory", "content", None, "personal")
+        result = facade.handoff_write("research-agent-memory", "content", workspace="personal")
         self.assertEqual(result["status"], "created")
         self.assertTrue(
             (self.root / "projects/research-agent-memory/handoff.md").is_file()
         )
+
+    def test_facade_expected_sha256_stays_optional(self):
+        facade = self._facade()
+        result = facade.handoff_write(
+            "research-agent-memory", "content", workspace="personal"
+        )
+        self.assertEqual(result["status"], "created")
+        updated = facade.handoff_write(
+            "research-agent-memory",
+            "again",
+            workspace="personal",
+            expected_sha256=result["sha256"],
+        )
+        self.assertEqual(updated["status"], "updated")
 
 
 if __name__ == "__main__":
