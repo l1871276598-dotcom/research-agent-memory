@@ -118,6 +118,64 @@ class HandoffUpdateTests(unittest.TestCase):
 
         self.assertEqual(target.read_text(encoding="utf-8"), before)
 
+    def test_rejects_cross_workspace_project_without_writing(self):
+        from handoff import update_project_handoff
+
+        with self.assertRaisesRegex(ValueError, "project_not_in_workspace"):
+            update_project_handoff(
+                self.root, "research-agent-memory", "content", workspace="work"
+            )
+
+        self.assertFalse(
+            (self.root / "projects/research-agent-memory/handoff.md").exists()
+        )
+
+    def test_accepts_matching_workspace_explicitly(self):
+        from handoff import update_project_handoff
+
+        result = update_project_handoff(
+            self.root, "research-agent-memory", "content", workspace="personal"
+        )
+        self.assertEqual(result["status"], "created")
+
+    def test_rejects_invalid_workspace_value(self):
+        from handoff import update_project_handoff
+
+        with self.assertRaisesRegex(ValueError, "workspace must be personal or work"):
+            update_project_handoff(
+                self.root, "research-agent-memory", "content", workspace="internal"
+            )
+
+    def test_agent_enforces_task_workspace(self):
+        from agents.handoff import HandoffAgent
+
+        agent = HandoffAgent(self.root)
+        task = {
+            "type": "handoff.write",
+            "workspace": "work",
+            "input": {"project_slug": "research-agent-memory", "content": "content"},
+        }
+        with self.assertRaisesRegex(ValueError, "project_not_in_workspace"):
+            agent.run(task, {})
+        self.assertFalse(
+            (self.root / "projects/research-agent-memory/handoff.md").exists()
+        )
+
+        task["workspace"] = "personal"
+        result = agent.run(task, {})
+        self.assertEqual(result["output"]["status"], "created")
+
+    def test_agent_requires_workspace(self):
+        from agents.handoff import HandoffAgent
+
+        agent = HandoffAgent(self.root)
+        task = {
+            "type": "handoff.write",
+            "input": {"project_slug": "research-agent-memory", "content": "content"},
+        }
+        with self.assertRaises(ValueError):
+            agent.run(task, {})
+
 
 if __name__ == "__main__":
     unittest.main()
