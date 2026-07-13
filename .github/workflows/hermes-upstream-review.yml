@@ -10,9 +10,9 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -23,7 +23,7 @@ jobs:
           python3 tools/check_hermes_updates.py check --markdown hermes-upstream-review.md
           cat hermes-upstream-review.md >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: hermes-upstream-review
           path: hermes-upstream-review.md
