@@ -2,9 +2,17 @@
 
 LAOS 是一个本地优先、可审计、人工审核受控的 Agent 记忆与学习层。它把结构化记忆、项目上下文、任务结果、反思、策略候选、会话审查和可复用原则统一到本地文件与可重建索引中，供 GPT、Codex、Claude、本地模型和其他 Agent 复用。
 
+## 项目标识与术语对照
+
+- **同一项目的三个名字**（指同一系统）：文档与设计里叫 **LAOS**（Local Agent Operating System）；GitHub 仓库标识为 **`research-agent-memory`**；运行时数据/状态目录名为 **`ResearchAgent`**（见下方"目录布局"）。
+- **Phase 与 Stage 是两层、两代术语，不是同一序列，编号也不对齐：**
+  - **Phase N（设计/特性流层）**——见 `docs/design/`：Phase 4 = 评估基础，**Phase 5 = 学习链**（子项 S5.1–S5.4）；Phase 1/2 为更早的设计单元（无 Phase 3）。
+  - **Stage NN（执行/运行时/测试增量层）**——见 `docs/progress/`、`config/stage*`、`tests/test_stageNN`：Stage 05–17 是 v0.8 → v0.9.0 的交付序列。
+  - **关键对照**：本仓库的"**Phase 5 学习链**"在 git 分支与运行时产物里记作 **`stage-07` / `stage_07_learning_loop`**（分支 `codex/stage-07-learning-loop`、`PHASE_STATUS.json` 的 `stage_07_*` 键）——两者指同一工作（**Phase 5 ≠ Stage 7**）。Human Review Phase（进行中）延续 Phase 5，设计基线在 `docs/design/phase-5/`。
+
 ## 当前版本
 
-- 当前正式版本：`v0.9.0`
+- 当前正式版本：`v0.10.0`
 - SQLite schema：`v3`
 - Python：`3.11+`
 - 当前验收平台：macOS
@@ -13,9 +21,13 @@ LAOS 是一个本地优先、可审计、人工审核受控的 Agent 记忆与�
 
 当前实现、集成、验收和发布范围仅承诺 macOS。Linux 与 Windows 兼容性将在 macOS 功能完整性和集成验收完成后作为独立阶段处理，不作为当前交付门禁。
 
-`v0.9.0` 功能已通过 PR #29 squash merge 到 `main`，合并提交为 `c21da74d9027760a47f1d96aa626184e6616d3f1`。Stage 17 本地 508 项测试与 PR #29 两条远程 macOS CI 均已通过。`v0.9.0` tag 与 GitHub Release 已创建并发布（参见 `docs/progress/2026-07-06-v0.9.0-release-preparation.md`）；`release_readiness` 为 `passed`，`deployment` 为 `not_applicable`。发布后由错误召回基准测试导致的 `main` CI 回归已通过 PR #32 撤回，并重新通过 508 项本地验证。
+`v0.10.0` 由发布 PR #39 squash merge 到 `main`（合并提交 `77b3c6d`，`v0.10.0` tag 打在该提交上）；当前 `main` HEAD 为 `06b4218`（PR #40 发布状态记录）。全量回归 **879 项通过 / 0 失败**（v0.9.0 基线为 508，四条特性流累积 508 → 787 → 866 → 879）；四轮外部发布评审收敛至 GO，`release_readiness` 为 `passed`，`deployment` 为 `not_applicable`（本地优先纯源码发布）。发布详情见 `docs/progress/2026-07-11-v0.10.0-release-preparation.md`。
 
-## v0.9 已实现能力
+**v0.10.0 在 v0.9.0 基线上新增四条特性流**：原子 vault 晋升、Phase 4 评估基础、Handoff 能力（第 12 个 registry agent）、**Phase 5 学习链（S5.1–S5.4）**。
+
+> 上一版 `v0.9.0`：PR #29 squash merge（合并提交 `c21da74d`），Stage 17 本地 508 项测试，详见 `docs/progress/2026-07-06-v0.9.0-release-preparation.md`。
+
+## 已实现能力（截至 v0.10.0）
 
 ### Memory Core 与安全边界
 
@@ -103,7 +115,7 @@ MCP checkpoint 是显式工具通道，不是浏览器侧被动、无损或自�
 7. MCP、HTTP 和 Bridge 服务只适用于本地可信操作者；当前没有多用户认证和能力授权。
 8. 真实记忆、数据库、PDF、日志、缓存、凭据和受限资料不得提交到 GitHub。
 
-## 不属于 v0.9 的能力
+## 当前不实现的能力（v0.10.0 范围外）
 
 - 浏览器侧被动、无损 ChatGPT 对话采集
 - 自动 policy approval
