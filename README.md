@@ -1,5 +1,72 @@
 # Local Agent Operating System (LAOS)
 
+LAOS is a local-first, auditable, human-governed memory and learning layer for AI agents. It keeps structured memory, project context, task evidence, reflections, and reusable principles in user-controlled files with rebuildable indexes, so GPT, Codex, Claude, local models, and other agents can reuse knowledge without bypassing human review.
+
+**Current release:** [v0.10.0](https://github.com/l1871276598-dotcom/research-agent-memory/releases/tag/v0.10.0) · Python 3.11+ · macOS acceptance target · [MIT](LICENSE)
+
+[Reproducible local demo](#reproducible-local-demo) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
+
+## Why LAOS
+
+- **Local ownership:** authoritative memory stays in user-controlled files, while derived indexes remain rebuildable.
+- **Human authority:** agents create candidates, and only an explicit Review Gate decision can accept them.
+- **Auditable, deterministic lineage:** memory and learning artifacts retain traceable source evidence and deterministic processing paths.
+- **Model independence:** GPT, Codex, Claude, local models, and other agents can use the same governed knowledge layer.
+- **Fail-closed isolation:** workspace, project, confidentiality, and restricted-data boundaries reject mismatches or exclude data by default.
+
+## Current capabilities (v0.10.0)
+
+v0.10.0 includes Memory Core, a unified 12-agent JSON CLI, a deterministic learning chain, controlled conversation review, MCP checkpoint tooling, atomic vault promotion, crash-replay convergence, and GitHub Actions. It provides no autonomous approval, passive browser capture, multi-user authorization, or production deployment outside the local trusted-operator boundary.
+
+## Reproducible local demo
+
+Run this from the repository root with Python 3.11 or later. The demo keeps both authoritative data and derived state in fresh temporary directories, contacts no model API, and removes its files when the demo block ends. The create response includes `"requires_review":true`; the candidate becomes searchable after the explicit `memory.review` acceptance. The subsequent `memory.py index` command incrementally synchronizes the derived index; in this sequence it verifies that the accepted record is already current and is not a prerequisite for acceptance or search.
+
+```bash
+(
+set -euo pipefail
+
+DEMO_DIR="$(mktemp -d)"
+DATA_ROOT="$DEMO_DIR/data"
+STATE_DIR="$DEMO_DIR/state"
+trap 'rm -rf -- "$DEMO_DIR"' EXIT
+
+python3 src/memory.py init --root "$DATA_ROOT"
+python3 src/memory.py db-init \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR"
+
+CREATE_RESULT="$(
+  python3 src/laos.py \
+    --root "$DATA_ROOT" \
+    --state-dir "$STATE_DIR" \
+    --task-json '{"type":"memory.create","input":{"type":"principle","title":"Evidence before claims","scope":"global","workspace":"personal","confidentiality":"personal","source":"manual:user_confirmed","confidence":"confirmed","content":"Require evidence before making claims."}}'
+)"
+printf '%s\n' "$CREATE_RESULT"
+
+CANDIDATE_ID="$(
+  printf '%s\n' "$CREATE_RESULT" |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["output"]["candidate_id"])'
+)"
+
+python3 src/laos.py \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --task-json "{\"type\":\"memory.review\",\"workspace\":\"personal\",\"input\":{\"action\":\"accept\",\"candidate_id\":\"$CANDIDATE_ID\"}}"
+
+python3 src/memory.py index \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR"
+
+python3 src/laos.py \
+  --root "$DATA_ROOT" \
+  --state-dir "$STATE_DIR" \
+  --task-json '{"type":"memory.search","input":{"query":"Evidence before claims","workspace":"personal"}}'
+)
+```
+
+## 中文说明
+
 LAOS 是一个本地优先、可审计、人工审核受控的 Agent 记忆与学习层。它把结构化记忆、项目上下文、任务结果、反思、策略候选、会话审查和可复用原则统一到本地文件与可重建索引中，供 GPT、Codex、Claude、本地模型和其他 Agent 复用。
 
 ## 项目标识与术语对照
@@ -21,7 +88,7 @@ LAOS 是一个本地优先、可审计、人工审核受控的 Agent 记忆与�
 
 当前实现、集成、验收和发布范围仅承诺 macOS。Linux 与 Windows 兼容性将在 macOS 功能完整性和集成验收完成后作为独立阶段处理，不作为当前交付门禁。
 
-`v0.10.0` 由发布 PR #39 squash merge 到 `main`（合并提交 `77b3c6d`，`v0.10.0` tag 打在该提交上）；当前 `main` HEAD 为 `06b4218`（PR #40 发布状态记录）。全量回归 **879 项通过 / 0 失败**（v0.9.0 基线为 508，四条特性流累积 508 → 787 → 866 → 879）；四轮外部发布评审收敛至 GO，`release_readiness` 为 `passed`，`deployment` 为 `not_applicable`（本地优先纯源码发布）。发布详情见 `docs/progress/2026-07-11-v0.10.0-release-preparation.md`。
+`v0.10.0` 由发布 PR #39 squash merge 到 `main`（合并提交 `77b3c6d`，`v0.10.0` tag 打在该提交上）。发布门禁记录为 **879 项通过 / 0 失败**（v0.9.0 基线为 508，四条特性流累积 508 → 787 → 866 → 879）；四轮外部发布评审收敛至 GO，`release_readiness` 为 `passed`，`deployment` 为 `not_applicable`（本地优先纯源码发布）。发布详情见 [v0.10.0 发布准备记录](docs/progress/2026-07-11-v0.10.0-release-preparation.md)。
 
 **v0.10.0 在 v0.9.0 基线上新增四条特性流**：原子 vault 晋升、Phase 4 评估基础、Handoff 能力（第 12 个 registry agent）、**Phase 5 学习链（S5.1–S5.4）**。
 
@@ -400,17 +467,18 @@ PDF/DOCX 等二进制文件只归档 raw；当前不会进行深度结构化解�
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m compileall -q src tests
+python3 -m compileall -q src tests tools
 git diff --check
 git diff --cached --check
 ```
 
-当前 HEAD 的本地 macOS 集成结果记录在 `docs/progress/2026-07-05-stage-17-macos-final-integration-review.md`，正式发布记录在 `docs/progress/2026-07-06-v0.9.0-release-preparation.md`。`v0.9.0` tag 与 GitHub Release 已创建并发布；发布后 `main` 的错误召回基准测试已撤回，当前本地完整验证为 508 项通过。独立部署不适用于本次本地优先源码发布。
+`v0.9.0` 的历史 Stage 17 macOS 集成与正式发布记录分别见 [Stage 17 最终整合审查](docs/progress/2026-07-05-stage-17-macos-final-integration-review.md)和 [v0.9.0 发布准备记录](docs/progress/2026-07-06-v0.9.0-release-preparation.md)。当前正式版本 `v0.10.0` 的记录见 [v0.10.0 发布准备记录](docs/progress/2026-07-11-v0.10.0-release-preparation.md)，其发布门禁结果为 **879 项通过 / 0 失败**。当前分支状态必须通过运行上述命令验证，不在说明文字中固定 SHA 或测试数量。
 
-## 发布门禁
+## 历史 v0.9.0 发布门禁
 
 ```text
-Stage 17 local macOS integration review
+Historical v0.9.0 release flow
+→ Stage 17 local macOS integration review
 → commit documentation alignment
 → push feature branch
 → Draft PR macOS CI
@@ -421,7 +489,7 @@ Stage 17 local macOS integration review
 → released
 ```
 
-本地验收、Draft PR、远程 CI、合并、tag 和正式 release 是不同 Gate。`v0.9.0` 的全部源码发布 Gate 已完成；后续代码变更继续按独立 PR 与 CI 门禁处理。
+以上仅记录历史 `v0.9.0` 发布流程。本地验收、Draft PR、远程 CI、合并、tag 和正式 release 是不同 Gate；`v0.9.0` 的全部源码发布 Gate 已完成。后续代码变更继续按独立 PR 与 CI 门禁处理。
 
 ## 文档
 
@@ -430,8 +498,9 @@ Stage 17 local macOS integration review
 - macOS-first 决策：`docs/decisions/2026-07-05-macos-first-delivery-scope.md`
 - v0.9 架构与安全审查：`docs/progress/2026-07-04-stage-15-v09-architecture-security-audit.md`
 - v0.9 初始发布审查：`docs/progress/2026-07-04-stage-16-v09-release-review.md`
-- 当前 HEAD macOS 最终整合审查：`docs/progress/2026-07-05-stage-17-macos-final-integration-review.md`
+- v0.9.0 / Stage 17 历史 macOS 最终整合审查：`docs/progress/2026-07-05-stage-17-macos-final-integration-review.md`
 - v0.9.0 正式发布记录：`docs/progress/2026-07-06-v0.9.0-release-preparation.md`
+- v0.10.0 正式发布记录：`docs/progress/2026-07-11-v0.10.0-release-preparation.md`
 - MCP checkpoint：`docs/mcp_checkpoint_validation.md`
 - 自动更新 Loop：`docs/stage_07_2_real_loop_acceptance.md`
 - Trusted Memory Loop：`docs/TRUSTED_MEMORY_LOOP.md`
