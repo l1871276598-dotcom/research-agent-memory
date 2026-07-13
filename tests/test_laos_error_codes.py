@@ -12,7 +12,9 @@ SOURCE_DIR = REPO_ROOT / "src"
 if str(SOURCE_DIR) not in sys.path:
     sys.path.insert(0, str(SOURCE_DIR))
 
+import laos
 import memory
+import memory_agent
 
 
 class LaosCliErrorCodeTests(unittest.TestCase):
@@ -45,6 +47,14 @@ class LaosCliErrorCodeTests(unittest.TestCase):
         self.assertNotIn("Traceback", result.stderr)
         for value in sensitive_values:
             self.assertNotIn(str(value), result.stderr)
+
+    def test_agent_error_code_is_preserved_without_exposing_message(self):
+        error = memory_agent.AgentError(
+            "distillation_failed",
+            "private root and candidate details must stay hidden",
+        )
+
+        self.assertEqual(laos._request_error_code(error), "distillation_failed")
 
     def test_invalid_memory_root_has_a_stable_safe_code(self):
         with tempfile.TemporaryDirectory() as tmp:

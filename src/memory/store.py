@@ -6,12 +6,34 @@ from . import WORKSPACE_CHOICES, collect_validated_records
 
 _TERMS = re.compile(r"[A-Za-z0-9_]+|[\u3400-\u4dbf\u4e00-\u9fff]+")
 _WORKSPACE_CHOICES = frozenset(WORKSPACE_CHOICES)
+_REVIEWABLE_STATUSES = frozenset({"candidate", "conflicted"})
 
 
 def _optional_text(value, name):
     if value is not None and (not isinstance(value, str) or not value.strip()):
         raise ValueError(f"{name} must be a non-empty string")
     return value
+
+
+def _workspace(value):
+    if not isinstance(value, str) or value not in _WORKSPACE_CHOICES:
+        raise ValueError("workspace must be personal or work")
+    return value
+
+
+def _statuses(values):
+    if values is None:
+        return _REVIEWABLE_STATUSES
+    if not isinstance(values, list) or not values:
+        raise ValueError("statuses must be a non-empty list")
+    normalized = set()
+    for value in values:
+        if value == "conflict":
+            value = "conflicted"
+        if value not in _REVIEWABLE_STATUSES:
+            raise ValueError("statuses must be candidate or conflicted")
+        normalized.add(value)
+    return frozenset(normalized)
 
 
 class MemoryStore:
@@ -44,11 +66,27 @@ class MemoryStore:
                 return record
         raise ValueError("memory not found")
 
+    def reviewable(self, workspace=None, project=None, statuses=None):
+        workspace = _workspace(workspace)
+        project = _optional_text(project, "project")
+        allowed_statuses = _statuses(statuses)
+        results = []
+        for record in self.records():
+            if record.get("status") not in allowed_statuses:
+                continue
+            if record.get("workspace") != workspace:
+                continue
+            if record.get("confidentiality") == "restricted":
+                continue
+            if project is not None and record.get("project") != project:
+                continue
+            results.append(record)
+        return results
+
     def active_relevant(self, query, workspace=None, project=None):
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
-        if not isinstance(workspace, str) or workspace not in _WORKSPACE_CHOICES:
-            raise ValueError("workspace must be personal or work")
+        workspace = _workspace(workspace)
         project = _optional_text(project, "project")
         terms = {term.casefold() for term in _TERMS.findall(query)}
         ranked = []
