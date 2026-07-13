@@ -120,6 +120,22 @@ class ScannerFirstSliceTests(unittest.TestCase):
         links = extract_wikilinks(body)
         self.assertEqual(set(links), {"PDC钻头", "钻井液"})
 
+    def test_extract_wikilinks_ignores_fenced_code(self):
+        from vault_scanner.parser import extract_wikilinks
+
+        body = (
+            "Real link [[PDC钻头]].\n"
+            "```\n"
+            "Example: [[不是真链接]] inside a code fence.\n"
+            "```\n"
+            "Another real [[钻井液]].\n"
+            "~~~python\n"
+            'x = "[[也不是]]"\n'
+            "~~~\n"
+        )
+        links = extract_wikilinks(body)
+        self.assertEqual(set(links), {"PDC钻头", "钻井液"})
+
     def test_parse_frontmatter_quarantines_unclosed_delimiter(self):
         from vault_scanner.parser import parse_frontmatter, QuarantineError
 

@@ -13,6 +13,9 @@ import re
 
 WIKILINK = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]+)?\]\]")
 
+# Fenced code block delimiter: up to 3 leading spaces, then >=3 backticks or tildes.
+_FENCE_LINE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+
 
 class QuarantineError(Exception):
     """Raised when a note cannot be parsed and must be quarantined."""
@@ -139,6 +142,33 @@ def validate_frontmatter(fm: dict) -> str | None:
     return None
 
 
+def _strip_fenced_code(text: str) -> str:
+    """Return text with fenced code blocks (``` or ~~~) removed.
+
+    Wikilink syntax inside fenced code is illustrative, not a real note
+    reference, so it must not be extracted.
+    """
+    kept = []
+    fence = None  # active fence char (` or ~), or None when outside a block
+    fence_len = 0
+    for line in text.splitlines(keepends=True):
+        match = _FENCE_LINE.match(line)
+        if fence is not None:
+            if match and match.group(1)[0] == fence and len(match.group(1)) >= fence_len:
+                fence = None
+                fence_len = 0
+            continue
+        if match:
+            fence = match.group(1)[0]
+            fence_len = len(match.group(1))
+            continue
+        kept.append(line)
+    return "".join(kept)
+
+
 def extract_wikilinks(text: str) -> list[str]:
-    """Return deduplicated list of [[wikilink]] targets from text."""
-    return list(dict.fromkeys(WIKILINK.findall(text)))
+    """Return deduplicated list of [[wikilink]] targets from text.
+
+    Wikilinks inside fenced code blocks (``` / ~~~) are ignored.
+    """
+    return list(dict.fromkeys(WIKILINK.findall(_strip_fenced_code(text))))
