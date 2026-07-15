@@ -11,7 +11,7 @@ version: 4.3.2
 approved: 2026-07-10（人工批准；修正案 A1/A2/A3 同时生效；审计缺口 G-1..G-5 知情接受）
 amended: 2026-07-11（人工批准修正案 A4，版本 v4.3 → v4.3.1；同日人工批准修正案 A5，版本 v4.3.1 → v4.3.2；全文见 §14）
 supersedes: Phase 5 Design Draft v4 (lost) + v4.1 patch + v4.2.1 amendment (consolidated)
-related: 
+related:
 migration_source: 1-projects/LAOS/03-design/Phase 5 Design Baseline v4.3 — Consolidated Reconstruction.md
 migration_status: canonical
 migration_date: 2026-07-11
