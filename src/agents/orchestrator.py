@@ -19,6 +19,9 @@ _LEGACY_CONTEXT_FREE_TASKS = frozenset(
         "loop.suggest-policies",
         "loop.generate-candidate",
         "loop.coordinate",
+        "review.list",
+        "review.show",
+        "review.decide",
     }
 )
 _CANDIDATE_STATUSES = frozenset({"candidate", "conflicted"})
