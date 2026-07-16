@@ -1,0 +1,4 @@
+interface:
+  display_name: "Research Memory"
+  short_description: "查询、召回、导入和安全维护本地 Research Agent Memory"
+  default_prompt: "Use $research-memory 查询本地 Research Agent Memory，并在写入时遵守备份、验证和回滚规则。"
