@@ -1,0 +1,9 @@
+{
+  "agents": [
+    {
+      "id": "human_review_agent",
+      "class": "HumanReviewAgent",
+      "handles": ["review.list", "review.show", "review.decide"]
+    }
+  ]
+}

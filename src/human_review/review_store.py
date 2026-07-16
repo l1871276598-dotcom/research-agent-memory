@@ -1,4 +1,4 @@
-"""Human Review HR.2 write store.
+"""Human Review decision store and read interfaces.
 
 All filesystem access is confined to the audited ``_Io`` shim.  The module
 depends on the frozen queue builder only through constructor injection.
@@ -598,7 +598,7 @@ def validate_frozen_review_chain(state_dir, rq_id, *, rq_builder,
 
 
 class ReviewStore:
-    """HR.2 decision writer; read/list transport remains deferred to HR.3."""
+    """HR.2 decision writer with HR.3 show/list read interfaces."""
 
     def __init__(self, state_dir, forbidden_roots, rq_builder, io=None,
                  nonce_factory=None, clock_factory=None):
@@ -677,3 +677,179 @@ class ReviewStore:
             decision_seq,
             command,
         )
+
+    def show(self, rq_id):
+        if type(rq_id) is not str or _RQ_ID.fullmatch(rq_id) is None:
+            _raise("invalid_review_queue_item_id")
+        root = _path_gate(self.state_dir, self.forbidden_roots, self.io)
+        lexical_root = os.path.abspath(os.fspath(self.state_dir))
+        if lexical_root.startswith(("/var/", "/tmp/", "/etc/")):
+            lexical_root = "/private" + lexical_root
+        if lexical_root != root:
+            _raise("unsafe_path", rq_id)
+
+        queue = os.path.join(root, "review_queue")
+        _check_path_length(queue, self.io, rq_id)
+        queue_st = _lstat_or_none(
+            self.io, queue, "path_read_failed", rq_id)
+        if queue_st is None:
+            _raise("request_not_found", rq_id)
+        if stat.S_ISLNK(queue_st.st_mode) or not stat.S_ISDIR(
+                queue_st.st_mode):
+            _raise("malformed_review_queue_namespace", rq_id)
+        decisions, decisions_exist = _decision_namespace(
+            root, self.io, rq_id, None)
+
+        request = _validate_frozen_review_chain(
+            root, rq_id, self.rq_builder, self.io)
+        _barrier(
+            self.io,
+            (queue, decisions) if decisions_exist else (queue,),
+            rq_id,
+            None,
+        )
+        events = _read_events(
+            self.io, decisions, rq_id, None) if decisions_exist else {}
+        state = _state(events, rq_id, None)
+        return {
+            "request": request,
+            "events": [events[seq] for seq in sorted(events)],
+            "state": state,
+        }
+
+    def list(self):
+        root = _path_gate(self.state_dir, self.forbidden_roots, self.io)
+        lexical_root = os.path.abspath(os.fspath(self.state_dir))
+        if lexical_root.startswith(("/var/", "/tmp/", "/etc/")):
+            lexical_root = "/private" + lexical_root
+        if lexical_root != root:
+            _raise("unsafe_path")
+        queue = os.path.join(root, "review_queue")
+        decisions = os.path.join(root, "decisions")
+
+        def gate_namespaces():
+            _check_path_length(queue, self.io)
+            queue_st = _lstat_or_none(
+                self.io, queue, "path_read_failed")
+            if queue_st is not None and (
+                    stat.S_ISLNK(queue_st.st_mode)
+                    or not stat.S_ISDIR(queue_st.st_mode)):
+                _raise("malformed_review_queue_namespace")
+
+            _check_path_length(decisions, self.io)
+            decisions_st = _lstat_or_none(
+                self.io, decisions, "path_read_failed")
+            if decisions_st is not None and (
+                    stat.S_ISLNK(decisions_st.st_mode)
+                    or not stat.S_ISDIR(decisions_st.st_mode)):
+                _raise("malformed_decisions_namespace")
+            return queue_st is not None, decisions_st is not None
+
+        def collect_decisions(exists):
+            if not exists:
+                return {}
+            try:
+                names = self.io.scandir_names(decisions)
+            except OSError:
+                _raise("path_read_failed")
+
+            slots = {}
+            for name in names:
+                if name.startswith(".tmp."):
+                    continue
+                match = _DECISION_NAME.fullmatch(name)
+                if match is None:
+                    _raise("malformed_directory_entry")
+                rq_id = match.group(1)
+                seq = int(match.group(2))
+                path = os.path.join(decisions, name)
+                _check_path_length(path, self.io, rq_id, seq)
+                st = _lstat_or_none(
+                    self.io, path, "path_read_failed", rq_id, seq)
+                if st is None:
+                    _raise("path_read_failed", rq_id, seq)
+                if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                    _raise("malformed_directory_entry", rq_id)
+                slots.setdefault(rq_id, {})[seq] = path
+
+            collected = {}
+            for rq_id in sorted(slots):
+                events = {}
+                for seq in (2, 1):
+                    if seq in slots[rq_id]:
+                        events[seq] = _read_event(
+                            self.io, slots[rq_id][seq], rq_id, seq)
+                collected[rq_id] = events
+            return collected
+
+        def collect_requests(exists):
+            if not exists:
+                return {}
+            try:
+                names = self.io.scandir_names(queue)
+            except OSError:
+                _raise("path_read_failed")
+
+            collected = {}
+            for name in names:
+                if name.startswith(".tmp."):
+                    continue
+                rq_id = name[:-5] if name.endswith(".json") else None
+                if rq_id is None or _RQ_ID.fullmatch(rq_id) is None:
+                    _raise("malformed_directory_entry")
+                path = os.path.join(queue, name)
+                _check_path_length(path, self.io, rq_id)
+                st = _lstat_or_none(
+                    self.io, path, "path_read_failed", rq_id)
+                if st is None:
+                    _raise("path_read_failed", rq_id)
+                if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                    _raise("malformed_directory_entry", rq_id)
+                try:
+                    raw = self.io.read_bytes(path)
+                except OSError:
+                    _raise("path_read_failed", rq_id)
+                collected[rq_id] = _validate_local_request(raw, rq_id)
+            return collected
+
+        def collect(queue_exists, decisions_exist):
+            events = collect_decisions(decisions_exist)
+            requests = collect_requests(queue_exists)
+            return events, requests
+
+        def render(events, requests):
+            items = []
+            for rq_id in sorted(requests):
+                state = _state(events.get(rq_id, {}), rq_id, None)
+                if state in ("pending", "deferred"):
+                    items.append({"rq_id": rq_id, "state": state})
+            return {"items": items}
+
+        queue_exists, decisions_exist = gate_namespaces()
+        _barrier(
+            self.io,
+            tuple(path for path, exists in (
+                (queue, queue_exists), (decisions, decisions_exist))
+                  if exists),
+            None,
+            None,
+        )
+        events, requests = collect(queue_exists, decisions_exist)
+        orphans = set(events) - set(requests)
+        if not orphans:
+            return render(events, requests)
+
+        queue_exists, decisions_exist = gate_namespaces()
+        _barrier(
+            self.io,
+            tuple(path for path, exists in (
+                (queue, queue_exists), (decisions, decisions_exist))
+                  if exists),
+            None,
+            None,
+        )
+        events, requests = collect(queue_exists, decisions_exist)
+        orphans = set(events) - set(requests)
+        if orphans:
+            _raise("orphan_decision", sorted(orphans)[0])
+        return render(events, requests)

@@ -2355,3 +2355,2115 @@ class HR2ScopeAuditTests(HR2Fixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReverseScandirIo(RecordingIo):
+    """Return directory entries opposite to filesystem order."""
+
+    def scandir_names(self, path):
+        self._before("scandir_names", path)
+        return list(reversed(self.base.scandir_names(path)))
+
+
+class HR3Fixture(HR2Fixture):
+    """Append-only H3.1 helpers for ReviewStore read interfaces."""
+
+    def _copy_request(self, request, rq_id):
+        value = dict(request)
+        value["review_queue_item_id"] = rq_id
+        return value
+
+    def _write_request(self, state, request):
+        from pathlib import Path
+        queue = Path(state) / "review_queue"
+        queue.mkdir(exist_ok=True)
+        rq_id = request["review_queue_item_id"]
+        (queue / (rq_id + ".json")).write_bytes(canonical_bytes(request))
+
+    def _write_event(self, state, rq_id, seq, action):
+        from pathlib import Path
+        event = build_decision(
+            rq_id, seq, action, "operator", "sufficient evidence",
+            RECORDED_AT,
+        )
+        decisions = Path(state) / "decisions"
+        decisions.mkdir(exist_ok=True)
+        path = decisions / f"{rq_id}.decision_{seq}.json"
+        path.write_bytes(canonical_bytes(event))
+        return event
+
+    def _replace_with(self, path, kind):
+        import os
+        import shutil
+        from pathlib import Path
+        path = Path(path)
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.exists():
+            shutil.rmtree(path)
+        if kind == "file":
+            path.write_bytes(b"x")
+        elif kind == "directory":
+            path.mkdir()
+        elif kind == "symlink":
+            os.symlink(self._state_dir(), path)
+        else:  # pragma: no cover - test helper contract
+            raise AssertionError(kind)
+
+
+class HR3ReadNamespaceTests(HR3Fixture):
+    """H3.1 RED-11 namespace, bounded-pass, and entry-language vectors."""
+
+    def test_three_handle_missing_namespace_matrix(self):
+        from pathlib import Path
+
+        # Q missing while an empty D namespace exists.
+        state = self._state_dir()
+        (Path(state) / "decisions").mkdir()
+        store = self._store(state, clock_factory=self._fixed_clock)
+        self._assert_code("request_not_found", lambda: store.show(RQ_ID))
+        self._assert_code(
+            "request_not_found", lambda: self._decide(store, RQ_ID))
+        self.assertEqual(store.list(), {"items": []})
+
+        # D missing is a legal empty event set for all three handles.
+        state, rq = self._published_chain()
+        rq_id = rq["review_queue_item_id"]
+        store = self._store(
+            state, nonce_factory=lambda: "7" * 32,
+            clock_factory=self._fixed_clock)
+        self.assertEqual(store.show(rq_id)["state"], "pending")
+        self.assertEqual(
+            store.list(), {"items": [{"rq_id": rq_id, "state": "pending"}]})
+        self.assertEqual(self._decide(store, rq_id)["status"], "published")
+
+        # Both namespaces missing preserves the same missing/empty semantics.
+        state = self._state_dir()
+        store = self._store(state, clock_factory=self._fixed_clock)
+        self._assert_code("request_not_found", lambda: store.show(RQ_ID))
+        self._assert_code(
+            "request_not_found", lambda: self._decide(store, RQ_ID))
+        self.assertEqual(store.list(), {"items": []})
+
+    def test_list_missing_namespaces_skip_fsync(self):
+        import os
+        from pathlib import Path
+
+        cases = ("review_queue", "decisions", "both")
+        for missing in cases:
+            with self.subTest(missing=missing):
+                if missing == "both":
+                    state = self._state_dir()
+                    expected = {"items": []}
+                else:
+                    state, rq = self._published_chain()
+                    expected = {"items": [{
+                        "rq_id": rq["review_queue_item_id"],
+                        "state": "pending",
+                    }]}
+                    if missing == "review_queue":
+                        import shutil
+                        shutil.rmtree(Path(state) / "review_queue")
+                        (Path(state) / "decisions").mkdir()
+                        expected = {"items": []}
+                    else:
+                        self.assertFalse((Path(state) / "decisions").exists())
+                io = RecordingIo()
+                self.assertEqual(self._store(state, io=io).list(), expected)
+                fsyncs = {
+                    os.path.basename(path)
+                    for name, path in io.calls if name == "fsync_dir"
+                }
+                self.assertNotIn(missing, fsyncs)
+                if missing == "both":
+                    self.assertEqual(fsyncs, set())
+
+    def test_list_orphan_after_exactly_two_passes(self):
+        import shutil
+        from pathlib import Path
+
+        state, rq = self._published_chain()
+        rq_id = rq["review_queue_item_id"]
+        self._write_event(state, rq_id, 1, "accept")
+        shutil.rmtree(Path(state) / "review_queue")
+        io = RecordingIo()
+        err = self._assert_code(
+            "orphan_decision", lambda: self._store(state, io=io).list())
+        self.assertEqual(err.rq_id, rq_id)
+        decisions = str(Path(state).resolve() / "decisions")
+        self.assertEqual(
+            sum(name == "scandir_names" and path == decisions
+                for name, path in io.calls),
+            2,
+        )
+
+    def test_list_pass2_success_reduces_second_snapshot_and_new_q(self):
+        import shutil
+        from pathlib import Path
+
+        state, request = self._published_chain()
+        queue = Path(state).resolve() / "review_queue"
+        saved = dict(request)
+        shutil.rmtree(queue)
+        original_id = request["review_queue_item_id"]
+        pending_id = "rq_" + "b" * 64
+        deferred_id = "rq_" + "c" * 64
+        self._write_event(state, original_id, 1, "accept")
+        queue_checks = []
+
+        def install_second_snapshot(name, args, _count):
+            if name == "lstat" and Path(args[0]) == queue:
+                queue_checks.append(args[0])
+                if len(queue_checks) == 2:
+                    self._write_request(state, saved)
+                    self._write_request(
+                        state, self._copy_request(saved, pending_id))
+                    self._write_request(
+                        state, self._copy_request(saved, deferred_id))
+                    self._write_event(state, deferred_id, 1, "defer")
+            return None
+
+        io = RecordingIo(fail=install_second_snapshot)
+        self.assertEqual(self._store(state, io=io).list(), {"items": [
+            {"rq_id": pending_id, "state": "pending"},
+            {"rq_id": deferred_id, "state": "deferred"},
+        ]})
+        root = Path(state).resolve()
+        queue_path = str(root / "review_queue")
+        decisions_path = str(root / "decisions")
+        namespace_calls = [
+            (name, path) for name, path in io.calls
+            if (name == "fsync_dir" or name == "scandir_names")
+            and path in (queue_path, decisions_path)
+        ]
+        self.assertEqual(namespace_calls, [
+            ("fsync_dir", decisions_path),
+            ("scandir_names", decisions_path),
+            ("fsync_dir", queue_path),
+            ("fsync_dir", decisions_path),
+            ("scandir_names", decisions_path),
+            ("scandir_names", queue_path),
+        ])
+
+    def test_list_second_gate_disappearance_uses_missing_semantics(self):
+        import shutil
+        from pathlib import Path
+
+        for vanished in ("review_queue", "decisions"):
+            with self.subTest(vanished=vanished):
+                state, request = self._published_chain()
+                orphan_id = "rq_" + "b" * 64
+                self._write_event(state, orphan_id, 1, "accept")
+                target = Path(state).resolve() / vanished
+                gate_count = []
+
+                def vanish_on_second_gate(name, args, _count):
+                    if name == "lstat" and Path(args[0]) == target:
+                        gate_count.append(args[0])
+                        if len(gate_count) == 2:
+                            shutil.rmtree(target)
+                    return None
+
+                io = RecordingIo(fail=vanish_on_second_gate)
+                if vanished == "review_queue":
+                    self._assert_code(
+                        "orphan_decision",
+                        lambda: self._store(state, io=io).list())
+                else:
+                    self.assertEqual(self._store(state, io=io).list(), {
+                        "items": [{
+                            "rq_id": request["review_queue_item_id"],
+                            "state": "pending",
+                        }],
+                    })
+                target_path = str(target.resolve())
+                self.assertEqual(
+                    sum(name == "fsync_dir" and path == target_path
+                        for name, path in io.calls),
+                    1,
+                )
+
+    def test_list_second_gate_invalid_namespace_does_not_blind_fsync(self):
+        from pathlib import Path
+
+        expected = {
+            "review_queue": "malformed_review_queue_namespace",
+            "decisions": "malformed_decisions_namespace",
+        }
+        for namespace, code in expected.items():
+            with self.subTest(namespace=namespace):
+                state, _request = self._published_chain()
+                self._write_event(state, "rq_" + "b" * 64, 1, "accept")
+                target = Path(state).resolve() / namespace
+                gate_count = []
+
+                def corrupt_on_second_gate(name, args, _count):
+                    if name == "lstat" and Path(args[0]) == target:
+                        gate_count.append(args[0])
+                        if len(gate_count) == 2:
+                            self._replace_with(target, "file")
+                    return None
+
+                io = RecordingIo(fail=corrupt_on_second_gate)
+                self._assert_code(
+                    code, lambda: self._store(state, io=io).list())
+                target_path = str(target.resolve())
+                self.assertEqual(
+                    sum(name == "fsync_dir" and path == target_path
+                        for name, path in io.calls),
+                    1,
+                )
+
+    def test_list_second_barrier_failure_stops_before_pass2(self):
+        from pathlib import Path
+
+        state, _request = self._published_chain()
+        self._write_event(state, "rq_" + "b" * 64, 1, "accept")
+        queue = str(Path(state).resolve() / "review_queue")
+        queue_fsyncs = []
+
+        def fail_second_barrier(name, args, _count):
+            if name == "fsync_dir" and args[0] == queue:
+                queue_fsyncs.append(args[0])
+                if len(queue_fsyncs) == 2:
+                    return OSError("second barrier failed")
+            return None
+
+        io = RecordingIo(fail=fail_second_barrier)
+        self._assert_code(
+            "precommit_directory_fsync_failed",
+            lambda: self._store(state, io=io).list())
+        self.assertEqual(io.counts["scandir_names"], 2)
+
+    def test_list_tmp_prefix_precedes_type_checks_in_both_namespaces(self):
+        import os
+        from pathlib import Path
+
+        state, request = self._published_chain()
+        decisions = Path(state) / "decisions"
+        decisions.mkdir()
+        for namespace in (Path(state) / "review_queue", decisions):
+            (namespace / ".tmp.directory").mkdir()
+            os.symlink(self._state_dir(), namespace / ".tmp.symlink")
+        self.assertEqual(self._store(state).list(), {"items": [{
+            "rq_id": request["review_queue_item_id"], "state": "pending",
+        }]})
+        for namespace in (Path(state) / "review_queue", decisions):
+            self.assertTrue((namespace / ".tmp.directory").is_dir())
+            self.assertTrue((namespace / ".tmp.symlink").is_symlink())
+
+    def test_list_rejects_every_other_illegal_entry_shape(self):
+        from pathlib import Path
+
+        cases = (
+            ("review_queue", "unknown.json", "file", None),
+            ("review_queue", RQ_ID + ".json", "directory", RQ_ID),
+            ("review_queue", RQ_ID + ".json", "symlink", RQ_ID),
+            ("decisions", "unknown.json", "file", None),
+            ("decisions", RQ_ID + ".decision_1.json", "directory", RQ_ID),
+            ("decisions", RQ_ID + ".decision_1.json", "symlink", RQ_ID),
+        )
+        for namespace, name, kind, context in cases:
+            with self.subTest(namespace=namespace, name=name, kind=kind):
+                state = self._state_dir()
+                path = Path(state) / namespace
+                path.mkdir()
+                entry = path / name
+                self._replace_with(entry, kind)
+                err = self._assert_code(
+                    "malformed_directory_entry",
+                    lambda: self._store(state).list())
+                self.assertEqual(err.rq_id, context)
+                self.assertIsNone(err.decision_seq)
+
+    def test_namespace_terminal_types_have_distinct_codes(self):
+        from pathlib import Path
+
+        expected = {
+            "review_queue": "malformed_review_queue_namespace",
+            "decisions": "malformed_decisions_namespace",
+        }
+        for namespace, code in expected.items():
+            for kind in ("file", "symlink"):
+                with self.subTest(namespace=namespace, kind=kind):
+                    state, request = self._published_chain()
+                    self._replace_with(Path(state) / namespace, kind)
+                    err = self._assert_code(
+                        code, lambda: self._store(state).list())
+                    self.assertIsNone(err.rq_id)
+                    if namespace == "review_queue":
+                        show_err = self._assert_code(
+                            code,
+                            lambda: self._store(state).show(
+                                request["review_queue_item_id"]))
+                        self.assertEqual(
+                            show_err.rq_id, request["review_queue_item_id"])
+
+
+class HR3ShowTests(HR3Fixture):
+    """H3.1 RED-11/12 full-G8 show vectors."""
+
+    def test_show_full_g8_error_partition_is_preserved(self):
+        import json
+        import shutil
+        from pathlib import Path
+
+        cases = (
+            ("step2", "malformed_request"),
+            ("step5", "malformed_request"),
+            ("step3", "invalid_review_chain"),
+            ("step4", "invalid_review_chain"),
+            ("step6", "invalid_review_chain"),
+        )
+        for step, code in cases:
+            with self.subTest(step=step):
+                state, request = self._published_chain()
+                rq_id = request["review_queue_item_id"]
+                rq_path = Path(state) / "review_queue" / (rq_id + ".json")
+                if step == "step2":
+                    rq_path.write_bytes(rq_path.read_bytes() + b"\n")
+                elif step == "step5":
+                    value = json.loads(rq_path.read_bytes())
+                    value["summary"] += " altered"
+                    rq_path.write_bytes(canonical_bytes(value))
+                elif step == "step3":
+                    shutil.rmtree(Path(state) / "evaluations")
+                elif step == "step4":
+                    next(Path(state).glob(
+                        "evaluations/eval_*/snap_*/reflection.json")).unlink()
+                else:
+                    path = next(Path(state).glob(
+                        "evaluations/eval_*/snap_*/eligibility.json"))
+                    value = json.loads(path.read_bytes())
+                    value["source_reflection_id"] = "rf_" + "b" * 64
+                    path.write_bytes(canonical_bytes(value))
+                err = self._assert_code(
+                    code, lambda: self._store(state).show(rq_id))
+                self.assertEqual(err.rq_id, rq_id)
+
+    def test_show_barrier_failure_is_precommit_directory_fsync_failed(self):
+        state, request = self._published_chain()
+
+        def fail(name, _args, _count):
+            if name == "fsync_dir":
+                return OSError("barrier failed")
+            return None
+
+        err = self._assert_code(
+            "precommit_directory_fsync_failed",
+            lambda: self._store(
+                state, io=RecordingIo(fail=fail)).show(
+                    request["review_queue_item_id"]))
+        self.assertEqual(err.rq_id, request["review_queue_item_id"])
+        self.assertIsNone(err.decision_seq)
+
+    def test_show_returns_exact_request_events_and_all_five_states(self):
+        cases = {
+            "pending": None,
+            "deferred": "defer",
+            "accepted": "accept",
+            "rejected": "reject",
+            "revised": "revise",
+        }
+        for expected, action in cases.items():
+            with self.subTest(state=expected):
+                state, request = self._published_chain()
+                rq_id = request["review_queue_item_id"]
+                store = self._store(
+                    state, nonce_factory=lambda: "8" * 32,
+                    clock_factory=self._fixed_clock)
+                if action is not None:
+                    self._decide(store, rq_id, action=action)
+                result = store.show(rq_id)
+                self.assertEqual(set(result), {"request", "events", "state"})
+                self.assertEqual(result["request"], request)
+                self.assertEqual(len(result["request"]), 12)
+                self.assertEqual(result["state"], expected)
+                self.assertEqual(
+                    [event["decision_seq"] for event in result["events"]],
+                    [] if action is None else [1],
+                )
+
+    def test_show_and_list_read_seq2_first_but_show_presents_seq_order(self):
+        import os
+
+        state, request = self._published_chain()
+        rq_id = request["review_queue_item_id"]
+        store = self._store(
+            state, nonce_factory=lambda: "9" * 32,
+            clock_factory=self._fixed_clock)
+        self._decide(store, rq_id, action="defer")
+        self._decide(store, rq_id, seq=2, action="accept")
+
+        for handle in ("show", "list"):
+            with self.subTest(handle=handle):
+                io = RecordingIo()
+                result = getattr(self._store(state, io=io), handle)(
+                    rq_id) if handle == "show" else self._store(
+                        state, io=io).list()
+                reads = [
+                    os.path.basename(path) for name, path in io.calls
+                    if name == "read_bytes"
+                    and ".decision_" in os.path.basename(path)
+                ]
+                self.assertEqual(reads[:2], [
+                    rq_id + ".decision_2.json",
+                    rq_id + ".decision_1.json",
+                ])
+                if handle == "show":
+                    self.assertEqual(
+                        [event["decision_seq"] for event in result["events"]],
+                        [1, 2],
+                    )
+                else:
+                    self.assertEqual(result, {"items": []})
+        # decide has the same order locked by the existing HR.2 test
+        # HR2DurabilityAndFaultTests.test_slot_reader_reads_seq2_before_seq1.
+
+    def test_show_g8_completes_before_barrier_with_read_only_operations(self):
+        from human_review.review_store import ReviewStore
+
+        state, request = self._published_chain()
+        io = RecordingIo()
+        builder = self._builder()
+
+        def marked_builder(*args):
+            result = builder(*args)
+            io.calls.append(("g8_complete", None))
+            return result
+
+        store = ReviewStore(
+            state, forbidden_roots=(), rq_builder=marked_builder, io=io)
+        store.show(request["review_queue_item_id"])
+        marker = io.calls.index(("g8_complete", None))
+        before = {name for name, _path in io.calls[:marker]}
+        self.assertLessEqual(before, {
+            "lstat", "resolve_path", "path_limit", "read_bytes",
+            "scandir_names",
+        })
+        self.assertEqual(io.calls[marker + 1][0], "fsync_dir")
+
+
+class HR3ListContractTests(HR3Fixture):
+    """H3.1 RED-11/12 local-Q, filtering, sorting, and purity vectors."""
+
+    def test_list_local_q_five_failures_include_rq_context(self):
+        import json
+        from pathlib import Path
+
+        def extra_key(value):
+            value["extra"] = True
+
+        def wrong_id(value):
+            value["review_queue_item_id"] = "rq_" + "b" * 64
+
+        cases = (
+            ("canonical", None),
+            ("closed_schema", extra_key),
+            ("embedded_identity", wrong_id),
+            ("schema_version", lambda value: value.update(schema_version=2)),
+            ("pending", lambda value: value.update(status="accepted")),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                state, request = self._published_chain()
+                rq_id = request["review_queue_item_id"]
+                path = Path(state) / "review_queue" / (rq_id + ".json")
+                if mutate is None:
+                    path.write_bytes(path.read_bytes() + b"\n")
+                else:
+                    value = json.loads(path.read_bytes())
+                    mutate(value)
+                    path.write_bytes(canonical_bytes(value))
+                err = self._assert_code(
+                    "malformed_request", lambda: self._store(state).list())
+                self.assertEqual(err.rq_id, rq_id)
+                self.assertIsNone(err.decision_seq)
+
+    def test_list_stops_after_local_q_without_full_chain_reads(self):
+        import shutil
+        from pathlib import Path
+
+        state, request = self._published_chain()
+        shutil.rmtree(Path(state) / "evaluations")
+
+        def forbidden_builder(*_args):
+            raise AssertionError("list must not execute G8 steps 3-6")
+
+        from human_review.review_store import ReviewStore
+        result = ReviewStore(
+            state, forbidden_roots=(), rq_builder=forbidden_builder).list()
+        self.assertEqual(result, {"items": [{
+            "rq_id": request["review_queue_item_id"], "state": "pending",
+        }]})
+
+    def test_list_terminal_filter_and_codepoint_sort_are_explicit(self):
+        from pathlib import Path
+
+        state, request = self._published_chain()
+        queue = Path(state) / "review_queue"
+        for path in queue.iterdir():
+            path.unlink()
+        vectors = (
+            ("0", None),
+            ("9", "defer"),
+            ("a", None),
+            ("1", "accept"),
+            ("2", "reject"),
+            ("3", "revise"),
+        )
+        for digit, action in vectors:
+            rq_id = "rq_" + digit * 64
+            self._write_request(state, self._copy_request(request, rq_id))
+            if action is not None:
+                self._write_event(state, rq_id, 1, action)
+        result = self._store(state, io=ReverseScandirIo()).list()
+        self.assertEqual(result, {"items": [
+            {"rq_id": "rq_" + "0" * 64, "state": "pending"},
+            {"rq_id": "rq_" + "9" * 64, "state": "deferred"},
+            {"rq_id": "rq_" + "a" * 64, "state": "pending"},
+        ]})
+
+    def test_list_empty_set_is_legal(self):
+        self.assertEqual(self._store(self._state_dir()).list(), {"items": []})
+
+    def test_unsafe_path_and_path_too_long_cover_all_three_handles(self):
+        import os
+        import shutil
+        from pathlib import Path
+
+        for handle in ("decide", "show"):
+            with self.subTest(code="unsafe_path", handle=handle):
+                state, request = self._published_chain()
+                evaluations = Path(state) / "evaluations"
+                shutil.rmtree(evaluations)
+                os.symlink(self._state_dir(), evaluations)
+                store = self._store(state, clock_factory=self._fixed_clock)
+                call = (lambda: self._decide(
+                    store, request["review_queue_item_id"])) \
+                    if handle == "decide" else \
+                    (lambda: store.show(request["review_queue_item_id"]))
+                self._assert_code("unsafe_path", call)
+
+        with self.subTest(code="unsafe_path", handle="list"):
+            parent = Path(self._state_dir())
+            real = parent / "real"
+            real.mkdir()
+            state = real / "state"
+            state.mkdir()
+            alias = parent / "alias"
+            os.symlink(real, alias)
+            self._assert_code(
+                "unsafe_path", lambda: self._store(alias / "state").list())
+
+        for handle in ("decide", "show", "list"):
+            with self.subTest(code="path_too_long", handle=handle):
+                state, request = self._published_chain()
+                rq_id = request["review_queue_item_id"]
+
+                def limit(path, handle=handle):
+                    basename = os.path.basename(path)
+                    target = (
+                        handle == "decide"
+                        and basename == rq_id + ".decision_1.json"
+                    ) or (
+                        handle == "show" and basename == rq_id + ".json"
+                    ) or (
+                        handle == "list" and basename == "review_queue"
+                    )
+                    return len(os.fsencode(path)) - 1 if target else 100000
+
+                store = self._store(
+                    state, io=RecordingIo(path_limit=limit),
+                    clock_factory=self._fixed_clock)
+                if handle == "decide":
+                    call = lambda: self._decide(store, rq_id)
+                elif handle == "show":
+                    call = lambda: store.show(rq_id)
+                else:
+                    call = store.list
+                self._assert_code("path_too_long", call)
+
+    def test_list_never_calls_mutating_io_operations(self):
+        state, _request = self._published_chain()
+        io = RecordingIo()
+        self._store(state, io=io).list()
+        names = {name for name, _path in io.calls}
+        self.assertTrue(names.isdisjoint({
+            "open_exclusive", "write_all", "mkdir", "link", "unlink",
+        }))
+
+
+class HR3AgentTests(HR3Fixture):
+    """H3.2 RED-12 agent and independent registry vectors."""
+
+    def test_list_dispatch_is_a_direct_base_agent_result(self):
+        from unittest.mock import patch
+
+        from agents.base import BaseAgent
+        from agents.human_review import HumanReviewAgent
+
+        agent = HumanReviewAgent(self._store(self._state_dir()))
+        self.assertIsInstance(agent, BaseAgent)
+        self.assertEqual(agent.agent_id, "human_review_agent")
+        self.assertEqual(
+            agent.handles,
+            ["review.list", "review.show", "review.decide"],
+        )
+        with patch.object(
+                BaseAgent, "result",
+                side_effect=AssertionError("result() must not be called")):
+            self.assertEqual(
+                agent.run({"type": "review.list", "input": {}}, {}),
+                {"items": []},
+            )
+
+    def test_show_and_decide_dispatch_preserve_success_shapes(self):
+        from agents.human_review import HumanReviewAgent
+
+        state, request = self._published_chain()
+        rq_id = request["review_queue_item_id"]
+        agent = HumanReviewAgent(self._store(
+            state,
+            nonce_factory=lambda: "a" * 32,
+            clock_factory=self._fixed_clock,
+        ))
+        shown = agent.run({
+            "type": "review.show",
+            "input": {"rq_id": rq_id},
+        }, {})
+        self.assertEqual(shown, {
+            "request": request,
+            "events": [],
+            "state": "pending",
+        })
+        decided = agent.run({
+            "type": "review.decide",
+            "input": {
+                "rq_id": rq_id,
+                "decision_seq": 1,
+                "action": "accept",
+                "operator_claim": "operator",
+                "reason": "evidence sufficient",
+            },
+        }, {})
+        self.assertEqual(decided["status"], "published")
+        self.assertEqual(decided["event"]["review_queue_item_id"], rq_id)
+
+    def test_task_and_input_envelopes_are_closed_before_field_parsing(self):
+        from agents.human_review import HumanReviewAgent
+        from human_review.review_store import ReviewError
+
+        agent = HumanReviewAgent(self._store(self._state_dir()))
+        invalid = (
+            {"type": "review.list"},
+            {"type": "review.list", "input": [], "trace_id": "x"},
+            {"type": "review.list", "input": {"extra": True}},
+            {"type": "review.show", "input": {"rq_id": RQ_ID, "x": 1}},
+            {"type": "review.decide", "input": {"unknown": True}},
+            {"type": "review.unknown", "input": {}},
+        )
+        for task in invalid:
+            with self.subTest(task=task):
+                with self.assertRaises(ReviewError) as caught:
+                    agent.run(task, {})
+                self.assertEqual(caught.exception.code, "invalid_request")
+                self.assertIsNone(caught.exception.rq_id)
+                self.assertIsNone(caught.exception.decision_seq)
+
+        with self.assertRaises(ReviewError) as caught:
+            agent.run({"type": "review.show", "input": {}}, {})
+        self.assertEqual(
+            caught.exception.code, "invalid_review_queue_item_id")
+
+    def test_review_error_is_re_raised_without_wrapping(self):
+        from agents.human_review import HumanReviewAgent
+        from human_review.review_store import ReviewError
+
+        expected = ReviewError("request_not_found", rq_id=RQ_ID)
+
+        class FailingStore:
+            def show(self, _rq_id):
+                raise expected
+
+        agent = HumanReviewAgent(FailingStore())
+        with self.assertRaises(ReviewError) as caught:
+            agent.run({"type": "review.show", "input": {"rq_id": RQ_ID}}, {})
+        self.assertIs(caught.exception, expected)
+
+    def test_independent_registry_selects_and_runs_the_supplied_agent(self):
+        from agents.human_review import HumanReviewAgent
+        from agents.registry import AgentRegistry
+
+        agent = HumanReviewAgent(self._store(self._state_dir()))
+        registry = AgentRegistry.from_config(
+            SOURCE_DIR / "agents" / "registry-review.yaml",
+            [agent],
+        )
+        for handle in agent.handles:
+            with self.subTest(handle=handle):
+                self.assertIs(registry.select({"type": handle}), agent)
+        self.assertEqual(
+            registry.select({"type": "review.list"}).run(
+                {"type": "review.list", "input": {}}, {}),
+            {"items": []},
+        )
+
+
+class HR3CliTests(HR3Fixture):
+    """H3.3 RED-12/16 early dispatch and envelope vectors."""
+
+    def _run_main(self, task, *, state=None, root=None, extra=()):
+        import contextlib
+        import io
+        import json
+
+        import laos
+
+        state = self._state_dir() if state is None else state
+        root = self._state_dir() if root is None else root
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        argv = [
+            "--root", str(root),
+            "--state-dir", str(state),
+            "--task-json", json.dumps(task, separators=(",", ":")),
+            *extra,
+        ]
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            return laos.main(argv), stdout.getvalue(), stderr.getvalue()
+
+    def test_review_list_routes_before_broken_model_configuration(self):
+        from pathlib import Path
+
+        model_config = Path(self._state_dir()) / "broken-model.json"
+        model_config.write_text("{", encoding="utf-8")
+        code, stdout, stderr = self._run_main(
+            {"type": "review.list", "input": {}},
+            extra=("--model-config", str(model_config)),
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stderr, "")
+        self.assertEqual(stdout, '{"items":[]}\n')
+
+    def test_review_handles_are_context_free_in_depth(self):
+        from agents.orchestrator import ContextAgent
+
+        class Builder:
+            def __init__(self):
+                self.empty_calls = []
+
+            def build(self, *_args):
+                raise AssertionError("review tasks must not read memory context")
+
+            def empty(self, limit):
+                self.empty_calls.append(limit)
+                return {"sources": [], "limit": limit}
+
+        builder = Builder()
+        agent = ContextAgent(builder)
+        for handle in ("review.list", "review.show", "review.decide"):
+            with self.subTest(handle=handle):
+                result = agent.run({
+                    "type": "context.build",
+                    "input": {"task": {"type": handle, "input": {}}},
+                }, {})
+                self.assertEqual(result["output"]["sources"], [])
+        self.assertEqual(builder.empty_calls, [8000, 8000, 8000])
+
+    def test_hr_error_envelope_is_closed_and_uses_parsed_context(self):
+        import json
+
+        cases = (
+            (
+                {"type": "review.show", "input": {}},
+                {"category": "precondition", "code":
+                 "invalid_review_queue_item_id"},
+            ),
+            (
+                {"type": "review.show", "input": {"rq_id": RQ_ID}},
+                {"category": "jurisdiction", "code": "request_not_found",
+                 "rq_id": RQ_ID},
+            ),
+            (
+                {"type": "review.decide", "input": {
+                    "rq_id": RQ_ID, "decision_seq": 0,
+                }},
+                {"category": "precondition", "code":
+                 "invalid_decision_seq", "rq_id": RQ_ID},
+            ),
+            (
+                {"type": "review.decide", "input": {
+                    "rq_id": RQ_ID, "decision_seq": 1,
+                    "action": "unknown", "operator_claim": "operator",
+                    "reason": "evidence",
+                }},
+                {"category": "precondition", "code": "invalid_action",
+                 "rq_id": RQ_ID, "decision_seq": 1},
+            ),
+        )
+        for task, expected in cases:
+            with self.subTest(code=expected["code"]):
+                code, stdout, stderr = self._run_main(task)
+                self.assertEqual(code, 1)
+                self.assertEqual(stdout, "")
+                self.assertEqual(json.loads(stderr), {"error": expected})
+
+    def test_missing_state_dir_precedes_review_bootstrap(self):
+        import contextlib
+        import io
+        import json
+        from unittest.mock import patch
+
+        import laos
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        argv = [
+            "--root", self._state_dir(),
+            "--task-json", json.dumps(
+                {"type": "review.list", "input": {}}),
+        ]
+        with patch.object(
+                laos, "_pin_and_load_rq_builder",
+                side_effect=AssertionError("pinning must not run")) as pin:
+            with contextlib.redirect_stdout(stdout), \
+                    contextlib.redirect_stderr(stderr):
+                code = laos.main(argv)
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        error = json.loads(stderr.getvalue())["error"]
+        self.assertEqual(set(error), {"code", "message", "stage"})
+        self.assertEqual(error["code"], "request_failed")
+        pin.assert_not_called()
+
+    def test_pinning_reuses_trusted_modules_and_rejects_foreign_src(self):
+        import types
+
+        import laos
+
+        builder = laos._pin_and_load_rq_builder()
+        trusted_src = sys.modules["src"]
+        trusted_loop = sys.modules["src.learning_loop"]
+        self.assertIs(laos._pin_and_load_rq_builder(), builder)
+        self.assertIs(sys.modules["src"], trusted_src)
+        self.assertIs(sys.modules["src.learning_loop"], trusted_loop)
+        self.assertEqual(builder.__module__, "src.learning_loop.queue_request")
+
+        saved = {
+            name: module for name, module in tuple(sys.modules.items())
+            if name == "src" or name.startswith("src.")
+        }
+        for name in saved:
+            sys.modules.pop(name, None)
+        foreign = types.ModuleType("src")
+        foreign.__path__ = ["/foreign/src"]
+        sys.modules["src"] = foreign
+        try:
+            with self.assertRaisesRegex(ValueError, "untrusted src namespace"):
+                laos._pin_and_load_rq_builder()
+            self.assertIs(sys.modules["src"], foreign)
+            self.assertNotIn("src.learning_loop.queue_request", sys.modules)
+        finally:
+            for name in tuple(sys.modules):
+                if name == "src" or name.startswith("src."):
+                    sys.modules.pop(name, None)
+            sys.modules.update(saved)
+
+    def test_cli_transport_runs_show_and_decide_through_registry(self):
+        import json
+
+        state, request = self._published_chain()
+        root = self._state_dir()
+        rq_id = request["review_queue_item_id"]
+        code, stdout, stderr = self._run_main(
+            {"type": "review.show", "input": {"rq_id": rq_id}},
+            state=state,
+            root=root,
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout), {
+            "request": request, "events": [], "state": "pending",
+        })
+
+        code, stdout, stderr = self._run_main({
+            "type": "review.decide",
+            "input": {
+                "rq_id": rq_id,
+                "decision_seq": 1,
+                "action": "accept",
+                "operator_claim": "operator",
+                "reason": "evidence sufficient",
+            },
+        }, state=state, root=root)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["status"], "published")
+
+    def test_cli_invalid_state_dir_uses_hr_envelope_without_context(self):
+        import json
+        from pathlib import Path
+
+        missing = Path(self._state_dir()) / "missing"
+        code, stdout, stderr = self._run_main(
+            {"type": "review.list", "input": {}},
+            state=missing,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertEqual(json.loads(stderr), {"error": {
+            "category": "precondition",
+            "code": "invalid_state_dir",
+        }})
+
+
+class HR3TransportE2ETests(HR3Fixture):
+    """H3.4 RED-16 subprocess and construction-boundary vectors."""
+
+    def test_subprocess_pinning_blocks_malicious_src_package(self):
+        import json
+        import os
+        import subprocess
+        from pathlib import Path
+
+        base = Path(self._state_dir())
+        root = base / "root"
+        state = base / "state"
+        root.mkdir()
+        state.mkdir()
+        malicious = base / "malicious"
+        fake_src = malicious / "src"
+        fake_src.mkdir(parents=True)
+        sentinel = base / "malicious-src-executed"
+        diagnostic = base / "pinning-diagnostic.json"
+        (fake_src / "__init__.py").write_text(
+            "from pathlib import Path\n"
+            f"Path({str(sentinel)!r}).write_text('executed')\n"
+            "foreign_marker = True\n",
+            encoding="utf-8",
+        )
+        (malicious / "sitecustomize.py").write_text(
+            "import atexit, json, sys\n"
+            "from pathlib import Path\n"
+            f"_diagnostic = Path({str(diagnostic)!r})\n"
+            "def _dump():\n"
+            "    src = sys.modules.get('src')\n"
+            "    loop = sys.modules.get('src.learning_loop')\n"
+            "    queue = sys.modules.get('src.learning_loop.queue_request')\n"
+            "    builder = getattr(queue, 'build_review_queue_request', None)\n"
+            "    value = {\n"
+            "        'src_paths': list(getattr(src, '__path__', ())),\n"
+            "        'foreign_marker': getattr(src, 'foreign_marker', False),\n"
+            "        'loop_file': getattr(loop, '__file__', None),\n"
+            "        'queue_file': getattr(queue, '__file__', None),\n"
+            "        'builder_module': getattr(builder, '__module__', None),\n"
+            "    }\n"
+            "    _diagnostic.write_text(json.dumps(value), encoding='utf-8')\n"
+            "atexit.register(_dump)\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(malicious)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SOURCE_DIR / "laos.py"),
+                "--root", str(root),
+                "--state-dir", str(state),
+                "--task-json", json.dumps(
+                    {"type": "review.list", "input": {}},
+                    separators=(",", ":"),
+                ),
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '{"items":[]}\n')
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(sentinel.exists())
+        identity = json.loads(diagnostic.read_text(encoding="utf-8"))
+        self.assertEqual(
+            {Path(path).resolve() for path in identity["src_paths"]},
+            {SOURCE_DIR.resolve()},
+        )
+        self.assertFalse(identity["foreign_marker"])
+        self.assertEqual(
+            Path(identity["loop_file"]).resolve(),
+            (SOURCE_DIR / "learning_loop" / "__init__.py").resolve(),
+        )
+        self.assertEqual(
+            Path(identity["queue_file"]).resolve(),
+            (SOURCE_DIR / "learning_loop" / "queue_request.py").resolve(),
+        )
+        self.assertEqual(
+            identity["builder_module"],
+            "src.learning_loop.queue_request",
+        )
+
+    def test_subprocess_review_contract_and_broken_model_config(self):
+        import json
+        import subprocess
+        from pathlib import Path
+
+        base = Path(self._state_dir())
+        root = base / "root"
+        state = base / "state"
+        root.mkdir()
+        state.mkdir()
+
+        def run(task, *extra):
+            return subprocess.run(
+                [
+                    sys.executable,
+                    str(SOURCE_DIR / "laos.py"),
+                    "--root", str(root),
+                    "--state-dir", str(state),
+                    "--task-json", json.dumps(
+                        task, separators=(",", ":")),
+                    *extra,
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        invalid = (
+            {"type": "review.list", "input": []},
+            {"type": "review.list", "input": {"unknown": True}},
+            {"type": "review.list", "input": {}, "trace_id": "x"},
+            {"type": "review.list"},
+        )
+        for task in invalid:
+            with self.subTest(task=task):
+                result = run(task)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(json.loads(result.stderr), {"error": {
+                    "category": "precondition",
+                    "code": "invalid_request",
+                }})
+
+        broken = base / "broken-model.json"
+        broken.write_text("{", encoding="utf-8")
+        result = run(
+            {"type": "review.list", "input": {}},
+            "--model-config", str(broken),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '{"items":[]}\n')
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(self._tree_bytes(root), {})
+        self.assertEqual(self._tree_bytes(state), {})
+
+    def test_pinning_rejects_foreign_module_without_replacement_or_import(self):
+        import json
+        import subprocess
+        from pathlib import Path
+
+        base = Path(self._state_dir())
+        root = base / "root"
+        state = base / "state"
+        root.mkdir()
+        state.mkdir()
+        argv = [
+            "--root", str(root),
+            "--state-dir", str(state),
+            "--task-json", json.dumps(
+                {"type": "review.list", "input": {}},
+                separators=(",", ":"),
+            ),
+        ]
+        script = (
+            "import json, sys, types\n"
+            f"sys.path.insert(0, {str(SOURCE_DIR)!r})\n"
+            "import laos\n"
+            "foreign = types.ModuleType('src')\n"
+            "foreign.__path__ = ['/foreign/src']\n"
+            "sys.modules['src'] = foreign\n"
+            f"code = laos.main({argv!r})\n"
+            "print(json.dumps({\n"
+            "    'same': sys.modules.get('src') is foreign,\n"
+            "    'queue_loaded': 'src.learning_loop.queue_request' in sys.modules,\n"
+            "    'store_loaded': 'human_review.review_store' in sys.modules,\n"
+            "    'agent_loaded': 'agents.human_review' in sys.modules,\n"
+            "}, sort_keys=True))\n"
+            "raise SystemExit(code)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stdout), {
+            "agent_loaded": False,
+            "queue_loaded": False,
+            "same": True,
+            "store_loaded": False,
+        })
+        error = json.loads(result.stderr)["error"]
+        self.assertEqual(set(error), {"code", "message", "stage"})
+        self.assertEqual(error["code"], "request_failed")
+        self.assertEqual(self._tree_bytes(root), {})
+        self.assertEqual(self._tree_bytes(state), {})
+
+    def test_pinning_reuses_preloaded_trusted_modules_through_cli_main(self):
+        import json
+        import subprocess
+        from pathlib import Path
+
+        base = Path(self._state_dir())
+        root = base / "root"
+        state = base / "state"
+        diagnostic = base / "trusted-diagnostic.json"
+        root.mkdir()
+        state.mkdir()
+        argv = [
+            "--root", str(root),
+            "--state-dir", str(state),
+            "--task-json", json.dumps(
+                {"type": "review.list", "input": {}},
+                separators=(",", ":"),
+            ),
+        ]
+        script = (
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            f"sys.path.insert(0, {str(SOURCE_DIR)!r})\n"
+            "import src.learning_loop.queue_request as queue\n"
+            "trusted_src = sys.modules['src']\n"
+            "trusted_loop = sys.modules['src.learning_loop']\n"
+            "import laos\n"
+            f"code = laos.main({argv!r})\n"
+            "value = {\n"
+            "    'same_src': sys.modules['src'] is trusted_src,\n"
+            "    'same_loop': sys.modules['src.learning_loop'] is trusted_loop,\n"
+            "    'src_paths': list(sys.modules['src'].__path__),\n"
+            "    'loop_file': trusted_loop.__file__,\n"
+            "    'queue_file': queue.__file__,\n"
+            "    'builder_module': queue.build_review_queue_request.__module__,\n"
+            "}\n"
+            f"Path({str(diagnostic)!r}).write_text(json.dumps(value), encoding='utf-8')\n"
+            "raise SystemExit(code)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '{"items":[]}\n')
+        identity = json.loads(diagnostic.read_text(encoding="utf-8"))
+        self.assertTrue(identity["same_src"])
+        self.assertTrue(identity["same_loop"])
+        self.assertEqual(
+            {Path(path).resolve() for path in identity["src_paths"]},
+            {SOURCE_DIR.resolve()},
+        )
+        self.assertEqual(
+            Path(identity["loop_file"]).resolve(),
+            (SOURCE_DIR / "learning_loop" / "__init__.py").resolve(),
+        )
+        self.assertEqual(
+            Path(identity["queue_file"]).resolve(),
+            (SOURCE_DIR / "learning_loop" / "queue_request.py").resolve(),
+        )
+        self.assertEqual(
+            identity["builder_module"],
+            "src.learning_loop.queue_request",
+        )
+
+    def test_review_modules_are_lazy_and_state_dir_error_has_priority(self):
+        import builtins
+        import contextlib
+        import io
+        import json
+        import subprocess
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import laos
+
+        calls = []
+        original_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name in ("human_review.review_store", "agents.human_review"):
+                calls.append(name)
+                raise AssertionError("review import must remain lazy")
+            return original_import(name, *args, **kwargs)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch("builtins.__import__", side_effect=guarded_import):
+            with contextlib.redirect_stdout(stdout), \
+                    contextlib.redirect_stderr(stderr):
+                code = laos.main([
+                    "--root", self._state_dir(),
+                    "--task-json", json.dumps(
+                        {"type": "review.list", "input": {}}),
+                ])
+        self.assertEqual(code, 1)
+        self.assertEqual(calls, [])
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            set(json.loads(stderr.getvalue())["error"]),
+            {"code", "message", "stage"},
+        )
+
+        base = Path(self._state_dir())
+        diagnostic = base / "lazy.json"
+        missing_root = base / "missing-root"
+        script = (
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            f"sys.path.insert(0, {str(SOURCE_DIR)!r})\n"
+            "import laos\n"
+            "before = {name: name in sys.modules for name in "
+            "('human_review.review_store', 'agents.human_review')}\n"
+            "code = laos.main([\n"
+            f"    '--root', {str(missing_root)!r},\n"
+            "    '--task-json', '{\"type\":\"unknown\",\"input\":{}}',\n"
+            "])\n"
+            "after = {name: name in sys.modules for name in before}\n"
+            f"Path({str(diagnostic)!r}).write_text(json.dumps([before, after]), encoding='utf-8')\n"
+            "raise SystemExit(code)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        before, after = json.loads(diagnostic.read_text(encoding="utf-8"))
+        self.assertEqual(before, {
+            "agents.human_review": False,
+            "human_review.review_store": False,
+        })
+        self.assertEqual(after, before)
+
+    def test_registry_config_failures_are_generic_and_side_effect_free(self):
+        import contextlib
+        import io
+        import json
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import laos
+
+        base = Path(self._state_dir())
+        root = base / "root"
+        state = base / "state"
+        fake_src = base / "fake-src"
+        config = fake_src / "agents" / "registry-review.yaml"
+        root.mkdir()
+        state.mkdir()
+        config.parent.mkdir(parents=True)
+        valid_entry = {
+            "id": "human_review_agent",
+            "class": "HumanReviewAgent",
+            "handles": ["review.list", "review.show", "review.decide"],
+        }
+        variants = (
+            ("missing", None),
+            ("invalid-json", "{"),
+            ("handles", json.dumps({"agents": [{
+                **valid_entry, "handles": ["review.list"],
+            }]})),
+            ("class", json.dumps({"agents": [{
+                **valid_entry, "class": "ForeignAgent",
+            }]})),
+        )
+        argv = [
+            "--root", str(root),
+            "--state-dir", str(state),
+            "--task-json", '{"type":"review.list","input":{}}',
+        ]
+        for label, value in variants:
+            with self.subTest(label=label):
+                config.unlink(missing_ok=True)
+                if value is not None:
+                    config.write_text(value, encoding="utf-8")
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with patch.object(
+                        laos, "__file__", str(fake_src / "laos.py")), \
+                        patch.object(
+                            laos, "_pin_and_load_rq_builder",
+                            return_value=self._builder()), \
+                        patch.object(laos, "build_application") as app, \
+                        patch.object(laos, "build_model_backend") as model, \
+                        patch.object(laos, "MemoryStore") as memory_store, \
+                        patch.object(laos, "CandidateStore") as candidates, \
+                        patch.object(
+                            laos, "ConversationReviewService") as review, \
+                        patch.object(laos, "ContextAgent") as context_agent:
+                    with contextlib.redirect_stdout(stdout), \
+                            contextlib.redirect_stderr(stderr):
+                        code = laos.main(argv)
+                self.assertEqual(code, 1)
+                self.assertEqual(stdout.getvalue(), "")
+                error = json.loads(stderr.getvalue())["error"]
+                self.assertEqual(set(error), {"code", "message", "stage"})
+                self.assertEqual(error["code"], "request_failed")
+                app.assert_not_called()
+                model.assert_not_called()
+                memory_store.assert_not_called()
+                candidates.assert_not_called()
+                review.assert_not_called()
+                context_agent.assert_not_called()
+                self.assertEqual(self._tree_bytes(root), {})
+                self.assertEqual(self._tree_bytes(state), {})
+
+    def test_review_dispatch_bypasses_generic_construction_and_generic_app(self):
+        import argparse
+        import contextlib
+        import io
+        import json
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import laos
+        import memory
+
+        base = Path(self._state_dir())
+        root = base / "root"
+        state = base / "state"
+        root.mkdir()
+        state.mkdir()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        argv = [
+            "--root", str(root),
+            "--state-dir", str(state),
+            "--task-json", json.dumps(
+                {"type": "review.list", "input": {}}),
+        ]
+        with patch.object(laos, "build_application") as app, \
+                patch.object(laos, "build_model_backend") as model, \
+                patch.object(laos, "MemoryStore") as memory_store, \
+                patch.object(laos, "CandidateStore") as candidates, \
+                patch.object(
+                    laos, "ConversationReviewService") as review_service, \
+                patch.object(laos, "ContextAgent") as context_agent:
+            with contextlib.redirect_stdout(stdout), \
+                    contextlib.redirect_stderr(stderr):
+                code = laos.main(argv)
+        self.assertEqual(code, 0, stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), '{"items":[]}\n')
+        app.assert_not_called()
+        model.assert_not_called()
+        memory_store.assert_not_called()
+        candidates.assert_not_called()
+        review_service.assert_not_called()
+        context_agent.assert_not_called()
+
+        generic_root = base / "generic-root"
+        generic_state = base / "generic-state"
+        memory.init_store(generic_root)
+        memory.db_init(argparse.Namespace(
+            root=str(generic_root), state_dir=str(generic_state)))
+
+        class Backend:
+            def review(self, _conversation):
+                return {}
+
+        application = laos.build_application(
+            generic_root, generic_state, Backend())
+        self.assertNotIn(
+            "human_review_agent", application.registry._agents_by_id)
+        from memory.store import MemoryStore
+        with patch.object(
+                MemoryStore, "active_relevant",
+                side_effect=AssertionError("review task read active memory")):
+            with self.assertRaises(ValueError) as caught:
+                application.run({"type": "review.list", "input": {}})
+        self.assertEqual(str(caught.exception), "task type is not registered")
+
+    def test_all_frozen_codes_are_emitted_and_capabilities_are_closed(self):
+        import ast
+        import subprocess
+
+        from human_review.decision import ERROR_CODES
+
+        production = (
+            SOURCE_DIR / "human_review" / "review_store.py",
+            SOURCE_DIR / "agents" / "human_review.py",
+        )
+        emitted = set()
+        for path in production:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not node.args:
+                    continue
+                name = node.func.id if isinstance(node.func, ast.Name) else None
+                arg = node.args[0]
+                if name in ("_raise", "ReviewError") \
+                        and isinstance(arg, ast.Constant) \
+                        and isinstance(arg.value, str):
+                    emitted.add(arg.value)
+        self.assertEqual(emitted, set(ERROR_CODES))
+        self.assertNotIn("concurrent_change", emitted)
+
+        banned = (
+            "learning_loop", "src.learning_loop", "memory", "src.memory",
+            "policy", "promotion", "lifecycle",
+        )
+        audited = tuple((SOURCE_DIR / "human_review").glob("*.py")) + (
+            SOURCE_DIR / "agents" / "human_review.py",
+        )
+        for path in audited:
+            imports = set()
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imports.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imports.add(node.module)
+            with self.subTest(path=path):
+                self.assertTrue(all(
+                    not name.startswith(banned) for name in imports),
+                    imports,
+                )
+
+        decision = SOURCE_DIR / "human_review" / "decision.py"
+        decision_tree = ast.parse(decision.read_text(encoding="utf-8"))
+        io_imports = {"os", "pathlib", "io", "shutil", "subprocess"}
+        self.assertFalse(any(
+            isinstance(node, ast.Import)
+            and any(alias.name.split(".")[0] in io_imports
+                    for alias in node.names)
+            or isinstance(node, ast.ImportFrom)
+            and node.module is not None
+            and node.module.split(".")[0] in io_imports
+            for node in ast.walk(decision_tree)
+        ))
+        script = (
+            "import builtins, sys\n"
+            f"sys.path.insert(0, {str(SOURCE_DIR)!r})\n"
+            "from human_review.decision import build_decision, reduce_state, validate_schema\n"
+            "def fail(*args, **kwargs): raise AssertionError('I/O attempted')\n"
+            "builtins.open = fail\n"
+            f"event = build_decision({RQ_ID!r}, 1, 'accept', 'operator', 'reason', {RECORDED_AT!r})\n"
+            "validate_schema(event)\n"
+            "assert reduce_state([event]) == 'accepted'\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cli_projects_every_category_and_all_post_link_codes(self):
+        import contextlib
+        import io
+        import json
+        from unittest.mock import patch
+
+        import laos
+        from human_review.decision import ERROR_CATEGORIES
+        from human_review.review_store import ReviewError
+
+        codes = (
+            "invalid_review_chain",
+            "invalid_action",
+            "decision_slot_conflict",
+            "decision_final_byte_mismatch",
+            "decision_final_missing",
+            "malformed_decision",
+            "decision_directory_fsync_failed",
+            "final_readback_failed",
+            "link_failed",
+        )
+
+        class Agent:
+            def __init__(self, error):
+                self.error = error
+
+            def run(self, task, context):
+                raise self.error
+
+        class Registry:
+            def __init__(self, error):
+                self.agent = Agent(error)
+
+            def select(self, task):
+                return self.agent
+
+        root = self._state_dir()
+        state = self._state_dir()
+        argv = [
+            "--root", root,
+            "--state-dir", state,
+            "--task-json", '{"type":"review.decide","input":{}}',
+        ]
+        seen_categories = set()
+        for code_name in codes:
+            with self.subTest(code=code_name):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                error = ReviewError(
+                    code_name, rq_id=RQ_ID, decision_seq=1)
+                with patch.object(
+                        laos, "_pin_and_load_rq_builder",
+                        return_value=self._builder()), \
+                        patch.object(
+                            laos, "build_review_transport",
+                            return_value=Registry(error)):
+                    with contextlib.redirect_stdout(stdout), \
+                            contextlib.redirect_stderr(stderr):
+                        result = laos.main(argv)
+                self.assertEqual(result, 1)
+                self.assertEqual(stdout.getvalue(), "")
+                projected = json.loads(stderr.getvalue())
+                self.assertEqual(projected, {"error": {
+                    "category": ERROR_CATEGORIES[code_name],
+                    "code": code_name,
+                    "rq_id": RQ_ID,
+                    "decision_seq": 1,
+                }})
+                seen_categories.add(ERROR_CATEGORIES[code_name])
+        self.assertEqual(seen_categories, {
+            "jurisdiction", "precondition", "conflict", "corruption",
+            "durability_unknown", "io",
+        })
+
+    def test_phase5_and_human_review_ignore_each_others_temp_files(self):
+        from pathlib import Path
+
+        from src.learning_loop.enrichment import (
+            build_enriched_utility_evaluation,
+        )
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+        from src.learning_loop.persistence import (
+            persist_learning_chain,
+            resume_learning_chain,
+        )
+        from src.learning_loop.reflection_builder import build_reflection
+
+        state = Path(self._state_dir())
+        decisions = state / "decisions"
+        decisions.mkdir()
+        hr_temp = decisions / (
+            ".tmp." + RQ_ID + ".decision_1.json." + "1" * 32)
+        hr_bytes = b"human-review-owned-temp"
+        hr_temp.write_bytes(hr_bytes)
+
+        enriched = build_enriched_utility_evaluation(
+            evaluate_experiment_bundle(self._bundle()))
+        digest = build_reflection(enriched)["source_snapshot_digest"]
+        persisted = persist_learning_chain(state, enriched)
+        resume_learning_chain(
+            state, enriched["source_evaluation_id"], digest)
+        self.assertTrue(hr_temp.exists())
+        self.assertEqual(hr_temp.read_bytes(), hr_bytes)
+
+        queue = state / "review_queue"
+        p5_temp = queue / ".tmp.phase5-retry-residue"
+        p5_bytes = b"phase-five-owned-temp"
+        p5_temp.write_bytes(p5_bytes)
+        listed = self._store(state).list()
+        self.assertEqual(
+            [item["rq_id"] for item in listed["items"]],
+            [persisted["review_queue_request"]["review_queue_item_id"]],
+        )
+        self.assertTrue(p5_temp.exists())
+        self.assertEqual(p5_temp.read_bytes(), p5_bytes)
+
+
+class HR3CloseoutAuditTests(HR3Fixture):
+    """H3.5 mechanical closure for the frozen RED-13/14/15 vectors."""
+
+    def test_operator_claim_and_reason_errors_reach_cli_without_effects(self):
+        import contextlib
+        import io
+        import json
+
+        import laos
+
+        missing = object()
+        cases = (
+            ("invalid_operator_claim", "operator_claim", missing),
+            ("invalid_operator_claim", "operator_claim", None),
+            ("invalid_operator_claim", "operator_claim", ""),
+            ("invalid_operator_claim", "operator_claim", 1),
+            ("invalid_reason", "reason", missing),
+            ("invalid_reason", "reason", None),
+            ("invalid_reason", "reason", ""),
+            ("invalid_reason", "reason", 1),
+        )
+        for expected, field, value in cases:
+            with self.subTest(code=expected, value=value):
+                state, request = self._published_chain()
+                root = self._state_dir()
+                rq_id = request["review_queue_item_id"]
+                values = {
+                    "rq_id": rq_id,
+                    "decision_seq": 1,
+                    "action": "accept",
+                    "operator_claim": "operator",
+                    "reason": "evidence sufficient",
+                }
+                if value is missing:
+                    values.pop(field)
+                else:
+                    values[field] = value
+                before = self._tree_bytes(state)
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(stdout), \
+                        contextlib.redirect_stderr(stderr):
+                    code = laos.main([
+                        "--root", root,
+                        "--state-dir", state,
+                        "--task-json", json.dumps({
+                            "type": "review.decide", "input": values,
+                        }, separators=(",", ":")),
+                    ])
+                self.assertEqual(code, 1)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(json.loads(stderr.getvalue()), {"error": {
+                    "category": "precondition",
+                    "code": expected,
+                    "rq_id": rq_id,
+                    "decision_seq": 1,
+                }})
+                self.assertEqual(self._tree_bytes(state), before)
+
+    def test_all_post_link_errors_converge_by_retry_or_show(self):
+        import contextlib
+        import os
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from human_review.decision import DecisionSchemaError
+
+        cases = (
+            ("decision_directory_fsync_failed", "valid"),
+            ("final_readback_failed", "valid"),
+            ("malformed_decision", "valid"),
+            ("decision_final_missing", "absent"),
+            ("decision_final_byte_mismatch", "corrupt"),
+        )
+        for expected, physical in cases:
+            with self.subTest(code=expected, physical=physical):
+                state, request = self._published_chain()
+                rq_id = request["review_queue_item_id"]
+                decisions = Path(state).resolve() / "decisions"
+                final = decisions / (rq_id + ".decision_1.json")
+
+                def fail(name, args, _count, expected=expected):
+                    if expected == "decision_directory_fsync_failed" \
+                            and name == "fsync_dir" \
+                            and Path(args[0]) == decisions:
+                        return OSError("post-link fsync failed")
+                    return None
+
+                def read_hook(path, _count, expected=expected):
+                    if Path(path) != final:
+                        return _DELEGATE
+                    if expected == "final_readback_failed":
+                        raise OSError("post-link read failed")
+                    if expected == "decision_final_missing":
+                        os.unlink(path)
+                        raise FileNotFoundError(path)
+                    if expected == "decision_final_byte_mismatch":
+                        Path(path).write_bytes(b"corrupt-final")
+                        return b"corrupt-final"
+                    return _DELEGATE
+
+                active_io = RecordingIo(fail=fail, read_hook=read_hook)
+                decoder = patch(
+                    "human_review.review_store.decode_event",
+                    side_effect=DecisionSchemaError(
+                        "post-link decode failure"),
+                ) if expected == "malformed_decision" \
+                    else contextlib.nullcontext()
+                with decoder:
+                    error = self._assert_code(
+                        expected,
+                        lambda: self._decide(
+                            self._store(
+                                state,
+                                io=active_io,
+                                nonce_factory=lambda: "a" * 32,
+                                clock_factory=self._fixed_clock,
+                            ),
+                            rq_id,
+                        ),
+                    )
+                self.assertEqual(error.rq_id, rq_id)
+                self.assertEqual(error.decision_seq, 1)
+                self.assertTrue(all(
+                    Path(path).name.startswith(".tmp.")
+                    for name, path in active_io.calls if name == "unlink"
+                ))
+
+                store = self._store(
+                    state,
+                    nonce_factory=lambda: "b" * 32,
+                    clock_factory=self._fixed_clock,
+                )
+                if physical == "valid":
+                    self.assertTrue(final.is_file())
+                    before_retry = final.read_bytes()
+                    retry = self._decide(store, rq_id)
+                    self.assertEqual(retry["status"], "idempotent")
+                    self.assertEqual(final.read_bytes(), before_retry)
+                    self.assertEqual(store.show(rq_id)["state"], "accepted")
+                elif physical == "absent":
+                    self.assertFalse(final.exists())
+                    retry = self._decide(store, rq_id)
+                    self.assertEqual(retry["status"], "published")
+                    self.assertEqual(store.show(rq_id)["state"], "accepted")
+                else:
+                    self.assertEqual(final.read_bytes(), b"corrupt-final")
+                    self._assert_code(
+                        "malformed_decision",
+                        lambda: self._decide(store, rq_id),
+                    )
+                    self._assert_code(
+                        "malformed_decision", lambda: store.show(rq_id))
+                    self.assertEqual(final.read_bytes(), b"corrupt-final")
+
+    def test_p3_static_matrix_and_producer_dynamic_guard(self):
+        import ast
+        import os
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from src.learning_loop.enrichment import (
+            build_enriched_utility_evaluation,
+        )
+        from src.learning_loop.evaluation import evaluate_experiment_bundle
+        from src.learning_loop import persistence
+        from src.learning_loop.reflection_builder import build_reflection
+
+        producer_paths = tuple(
+            SOURCE_DIR / "learning_loop" / name for name in (
+                "evaluation.py", "enrichment.py", "reflection_builder.py",
+                "eligibility.py", "queue_request.py", "persistence.py",
+            )
+        )
+        producer_forbidden = (
+            "human_review", "src.human_review", "memory", "src.memory",
+            "policy", "promotion", "lifecycle",
+        )
+        review_forbidden = (
+            "learning_loop", "src.learning_loop", "memory", "src.memory",
+            "policy", "promotion", "lifecycle",
+        )
+
+        def imported_modules(path):
+            found = set()
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    found.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    found.add(node.module)
+            return found
+
+        for path in producer_paths:
+            with self.subTest(subject="producer", path=path):
+                self.assertTrue(all(
+                    not name.startswith(producer_forbidden)
+                    for name in imported_modules(path)
+                ))
+
+        human_review_paths = tuple(
+            (SOURCE_DIR / "human_review").glob("*.py")) + (
+                SOURCE_DIR / "agents" / "human_review.py",
+            )
+        for path in human_review_paths:
+            with self.subTest(subject="human-review", path=path):
+                self.assertTrue(all(
+                    not name.startswith(review_forbidden)
+                    for name in imported_modules(path)
+                ))
+
+        laos_path = SOURCE_DIR / "laos.py"
+        laos_tree = ast.parse(laos_path.read_text(encoding="utf-8"))
+        direct_store_calls = {
+            node.func.attr
+            for node in ast.walk(laos_tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"list", "show", "decide"}
+        }
+        self.assertEqual(direct_store_calls, set())
+        self.assertFalse({"evaluations", "review_queue", "decisions"} & {
+            node.value for node in ast.walk(laos_tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        })
+
+        class GuardIo:
+            def __init__(self):
+                self.base = persistence._Io()
+                self.calls = []
+
+            def __getattr__(self, name):
+                function = getattr(self.base, name)
+
+                def guarded(*args):
+                    for value in args:
+                        if isinstance(value, (str, os.PathLike)) \
+                                and "decisions" in Path(value).parts:
+                            raise AssertionError(
+                                "Phase 5 producer touched decisions")
+                    self.calls.append((name, args[0] if args else None))
+                    return function(*args)
+
+                return guarded
+
+        state = Path(self._state_dir())
+        decisions = state / "decisions"
+        decisions.mkdir()
+        protected = {
+            decisions / "producer-must-not-touch": b"decision-sentinel",
+            state / "memory-state": b"memory-sentinel",
+            state / "policy-state": b"policy-sentinel",
+            state / "promotion-state": b"promotion-sentinel",
+        }
+        for path, value in protected.items():
+            path.write_bytes(value)
+        enriched = build_enriched_utility_evaluation(
+            evaluate_experiment_bundle(self._bundle()))
+        digest = build_reflection(enriched)["source_snapshot_digest"]
+        guard = GuardIo()
+        with patch.object(persistence, "_io", guard):
+            persisted = persistence.persist_learning_chain(state, enriched)
+            persistence.resume_learning_chain(
+                state, enriched["source_evaluation_id"], digest)
+        self.assertIsNotNone(persisted["review_queue_request"])
+        self.assertTrue(any(
+            "review_queue" in Path(path).parts
+            for _name, path in guard.calls if isinstance(path, str)
+        ))
+        for path, value in protected.items():
+            self.assertEqual(path.read_bytes(), value)
+
+    def test_transport_all_handles_use_agent_and_have_zero_governance_effect(self):
+        import contextlib
+        import io
+        import json
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import laos
+        from agents.human_review import HumanReviewAgent
+
+        agent_calls = []
+        original_run = HumanReviewAgent.run
+
+        def audited_run(agent, task, context):
+            agent_calls.append((task["type"], context))
+            return original_run(agent, task, context)
+
+        blocked = (
+            "build_application", "build_model_backend", "MemoryStore",
+            "CandidateStore", "MemoryCore", "PolicyAgent",
+            "LowRiskCandidateAgent", "LoopCoordinatorAgent",
+            "ConversationReviewService", "ContextAgent", "ReviewGate",
+        )
+        with contextlib.ExitStack() as stack:
+            mocks = {
+                name: stack.enter_context(patch.object(
+                    laos, name,
+                    side_effect=AssertionError(
+                        "review transport constructed " + name),
+                ))
+                for name in blocked
+            }
+            stack.enter_context(patch.object(
+                HumanReviewAgent, "run", audited_run))
+            for handle in ("review.list", "review.show", "review.decide"):
+                with self.subTest(handle=handle):
+                    state, request = self._published_chain()
+                    root = Path(self._state_dir())
+                    rq_id = request["review_queue_item_id"]
+                    protected = {
+                        str(path.relative_to(state)): path.read_bytes()
+                        for namespace in ("evaluations", "review_queue")
+                        for path in (Path(state) / namespace).rglob("*")
+                        if path.is_file()
+                    }
+                    if handle == "review.list":
+                        values = {}
+                    elif handle == "review.show":
+                        values = {"rq_id": rq_id}
+                    else:
+                        values = {
+                            "rq_id": rq_id,
+                            "decision_seq": 1,
+                            "action": "accept",
+                            "operator_claim": "operator",
+                            "reason": "evidence sufficient",
+                        }
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stdout(stdout), \
+                            contextlib.redirect_stderr(stderr):
+                        code = laos.main([
+                            "--root", str(root),
+                            "--state-dir", state,
+                            "--task-json", json.dumps({
+                                "type": handle, "input": values,
+                            }, separators=(",", ":")),
+                        ])
+                    self.assertEqual(code, 0, stderr.getvalue())
+                    self.assertNotEqual(stdout.getvalue(), "")
+                    after = {
+                        str(path.relative_to(state)): path.read_bytes()
+                        for namespace in ("evaluations", "review_queue")
+                        for path in (Path(state) / namespace).rglob("*")
+                        if path.is_file()
+                    }
+                    self.assertEqual(after, protected)
+                    self.assertEqual(self._tree_bytes(root), {})
+                    if handle == "review.decide":
+                        self.assertEqual(
+                            len(list((Path(state) / "decisions").glob(
+                                "*.json"))),
+                            1,
+                        )
+                    else:
+                        self.assertFalse(
+                            (Path(state) / "decisions").exists())
+            for mock in mocks.values():
+                mock.assert_not_called()
+        self.assertEqual(agent_calls, [
+            ("review.list", {}),
+            ("review.show", {}),
+            ("review.decide", {}),
+        ])
+
+    def test_invalid_state_dir_cli_matrix_is_closed_and_memory_free(self):
+        import contextlib
+        import io
+        import json
+        import os
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import laos
+        import human_review.review_store as review_store
+
+        def vector(label):
+            base = Path(self._state_dir())
+            root = base / "root"
+            root.mkdir()
+            sync_roots = ()
+            fake_home = None
+            if label == "missing":
+                state = base / "missing"
+            elif label == "file":
+                state = base / "state-file"
+                state.write_bytes(b"x")
+            elif label == "symlink":
+                target = base / "target"
+                target.mkdir()
+                state = base / "state-link"
+                os.symlink(target, state)
+            elif label == "equal-root":
+                state = root
+            elif label == "state-in-root":
+                state = root / "state"
+                state.mkdir()
+            elif label == "root-in-state":
+                state = base / "state"
+                state.mkdir()
+                root = state / "root"
+                root.mkdir()
+            elif label == "repository-root":
+                state = REPO_ROOT
+            elif label == "known-sync-root":
+                state = base / "sync-root"
+                state.mkdir()
+                sync_roots = (state,)
+            else:
+                fake_home = base / "home"
+                state = fake_home / "Library" / "CloudStorage"
+                state.mkdir(parents=True)
+            return root, state, sync_roots, fake_home
+
+        tasks = {
+            "review.list": {},
+            "review.show": {"rq_id": RQ_ID},
+            "review.decide": {
+                "rq_id": RQ_ID,
+                "decision_seq": 1,
+                "action": "accept",
+                "operator_claim": "operator",
+                "reason": "evidence sufficient",
+            },
+        }
+        labels = (
+            "missing", "file", "symlink", "equal-root",
+            "state-in-root", "root-in-state", "repository-root",
+            "known-sync-root", "cloud-storage-root",
+        )
+        real_expanduser = review_store.os.path.expanduser
+        for label in labels:
+            root, state, sync_roots, fake_home = vector(label)
+            for handle, values in tasks.items():
+                with self.subTest(label=label, handle=handle):
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(patch.object(
+                            review_store, "known_sync_roots",
+                            return_value=sync_roots,
+                        ))
+                        if fake_home is not None:
+                            stack.enter_context(patch.object(
+                                review_store.os.path,
+                                "expanduser",
+                                side_effect=lambda path, home=fake_home: (
+                                    str(home) if path == "~"
+                                    else real_expanduser(path)
+                                ),
+                            ))
+                        blocked = {
+                            name: stack.enter_context(patch.object(
+                                laos, name,
+                                side_effect=AssertionError(
+                                    "invalid state reached " + name),
+                            ))
+                            for name in (
+                                "build_application", "build_model_backend",
+                                "MemoryStore", "CandidateStore",
+                            )
+                        }
+                        with contextlib.redirect_stdout(stdout), \
+                                contextlib.redirect_stderr(stderr):
+                            code = laos.main([
+                                "--root", str(root),
+                                "--state-dir", str(state),
+                                "--task-json", json.dumps({
+                                    "type": handle, "input": values,
+                                }, separators=(",", ":")),
+                            ])
+                    self.assertEqual(code, 1)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertEqual(json.loads(stderr.getvalue()), {
+                        "error": {
+                            "category": "precondition",
+                            "code": "invalid_state_dir",
+                        },
+                    })
+                    for mock in blocked.values():
+                        mock.assert_not_called()

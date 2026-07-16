@@ -1,6 +1,10 @@
 import argparse
+import importlib
+import importlib.machinery
 import json
+import os
 import sys
+import types
 from pathlib import Path
 
 import memory
@@ -26,6 +30,7 @@ from review.gate import ReviewGate
 
 
 _INVALID_MEMORY_ROOT_MESSAGE = "\u8bf7\u5148\u6267\u884c\uff1apython3 src/memory.py init --root PATH"
+_REVIEW_TASKS = frozenset({"review.list", "review.show", "review.decide"})
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -103,6 +108,85 @@ def build_application(root, state_dir=None, model_backend=None):
     return Orchestrator(AgentRegistry.from_config(config, agents))
 
 
+def _normalized_path(path):
+    return os.path.normcase(os.path.realpath(os.fspath(path)))
+
+
+def _module_paths(module):
+    try:
+        return {_normalized_path(path) for path in module.__path__}
+    except (AttributeError, TypeError) as exc:
+        raise ValueError("untrusted src namespace") from exc
+
+
+def _pin_and_load_rq_builder():
+    repo_src = Path(__file__).resolve().parent
+    expected_src = _normalized_path(repo_src)
+    expected_loop = _normalized_path(repo_src / "learning_loop" / "__init__.py")
+    expected_loop_path = _normalized_path(repo_src / "learning_loop")
+    expected_queue = _normalized_path(
+        repo_src / "learning_loop" / "queue_request.py")
+
+    src_module = sys.modules.get("src")
+    if src_module is None:
+        src_module = types.ModuleType("src")
+        src_module.__package__ = "src"
+        src_module.__path__ = [str(repo_src)]
+        spec = importlib.machinery.ModuleSpec(
+            "src", loader=None, is_package=True)
+        spec.submodule_search_locations = [str(repo_src)]
+        src_module.__spec__ = spec
+        sys.modules["src"] = src_module
+    elif _module_paths(src_module) != {expected_src}:
+        raise ValueError("untrusted src namespace")
+
+    loop_module = sys.modules.get("src.learning_loop")
+    if loop_module is None:
+        loop_module = importlib.import_module("src.learning_loop")
+    elif (
+        _normalized_path(getattr(loop_module, "__file__", ""))
+        != expected_loop
+        or _module_paths(loop_module) != {expected_loop_path}
+    ):
+        raise ValueError("untrusted learning_loop package")
+
+    queue_module = sys.modules.get("src.learning_loop.queue_request")
+    if queue_module is None:
+        queue_module = importlib.import_module(
+            "src.learning_loop.queue_request")
+    elif _normalized_path(getattr(queue_module, "__file__", "")) \
+            != expected_queue:
+        raise ValueError("untrusted queue_request module")
+
+    builder = getattr(queue_module, "build_review_queue_request", None)
+    if (
+        _module_paths(src_module) != {expected_src}
+        or _normalized_path(getattr(loop_module, "__file__", ""))
+        != expected_loop
+        or _module_paths(loop_module) != {expected_loop_path}
+        or _normalized_path(getattr(queue_module, "__file__", ""))
+        != expected_queue
+        or not callable(builder)
+        or builder.__module__ != "src.learning_loop.queue_request"
+    ):
+        raise ValueError("invalid review queue builder provenance")
+    return builder
+
+
+def build_review_transport(state_dir, forbidden_roots, *, rq_builder):
+    from human_review.review_store import ReviewStore
+    from agents.human_review import HumanReviewAgent
+
+    store = ReviewStore(
+        state_dir,
+        forbidden_roots=forbidden_roots,
+        rq_builder=rq_builder,
+    )
+    agent = HumanReviewAgent(store)
+    config = Path(__file__).with_name("agents") / "registry-review.yaml"
+    return AgentRegistry.from_config(config, [agent])
+
+
 def _parser():
     parser = JsonArgumentParser()
     parser.add_argument("--root", required=True)
@@ -141,6 +225,15 @@ def _error_stage(error):
     return "task"
 
 
+def _review_error(error):
+    value = {"category": error.category, "code": error.code}
+    if error.rq_id is not None:
+        value["rq_id"] = error.rq_id
+    if error.decision_seq is not None:
+        value["decision_seq"] = error.decision_seq
+    return {"error": value}
+
+
 def main(argv=None):
     try:
         args = _parser().parse_args(argv)
@@ -148,13 +241,30 @@ def main(argv=None):
         if text is None:
             text = Path(args.task_file).read_text(encoding="utf-8-sig")
         task = json.loads(text)
-        backend = None
-        if args.model_config:
-            model_config = json.loads(
-                Path(args.model_config).read_text(encoding="utf-8-sig")
+        if isinstance(task, dict) and task.get("type") in _REVIEW_TASKS:
+            if args.state_dir is None:
+                raise ValueError("--state-dir is required for review tasks")
+            rq_builder = _pin_and_load_rq_builder()
+            from human_review.review_store import ReviewError
+            transport = build_review_transport(
+                args.state_dir,
+                (args.root,),
+                rq_builder=rq_builder,
             )
-            backend = build_model_backend(model_config)
-        result = build_application(args.root, args.state_dir, backend).run(task)
+            try:
+                result = transport.select(task).run(task, {})
+            except ReviewError as error:
+                _write_json(sys.stderr, _review_error(error))
+                return 1
+        else:
+            backend = None
+            if args.model_config:
+                model_config = json.loads(
+                    Path(args.model_config).read_text(encoding="utf-8-sig")
+                )
+                backend = build_model_backend(model_config)
+            result = build_application(
+                args.root, args.state_dir, backend).run(task)
     except Exception as error:
         _write_json(
             sys.stderr,
