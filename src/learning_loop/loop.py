@@ -10,7 +10,12 @@ from pathlib import Path
 from ..context.builder import ContextBuilder
 from ..memory.candidate import CandidateStore
 from ..memory.store import MemoryStore
-from ..review.gate import ReviewGate
+from ..review import (
+    AuthorityMemoryStore,
+    AuthorityStore,
+    ReviewerProfile,
+    ReviewGate,
+)
 
 
 _STATES = {
@@ -99,6 +104,12 @@ def validate_task(task):
         raise ValueError("invalid confidentiality")
     if confidentiality == "restricted":
         raise ValueError("restricted tasks cannot be sent to the learning-loop model")
+    candidate_confidentiality = task.get("candidate_confidentiality")
+    if (
+        candidate_confidentiality is not None
+        and candidate_confidentiality not in _CONFIDENTIALITY
+    ):
+        raise ValueError("invalid candidate confidentiality")
     project = task.get("project")
     if project is not None:
         _text(project, "project")
@@ -159,10 +170,20 @@ class LearningLoop:
         self.backend = backend
         self.runs_root = self.state_dir / "learning_runs"
         self.runs_root.mkdir(parents=True, exist_ok=True)
-        self.memory_store = MemoryStore(self.data_root)
+        base_memory_store = MemoryStore(self.data_root)
         self.candidates = CandidateStore(self.data_root, self.state_dir)
+        self.authority_store = AuthorityStore(
+            self.data_root, self.candidates.state_dir
+        )
+        self.memory_store = AuthorityMemoryStore(
+            base_memory_store, self.authority_store
+        )
         self.context_builder = ContextBuilder(self.memory_store)
-        self.review_gate = ReviewGate(self.data_root, self.state_dir)
+        self.review_gate = ReviewGate(
+            self.data_root,
+            self.candidates.state_dir,
+            authority_store=self.authority_store,
+        )
 
     def _run_dir(self, run_id):
         run_id = _text(run_id, "run_id")
@@ -579,6 +600,12 @@ class LearningLoop:
         if action not in {"accept", "reject"}:
             raise ValueError("review action must be accept or reject")
         run = self._load_run(run_id)
+        stored_task = run.get("task")
+        if not isinstance(stored_task, dict):
+            raise ValueError("learning run task binding is invalid")
+        validate_task(stored_task)
+        if run.get("task_digest") != _digest_text(_canonical(stored_task)):
+            raise ValueError("learning run task binding is invalid")
         if candidate_id not in set(run.get("candidate_ids") or []):
             raise ValueError("candidate does not belong to this learning run")
         decisions = self._load_decisions(run_id)
@@ -588,21 +615,23 @@ class LearningLoop:
                 raise ValueError("candidate already has a different review decision")
             return self.status(run_id)
 
-        record = self.memory_store.get(candidate_id)
-        already_applied = (
-            action == "accept" and record.get("status") == "active"
-        ) or (
-            action == "reject" and record.get("audit_status") == "rejected"
+        workspace = stored_task["workspace"]
+        confidentiality = stored_task.get("candidate_confidentiality") or stored_task.get(
+            "confidentiality"
+        ) or ("personal" if workspace == "personal" else "internal")
+        if confidentiality == "public":
+            confidentiality = "personal"
+        reviewer_gate = ReviewGate(
+            self.data_root,
+            self.candidates.state_dir,
+            authority_store=self.authority_store,
+            reviewer_profile=ReviewerProfile(workspace, confidentiality),
         )
-        result = (
-            {"status": "already_reviewed", "candidate_id": candidate_id, "action": action}
-            if already_applied
-            else self.review_gate.review(
-                action,
-                candidate_id,
-                reason=reason,
-                workspace=run["task"]["workspace"],
-            )
+        result = reviewer_gate.review(
+            action,
+            candidate_id,
+            reason=reason,
+            workspace=workspace,
         )
         decisions["decisions"][candidate_id] = {
             "action": action,
@@ -617,6 +646,63 @@ class LearningLoop:
             run,
             "reviewed" if all_decided else "review_pending",
             review_decisions={key: value["action"] for key, value in decisions["decisions"].items()},
+        )
+        return self.status(run_id)
+
+    def activate_review(
+        self,
+        run_id,
+        decision_id,
+        expected_active_generation,
+    ):
+        decision_id = _text(decision_id, "decision_id")
+        if (
+            isinstance(expected_active_generation, bool)
+            or not isinstance(expected_active_generation, int)
+            or expected_active_generation < 0
+        ):
+            raise ValueError(
+                "expected_active_generation must be a non-negative integer"
+            )
+        run = self._load_run(run_id)
+        decision = self.authority_store.read_decision(decision_id)
+        candidate_id = decision["candidate_snapshot"]["candidate_id"]
+        if candidate_id not in set(run.get("candidate_ids") or []):
+            raise ValueError("decision candidate does not belong to this learning run")
+        decisions = self._load_decisions(run_id)
+        entry = decisions["decisions"].get(candidate_id)
+        if not isinstance(entry, dict):
+            raise ValueError("candidate has no learning-loop review decision")
+        review_result = entry.get("result")
+        if (
+            not isinstance(review_result, dict)
+            or review_result.get("decision_id") != decision_id
+            or review_result.get("expected_active_generation")
+            != expected_active_generation
+        ):
+            raise ValueError("activation does not match the recorded review decision")
+
+        activation = self.review_gate.activate(
+            decision_id,
+            expected_active_generation,
+        )
+        entry["activation"] = activation
+        entry["activated_at"] = _timestamp()
+        _write_json(self._decisions_path(run_id), decisions)
+        self._write_memory_rules(run_id, decisions)
+        activated_ids = sorted(
+            item_id
+            for item_id, item in decisions["decisions"].items()
+            if isinstance(item.get("activation"), dict)
+            and item["activation"].get("status") == "committed"
+        )
+        all_decided = set(run.get("candidate_ids") or []) <= set(
+            decisions["decisions"]
+        )
+        self._save_run(
+            run,
+            "reviewed" if all_decided else "review_pending",
+            activated_candidate_ids=activated_ids,
         )
         return self.status(run_id)
 

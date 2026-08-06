@@ -992,6 +992,27 @@ class ReviewGateTests(unittest.TestCase):
 
         return ReviewAgent(ReviewGate(self.root, self.state))
 
+    def make_activation_agent(self):
+        from agents.orchestrator import ActivationAgent
+        from review.gate import ReviewGate
+
+        return ActivationAgent(ReviewGate(self.root, self.state))
+
+    def decide_and_activate(self, action, candidate_id, reason=None, workspace=None):
+        from review.gate import ReviewGate
+
+        gate = ReviewGate(self.root, self.state)
+        decision = gate.review(
+            action,
+            candidate_id,
+            reason=reason,
+            workspace=workspace,
+        )
+        return gate.activate(
+            decision["decision_id"],
+            decision["expected_active_generation"],
+        )
+
     def test_review_actions_are_exactly_accept_reject_merge_conflict(self):
         from review.gate import REVIEW_ACTIONS
 
@@ -1022,13 +1043,27 @@ class ReviewGateTests(unittest.TestCase):
                     call()
                 self.assertEqual(self.record(candidate_id)["status"], "candidate")
 
-        result = self.make_review_agent().run(
+        decision = self.make_review_agent().run(
             {"type": "memory.review", "input": {"action": "accept", "candidate_id": candidate_id}},
             {},
         )
 
+        self.assertEqual(self.record(candidate_id)["status"], "candidate")
+        self.assertEqual(decision["output"]["status"], "decided")
+        result = self.make_activation_agent().run(
+            {
+                "type": "memory.activate",
+                "input": {
+                    "decision_id": decision["output"]["decision_id"],
+                    "expected_active_generation": decision["output"][
+                        "expected_active_generation"
+                    ],
+                },
+            },
+            {},
+        )
         self.assertEqual(self.record(candidate_id)["status"], "active")
-        self.assertEqual(result["output"]["status"], "completed")
+        self.assertEqual(result["output"]["status"], "committed")
 
     def test_lifecycle_validation_precedes_review_write(self):
         candidate_id = self.create_candidate()
@@ -1059,20 +1094,33 @@ class ReviewGateTests(unittest.TestCase):
         candidate_id = self.create_candidate(
             action="conflict",
             title="Conflict review candidate",
-            source="codex",
-            confidence="inferred",
+            source="manual:user_confirmed",
+            confidence="confirmed",
             content="conflicting candidate content",
             target_id="review-target",
             source_refs=["manual:test-evidence"],
         )
 
-        result = self.make_review_agent().run(
+        decision = self.make_review_agent().run(
             {"type": "memory.review", "input": {"action": "conflict", "candidate_id": candidate_id}},
             {},
         )
 
+        self.assertEqual(self.record(candidate_id)["status"], "candidate")
+        result = self.make_activation_agent().run(
+            {
+                "type": "memory.activate",
+                "input": {
+                    "decision_id": decision["output"]["decision_id"],
+                    "expected_active_generation": decision["output"][
+                        "expected_active_generation"
+                    ],
+                },
+            },
+            {},
+        )
         self.assertEqual(self.record(candidate_id)["status"], "conflicted")
-        self.assertEqual(result["output"]["status"], "conflicted")
+        self.assertEqual(result["output"]["status"], "committed")
         self.assertEqual(self.record("review-target")["content"], "confirmed target")
 
     def test_gate_requires_explicit_merge_or_conflict_actions(self):
@@ -1091,8 +1139,8 @@ class ReviewGateTests(unittest.TestCase):
                 action=action,
                 title=f"{action} candidate",
                 content=f"{action} candidate content",
-                source="codex",
-                confidence="inferred",
+                source="manual:user_confirmed",
+                confidence="confirmed",
                 target_id=target_id,
                 source_refs=[f"manual:{action}"],
             )
@@ -1104,9 +1152,16 @@ class ReviewGateTests(unittest.TestCase):
                     gate.review("accept", candidate_id)
                 self.assertEqual(self.record(candidate_id)["status"], "candidate")
 
-        gate.review("merge", candidates["merge"])
-        gate.review("merge", candidates["support"])
-        gate.review("conflict", candidates["conflict"])
+        for action, candidate_id in (
+            ("merge", candidates["merge"]),
+            ("merge", candidates["support"]),
+            ("conflict", candidates["conflict"]),
+        ):
+            decision = gate.review(action, candidate_id)
+            gate.activate(
+                decision["decision_id"],
+                decision["expected_active_generation"],
+            )
         self.assertEqual(self.record(candidates["merge"])["status"], "archived")
         self.assertEqual(self.record(candidates["support"])["status"], "archived")
         self.assertEqual(self.record(candidates["conflict"])["status"], "conflicted")
@@ -1114,15 +1169,27 @@ class ReviewGateTests(unittest.TestCase):
     def test_reject_without_reason_writes_stable_default(self):
         candidate_id = self.create_candidate()
 
-        result = self.make_review_agent().run(
+        decision = self.make_review_agent().run(
             {
                 "type": "memory.review",
                 "input": {"action": "reject", "candidate_id": candidate_id},
             },
             {},
         )
+        result = self.make_activation_agent().run(
+            {
+                "type": "memory.activate",
+                "input": {
+                    "decision_id": decision["output"]["decision_id"],
+                    "expected_active_generation": decision["output"][
+                        "expected_active_generation"
+                    ],
+                },
+            },
+            {},
+        )
 
-        self.assertEqual(result["output"]["status"], "archived")
+        self.assertEqual(result["output"]["status"], "committed")
         self.assertEqual(self.record(candidate_id)["review_reason"], "rejected by reviewer")
 
     def test_public_legacy_review_handlers_translate_to_canonical_actions(self):
@@ -1150,16 +1217,28 @@ class ReviewGateTests(unittest.TestCase):
                 )
 
             self.assertEqual(accepted, {"status": "completed"})
-            review.assert_called_once_with(expected_action, "legacy-candidate", reason=None)
+            review.assert_called_once_with(
+                expected_action,
+                "legacy-candidate",
+                reason=None,
+                workspace="personal",
+            )
 
         candidate_id = self.create_candidate(title="Reject candidate")
         with mock.patch("review.gate.ReviewGate.review", return_value={"status": "archived"}) as review:
             rejected = memory_distill.reject_candidate(
-                argparse.Namespace(root=str(self.root), id=candidate_id, reason="duplicate")
+                argparse.Namespace(
+                    root=str(self.root),
+                    state_dir=str(self.state),
+                    id=candidate_id,
+                    reason="duplicate",
+                )
             )
 
         self.assertEqual(rejected, {"status": "archived"})
-        review.assert_called_once_with("reject", candidate_id, reason="duplicate")
+        review.assert_called_once_with(
+            "reject", candidate_id, reason="duplicate", workspace="personal"
+        )
 
     def test_merge_requires_state_dir_before_candidate_introspection(self):
         from review.gate import ReviewGate
@@ -1284,8 +1363,8 @@ class PartitionIsolationTests(unittest.TestCase):
             self.candidate_values(
                 action="merge",
                 target_id="safe-target",
-                source="codex",
-                confidence="inferred",
+                source="manual:user_confirmed",
+                confidence="confirmed",
                 source_refs=["manual:partition"],
             )
         )
@@ -1428,8 +1507,15 @@ class PartitionIsolationTests(unittest.TestCase):
         )
         before_candidate = candidate_path.read_bytes()
 
+        from review.authority import ReviewerProfile
+
+        gate = ReviewGate(
+            self.root,
+            self.state,
+            reviewer_profile=ReviewerProfile("work", "restricted"),
+        )
         with self.assertRaises(ValueError) as raised:
-            ReviewGate(self.root, self.state).review("accept", candidate["id"])
+            gate.review("accept", candidate["id"], workspace="work")
 
         self.assertEqual(str(raised.exception), "context transition proposal is invalid")
         self.assertEqual(candidate_path.read_bytes(), before_candidate)
@@ -1445,7 +1531,18 @@ class PartitionIsolationTests(unittest.TestCase):
         candidate, errors = memory.parse_front_matter(candidate_path)
         self.assertEqual(errors, [])
 
-        ReviewGate(self.root, self.state).review("accept", candidate["id"])
+        from review.authority import ReviewerProfile
+
+        gate = ReviewGate(
+            self.root,
+            self.state,
+            reviewer_profile=ReviewerProfile("work", "restricted"),
+        )
+        decision = gate.review("accept", candidate["id"], workspace="work")
+        gate.activate(
+            decision["decision_id"],
+            decision["expected_active_generation"],
+        )
 
         records = {row["id"]: row for row in MemoryStore(self.root).records()}
         self.assertEqual(records["personal-context-source"]["status"], "deprecated")
@@ -1459,7 +1556,6 @@ class PartitionIsolationTests(unittest.TestCase):
 
     def test_context_transition_rejects_work_to_personal_partition(self):
         import memory
-        from review.gate import ReviewGate
 
         write_memory(
             self.root,
@@ -1473,36 +1569,38 @@ class PartitionIsolationTests(unittest.TestCase):
             workspace="work",
             confidentiality="internal",
         )
-        transition = memory.context_transition(
-            argparse.Namespace(
-                root=str(self.root),
-                from_context="work-source",
-                to_context="planned-personal",
-                to_title="Planned personal context",
-                workspace="personal",
-                confidentiality="personal",
-                effective_date="2027-07-01",
-                reason="move to personal",
-                source="user",
-                confidence="confirmed",
-                content=None,
-                tags=[],
-                dry_run=False,
-            )
-        )
-        candidate_path = self.root / transition["transition_path"]
-        source_path = next((self.root / "memory").rglob("work-context-source-*.md"))
-        candidate, errors = memory.parse_front_matter(candidate_path)
-        self.assertEqual(errors, [])
-        before_candidate = candidate_path.read_bytes()
-        before_source = source_path.read_bytes()
+        before = {
+            path.relative_to(self.root): path.read_bytes()
+            for path in (self.root / "memory").rglob("*.md")
+        }
 
         with self.assertRaises(ValueError):
-            ReviewGate(self.root, self.state).review("accept", candidate["id"])
+            memory.context_transition(
+                argparse.Namespace(
+                    root=str(self.root),
+                    from_context="work-source",
+                    to_context="planned-personal",
+                    to_title="Planned personal context",
+                    workspace="personal",
+                    confidentiality="personal",
+                    effective_date="2027-07-01",
+                    reason="move to personal",
+                    source="user",
+                    confidence="confirmed",
+                    content=None,
+                    tags=[],
+                    dry_run=False,
+                )
+            )
 
-        self.assertEqual(candidate_path.read_bytes(), before_candidate)
-        self.assertEqual(source_path.read_bytes(), before_source)
-        self.assertFalse((self.root / transition["new_context_path"]).exists())
+        after = {
+            path.relative_to(self.root): path.read_bytes()
+            for path in (self.root / "memory").rglob("*.md")
+        }
+        self.assertEqual(after, before)
+        self.assertFalse(
+            any("planned-personal" in path.name for path in (self.root / "memory").rglob("*.md"))
+        )
 
     def test_restricted_records_do_not_affect_candidate_deduplication(self):
         for index, (workspace, confidentiality) in enumerate(
@@ -1527,6 +1625,16 @@ class PartitionIsolationTests(unittest.TestCase):
                 source_sha256=digest,
             )
 
+            from review.source_refs import publish_source_artifact
+
+            source_ref = publish_source_artifact(
+                self.state,
+                kind="partition_dedup_test",
+                workspace=workspace,
+                project=None,
+                confidentiality=confidentiality,
+                payload={"index": index, "title": title, "content": content},
+            )
             created = self.candidate_store().create(
                 self.candidate_values(
                     title=title,
@@ -1535,8 +1643,7 @@ class PartitionIsolationTests(unittest.TestCase):
                     confidentiality=confidentiality,
                     source="codex",
                     confidence="inferred",
-                    source_path=relative_source,
-                    source_sha256=digest,
+                    source_refs=[source_ref],
                 )
             )
 
@@ -1699,7 +1806,12 @@ class PartitionIsolationTests(unittest.TestCase):
             )
         )
 
-        ReviewGate(self.root, self.state).review("accept", created["candidate_id"])
+        gate = ReviewGate(self.root, self.state)
+        decision = gate.review("accept", created["candidate_id"])
+        gate.activate(
+            decision["decision_id"],
+            decision["expected_active_generation"],
+        )
 
         self.assertEqual(
             MemoryStore(self.root).get(created["candidate_id"])["status"], "active"
@@ -1782,7 +1894,7 @@ class ConcreteAgentTests(unittest.TestCase):
             self.assertIs(result["requires_review"], True)
         self.assertEqual(
             self.gate.calls,
-            [("reject", "candidate-1", "duplicate", None)],
+            [("reject", "candidate-1", "duplicate", "personal")],
         )
         self.assertEqual(self.builder.calls, [("original query", 120, "work", "p1")])
 
@@ -2484,7 +2596,7 @@ class RealAgentStorageTests(unittest.TestCase):
         self.assertEqual(builder.calls, [("empty", 8000)])
         self.assertEqual(
             gate.calls,
-            [("reject", "candidate-1", None, None)],
+            [("reject", "candidate-1", None, "personal")],
         )
         self.assertEqual(result["output"], {"status": "reviewed"})
 
@@ -2623,6 +2735,7 @@ class PipelineTests(unittest.TestCase):
             "memory.create": "memory_agent",
             "memory.search": "search_agent",
             "memory.review": "review_agent",
+            "memory.activate": "activation_agent",
             "context.build": "context_agent",
         }
         for task_type, agent_id in expected.items():
@@ -2670,6 +2783,25 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(review.returncode, 0, review.stderr)
+        decision = json.loads(review.stdout)["output"]
+        self.assertEqual(MemoryStore(self.root).get(candidate_id)["status"], "candidate")
+
+        activation = self.run_task(
+            {
+                "type": "memory.activate",
+                "input": {
+                    "decision_id": decision["decision_id"],
+                    "expected_active_generation": decision[
+                        "expected_active_generation"
+                    ],
+                },
+            }
+        )
+        self.assertEqual(activation.returncode, 0, activation.stderr)
+        self.assertEqual(
+            json.loads(activation.stdout)["output"]["status"],
+            "committed",
+        )
         self.assertEqual(MemoryStore(self.root).get(candidate_id)["status"], "active")
 
         search = self.run_task(

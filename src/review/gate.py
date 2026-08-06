@@ -2,13 +2,10 @@ import argparse
 import importlib
 from pathlib import Path
 
+from .authority import AuthorityError, AuthorityStore, DECISION_ACTIONS, ReviewerProfile
 
-REVIEW_ACTIONS = frozenset({"accept", "reject", "merge", "conflict"})
-_WORKSPACES = frozenset({"personal", "work"})
-_MERGE_REQUESTS = frozenset({"merge", "support"})
-_ACCEPT_REQUESTS = frozenset(
-    {"add", "create", "ADD", "UPDATE", "DEPRECATE", "supersede", "context_transition"}
-)
+
+REVIEW_ACTIONS = DECISION_ACTIONS
 _REVIEW_AUTHORITY = object()
 
 
@@ -19,7 +16,21 @@ def _canonical_backend_and_authority():
 
 
 class ReviewGate:
-    def __init__(self, root, state_dir=None, backend=None):
+    """Two-phase review gate.
+
+    ``review`` publishes an immutable decision and never changes memory state.
+    ``activate`` is the only public transition path and consumes only a
+    decision id plus the expected active-set generation.
+    """
+
+    def __init__(
+        self,
+        root,
+        state_dir=None,
+        backend=None,
+        authority_store=None,
+        reviewer_profile=None,
+    ):
         try:
             self.root = Path(root).expanduser()
         except TypeError as exc:
@@ -38,53 +49,112 @@ class ReviewGate:
             raise ValueError("review backend is invalid")
         self.backend = backend
         self._authority = authority if backend is canonical_backend else _REVIEW_AUTHORITY
+        if authority_store is None:
+            authority_store = AuthorityStore(self.root, self.state_dir)
+        if not isinstance(authority_store, AuthorityStore):
+            raise ValueError("authority_store is invalid")
+        self.authority_store = authority_store
+        if reviewer_profile is None:
+            try:
+                from profiles.store import current_profile
+
+                active_profile = current_profile()
+            except (ImportError, ValueError):
+                active_profile = None
+            if active_profile is None:
+                reviewer_profile = ReviewerProfile("personal", "personal")
+            else:
+                reviewer_profile = ReviewerProfile(
+                    active_profile.get("workspace"),
+                    active_profile.get("confidentiality"),
+                )
+        if not isinstance(reviewer_profile, ReviewerProfile):
+            raise ValueError("reviewer_profile must be an immutable ReviewerProfile")
+        self.reviewer_profile = reviewer_profile
 
     def review(self, action, candidate_id, reason=None, workspace=None):
-        if action not in REVIEW_ACTIONS:
-            raise ValueError("unsupported review action")
-        if not isinstance(candidate_id, str) or not candidate_id.strip():
-            raise ValueError("candidate_id must be a non-empty string")
-        if reason is not None and (not isinstance(reason, str) or not reason.strip()):
-            raise ValueError("reason must be a non-empty string")
-        if workspace is not None and workspace not in _WORKSPACES:
-            raise ValueError("workspace must be personal or work")
+        """Publish a decision bound to the current exact candidate snapshot."""
+        preflight = getattr(self.backend, "_preflight_candidate_impl", None)
 
-        candidate_id = candidate_id.strip()
-        candidate = None
-        if workspace is not None or action != "reject":
-            candidate = self.backend._candidate_record(self.root, candidate_id)
+        if workspace is not None:
+            if workspace not in {"personal", "work"}:
+                raise AuthorityError("invalid_workspace", "reviewer workspace is invalid")
+            if workspace != self.reviewer_profile.workspace:
+                raise AuthorityError("candidate_not_found", "candidate not found")
 
-        if workspace is not None and candidate.get("workspace") != workspace:
-            raise ValueError("candidate not found")
+        def validate(record, snapshot):
+            if callable(preflight):
+                preflight(self.root, record, action, self.state_dir)
 
-        if action == "reject":
-            fields = {"root": str(self.root), "id": candidate_id, "reason": reason}
-            if self.state_dir is not None:
-                fields["state_dir"] = str(self.state_dir)
-            return self.backend._reject_candidate_impl(
-                argparse.Namespace(**fields), authority=self._authority
-            )
+        decision = self.authority_store.publish_decision(
+            action,
+            candidate_id,
+            reason=reason,
+            workspace=self.reviewer_profile.workspace,
+            confidentiality=self.reviewer_profile.confidentiality,
+            validator=validate,
+        )
+        snapshot = decision["candidate_snapshot"]
+        return {
+            "status": "decided",
+            "decision_id": decision["decision_id"],
+            "decision_sha256": decision["decision_sha256"],
+            "candidate_id": snapshot["candidate_id"],
+            "candidate_artifact_sha256": snapshot["artifact_sha256"],
+            "action": decision["action"],
+            "expected_active_generation": decision["expected_active_generation"],
+        }
 
-        self._require_state_dir()
-        requested = candidate.get("requested_action")
-        candidate_action = candidate.get("candidate_action")
-        if action == "conflict":
-            if requested != "conflict" and candidate_action != "REVIEW_REQUIRED":
-                raise ValueError("candidate does not request conflict review")
-            return self.backend._conflict_candidate_impl(
-                argparse.Namespace(root=str(self.root), state_dir=str(self.state_dir), id=candidate_id),
+    def activate(self, decision_id, expected_active_generation):
+        """Apply one immutable decision through the generation CAS boundary."""
+
+        def apply(decision):
+            candidate_id = decision["candidate_snapshot"]["candidate_id"]
+            action = decision["action"]
+            if action == "reject":
+                return self.backend._reject_candidate_impl(
+                    argparse.Namespace(
+                        root=str(self.root),
+                        state_dir=str(self.state_dir),
+                        id=candidate_id,
+                        reason=decision["reason"],
+                    ),
+                    authority=self._authority,
+                )
+            if action == "conflict":
+                return self.backend._conflict_candidate_impl(
+                    argparse.Namespace(
+                        root=str(self.root),
+                        state_dir=str(self.state_dir),
+                        id=candidate_id,
+                    ),
+                    authority=self._authority,
+                )
+            return self.backend._accept_candidate_impl(
+                argparse.Namespace(
+                    root=str(self.root),
+                    state_dir=str(self.state_dir),
+                    id=candidate_id,
+                ),
                 authority=self._authority,
             )
-        if action == "merge":
-            if requested not in _MERGE_REQUESTS:
-                raise ValueError("candidate does not request merge review")
-        elif requested not in _ACCEPT_REQUESTS or candidate_action == "REVIEW_REQUIRED":
-            raise ValueError("candidate requires an explicit review action")
-        return self.backend._accept_candidate_impl(
-            argparse.Namespace(root=str(self.root), state_dir=str(self.state_dir), id=candidate_id),
-            authority=self._authority,
-        )
 
-    def _require_state_dir(self):
-        if self.state_dir is None:
-            raise ValueError("state_dir is required for this review action")
+        receipt, backend_result = self.authority_store.activate(
+            decision_id,
+            expected_active_generation,
+            apply,
+        )
+        return {
+            "status": receipt["status"],
+            "activation_id": receipt["activation_id"],
+            "activation_sha256": receipt["activation_sha256"],
+            "decision_id": receipt["decision_id"],
+            "candidate_id": receipt["candidate_id"],
+            "action": receipt["action"],
+            "previous_generation": receipt["previous_generation"],
+            "active_generation": receipt["active_generation"],
+            "authorized_records": receipt["authorized_records"],
+            "backend_status": backend_result.get("status")
+            if isinstance(backend_result, dict)
+            else None,
+        }

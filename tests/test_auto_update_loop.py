@@ -79,6 +79,20 @@ class AutoUpdateLoopTests(unittest.TestCase):
         loop = LearningLoop(self.data.name, self.state.name, self.work.name, backend)
         return loop, AutoUpdateLoopCoordinator(loop)
 
+    def decide_and_activate(self, loop, run_id, candidate_id, action):
+        reviewed = loop.review(run_id, candidate_id, action)
+        decisions = __import__("json").loads(
+            Path(reviewed["artifacts"]["review_decisions.json"]).read_text(
+                encoding="utf-8"
+            )
+        )
+        result = decisions["decisions"][candidate_id]["result"]
+        return loop.activate_review(
+            run_id,
+            result["decision_id"],
+            result["expected_active_generation"],
+        )
+
     def test_waits_for_review_then_verifies(self):
         backend = Backend()
         loop, coordinator = self.build(backend)
@@ -92,8 +106,8 @@ class AutoUpdateLoopTests(unittest.TestCase):
         ])
         self.assertEqual(MemoryStore(self.data.name).active_relevant("fail-closed recovery", workspace="personal"), [])
         accepted, rejected = pending["candidate_ids"]
-        loop.review("auto-one", accepted, "accept")
-        loop.review("auto-one", rejected, "reject")
+        self.decide_and_activate(loop, "auto-one", accepted, "accept")
+        self.decide_and_activate(loop, "auto-one", rejected, "reject")
         verification = make_task("auto-two", "one.py", "auto-one")
         verification["task_id"] = "auto-one"
         verification["memory_condition"] = "with_memory"
@@ -111,7 +125,9 @@ class AutoUpdateLoopTests(unittest.TestCase):
         baseline = make_task("reject-one", "one.py")
         pending = coordinator.advance(baseline)
         for candidate_id in pending["candidate_ids"]:
-            loop.review("reject-one", candidate_id, "reject")
+            self.decide_and_activate(
+                loop, "reject-one", candidate_id, "reject"
+            )
         result = coordinator.advance(baseline)
         self.assertEqual(result["state"], "rejected")
         self.assertNotIn("active_memory_ids", result)
@@ -148,8 +164,8 @@ class AutoUpdateLoopTests(unittest.TestCase):
         baseline["memory_condition"] = "without_memory"
         pending = coordinator.advance(baseline)
         accepted, rejected = pending["candidate_ids"]
-        loop.review("verify-one", accepted, "accept")
-        loop.review("verify-one", rejected, "reject")
+        self.decide_and_activate(loop, "verify-one", accepted, "accept")
+        self.decide_and_activate(loop, "verify-one", rejected, "reject")
         verification = make_task("verify-two", "one.py", "verify-one")
         verification["task_id"] = "verify-one"
         verification["memory_condition"] = "with_memory"
@@ -166,8 +182,12 @@ class AutoUpdateLoopTests(unittest.TestCase):
         baseline = make_task("verify-change-one", "one.py")
         pending = coordinator.advance(baseline)
         accepted, rejected = pending["candidate_ids"]
-        loop.review("verify-change-one", accepted, "accept")
-        loop.review("verify-change-one", rejected, "reject")
+        self.decide_and_activate(
+            loop, "verify-change-one", accepted, "accept"
+        )
+        self.decide_and_activate(
+            loop, "verify-change-one", rejected, "reject"
+        )
         verification = make_task("verify-change-two", "two.py", "verify-change-one")
         with self.assertRaisesRegex(RuntimeError, "interruption"):
             coordinator.advance(baseline, verification_task=verification)

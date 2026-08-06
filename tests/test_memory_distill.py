@@ -79,6 +79,20 @@ class MemoryDistillReviewTests(unittest.TestCase):
         return memory_id
 
     def distill_apply(self, root, action="create", **kwargs):
+        if "source_path" not in kwargs:
+            source_dir = root / "imports/manual/text"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            sequence = len(list(source_dir.glob("test-evidence-*.md")))
+            source_path = source_dir / f"test-evidence-{sequence:04d}.md"
+            source_path.write_text(
+                f"verified test evidence {sequence}\n", encoding="utf-8"
+            )
+            kwargs["source_path"] = source_path.relative_to(root).as_posix()
+        if "source_sha256" not in kwargs:
+            source_path = root / kwargs["source_path"]
+            kwargs["source_sha256"] = hashlib.sha256(
+                source_path.read_bytes()
+            ).hexdigest()
         args = [
             DISTILL,
             "apply",
@@ -116,12 +130,49 @@ class MemoryDistillReviewTests(unittest.TestCase):
         return re.search(r"candidate_id: (.+)", result.stdout).group(1)
 
     def distill_accept(self, root, candidate_id):
+        record = self.parsed_records(root)[candidate_id][1]
+        reviewer_confidentiality = record["confidentiality"]
+        if reviewer_confidentiality == "public":
+            reviewer_confidentiality = "personal"
+        decision = self.run_cli(
+            DISTILL,
+            "accept",
+            "--root",
+            root,
+            "--state-dir",
+            root.parent / "state",
+            "--id",
+            candidate_id,
+            "--reviewer-workspace",
+            record["workspace"],
+            "--reviewer-confidentiality",
+            reviewer_confidentiality,
+        )
+        if decision.returncode != 0:
+            return decision
+        decision_id = re.search(r"Decision: (.+)", decision.stdout).group(1)
+        generation = re.search(
+            r"Expected active generation: (\d+)", decision.stdout
+        ).group(1)
         return self.run_cli(
-            DISTILL, "accept", "--root", root, "--state-dir", root.parent / "state", "--id", candidate_id,
+            DISTILL,
+            "activate",
+            "--root",
+            root,
+            "--state-dir",
+            root.parent / "state",
+            "--decision-id",
+            decision_id,
+            "--expected-active-generation",
+            generation,
         )
 
     def distill_reject(self, root, candidate_id, reason="not useful"):
-        return self.run_cli(
+        record = self.parsed_records(root)[candidate_id][1]
+        reviewer_confidentiality = record["confidentiality"]
+        if reviewer_confidentiality == "public":
+            reviewer_confidentiality = "personal"
+        decision = self.run_cli(
             DISTILL,
             "reject",
             "--root",
@@ -132,6 +183,28 @@ class MemoryDistillReviewTests(unittest.TestCase):
             candidate_id,
             "--reason",
             reason,
+            "--reviewer-workspace",
+            record["workspace"],
+            "--reviewer-confidentiality",
+            reviewer_confidentiality,
+        )
+        if decision.returncode != 0:
+            return decision
+        decision_id = re.search(r"Decision: (.+)", decision.stdout).group(1)
+        generation = re.search(
+            r"Expected active generation: (\d+)", decision.stdout
+        ).group(1)
+        return self.run_cli(
+            DISTILL,
+            "activate",
+            "--root",
+            root,
+            "--state-dir",
+            root.parent / "state",
+            "--decision-id",
+            decision_id,
+            "--expected-active-generation",
+            generation,
         )
 
     def record_by_id(self, root, memory_id):
@@ -176,7 +249,7 @@ class MemoryDistillReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self.init_root(tmp)
 
-            candidate_id = self.distill_apply(root, evidence=["imports/manual/text/a.md"])
+            candidate_id = self.distill_apply(root, evidence=["manual:imports/manual/text/a.md"])
             path, text = self.record_by_id(root, candidate_id)
 
             self.assertIn('status: "candidate"', text)
@@ -203,7 +276,7 @@ class MemoryDistillReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self.init_root(tmp)
             target_id = self.add_memory(root, title="目标", content="核心内容")
-            candidate_id = self.distill_apply(root, action="merge", target_id=target_id, tags=["new"], source_refs=["doc:one"], relations=["supports:doc"])
+            candidate_id = self.distill_apply(root, action="merge", target_id=target_id, tags=["new"], source_refs=["manual:doc-one"], relations=["supports:doc"])
 
             result = self.distill_accept(root, candidate_id)
 
@@ -212,7 +285,7 @@ class MemoryDistillReviewTests(unittest.TestCase):
             _, candidate = self.record_by_id(root, candidate_id)
             self.assertIn("核心内容", target)
             self.assertIn("source_refs:", target)
-            self.assertIn('  - "doc:one"', target)
+            self.assertIn('  - "manual:doc-one"', target)
             self.assertIn("relations:", target)
             self.assertIn('status: "archived"', candidate)
             self.assertIn('audit_status: "accepted"', candidate)
@@ -221,7 +294,7 @@ class MemoryDistillReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self.init_root(tmp)
             target_id = self.add_memory(root, content="do not overwrite")
-            candidate_id = self.distill_apply(root, action="support", target_id=target_id, content="replacement", evidence=["doc:two"])
+            candidate_id = self.distill_apply(root, action="support", target_id=target_id, content="replacement", evidence=["manual:doc-two"])
 
             result = self.distill_accept(root, candidate_id)
 
@@ -229,7 +302,7 @@ class MemoryDistillReviewTests(unittest.TestCase):
             _, target = self.record_by_id(root, target_id)
             self.assertIn("do not overwrite", target)
             self.assertNotIn("replacement", target)
-            self.assertIn('  - "doc:two"', target)
+            self.assertIn('  - "manual:doc-two"', target)
             _, candidate = self.record_by_id(root, candidate_id)
             self.assertIn('status: "archived"', candidate)
             self.assertIn('audit_status: "accepted"', candidate)
@@ -355,6 +428,8 @@ class MemoryDistillReviewTests(unittest.TestCase):
             db_before = db.read_bytes()
             module = load_distill_module()
             args = argparse.Namespace(root=str(root), state_dir=str(root.parent / "state"), id=candidate_id)
+            journal_path = root / "state/distill_runs.jsonl"
+            journal_before = journal_path.read_bytes()
 
             with mock.patch.object(module, "index_store") as index_store:
                 with self.assertRaises(module.DistillError) as raised:
@@ -366,8 +441,7 @@ class MemoryDistillReviewTests(unittest.TestCase):
             index_store.assert_not_called()
             self.assertEqual({path: path.read_bytes() for path in before}, before)
             self.assertEqual(db.read_bytes(), db_before)
-            journal = [json.loads(line) for line in (root / "state/distill_runs.jsonl").read_text(encoding="utf-8").splitlines()]
-            self.assertEqual(journal[-1]["status"], "stale_target")
+            self.assertEqual(journal_path.read_bytes(), journal_before)
 
     def test_accept_rejects_changed_or_deleted_target_as_stale(self):
         for mutation in ("content", "delete"):
@@ -429,11 +503,21 @@ class MemoryDistillReviewTests(unittest.TestCase):
             candidate_id = self.transition_apply(root)
             before = {path.relative_to(root): path.read_bytes() for path in (root / "memory").rglob("*.md")}
             module = load_distill_module()
-            args = argparse.Namespace(root=str(root), state_dir=str(root.parent / "state"), id=candidate_id)
+            from review.gate import ReviewGate
+
+            gate = ReviewGate(
+                root,
+                root.parent / "state",
+                backend=module._review_backend(),
+            )
+            decision = gate.review("accept", candidate_id)
 
             with mock.patch.object(module, "index_store", side_effect=ValueError("injected index failure")):
                 with self.assertRaises(module.DistillError) as raised:
-                    module.accept_candidate(args)
+                    gate.activate(
+                        decision["decision_id"],
+                        decision["expected_active_generation"],
+                    )
 
             self.assertEqual(raised.exception.feedback["code"], "index_failed")
             after = {path.relative_to(root): path.read_bytes() for path in (root / "memory").rglob("*.md")}
@@ -451,10 +535,14 @@ class MemoryDistillReviewTests(unittest.TestCase):
             from review.gate import ReviewGate
 
             gate = ReviewGate(root, root.parent / "state", backend=module._review_backend())
+            decision = gate.review("conflict", candidate_id)
 
             with mock.patch.object(module, "index_store", side_effect=ValueError("injected index failure")):
                 with self.assertRaises(module.DistillError) as raised:
-                    gate.review("conflict", candidate_id)
+                    gate.activate(
+                        decision["decision_id"],
+                        decision["expected_active_generation"],
+                    )
 
             self.assertEqual(raised.exception.feedback["code"], "index_failed")
             after = {path.relative_to(root): path.read_bytes() for path in (root / "memory").rglob("*.md")}
@@ -505,7 +593,7 @@ class MemoryDistillReviewTests(unittest.TestCase):
                 DISTILL, "apply", "--root", root, "--state-dir", root.parent / "state",
                 "--action", "ADD", "--type", "principle", "--title", "Same",
                 "--scope", "global", "--workspace", "personal", "--confidentiality", "personal",
-                "--source", "codex", "--source-refs", "manual:test-evidence", "--content", "identical",
+                "--source", "manual:user_confirmed", "--confirmed", "--content", "identical",
             )
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -522,7 +610,7 @@ class MemoryDistillReviewTests(unittest.TestCase):
                 DISTILL, "apply", "--root", root, "--state-dir", root.parent / "state",
                 "--action", "ADD", "--type", "principle", "--title", "Ambiguous",
                 "--scope", "global", "--workspace", "personal", "--confidentiality", "personal",
-                "--source", "codex", "--source-refs", "manual:test-evidence", "--content", "different",
+                "--source", "manual:user_confirmed", "--confirmed", "--content", "different",
             )
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -538,8 +626,8 @@ class MemoryDistillReviewTests(unittest.TestCase):
                 DISTILL, "apply", "--root", root, "--state-dir", root.parent / "state",
                 "--action", "ADD", "--type", "principle", "--title", "Uncertain",
                 "--scope", "global", "--workspace", "personal", "--confidentiality", "personal",
-                "--source", "codex", "--confidence", "uncertain",
-                "--source-refs", "manual:test", "--content", "uncertain content",
+                "--source", "manual:user_confirmed", "--confirmed", "--confidence", "uncertain",
+                "--content", "uncertain content",
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("Status: low_confidence", result.stdout)
@@ -614,7 +702,7 @@ class MemoryDistillReviewTests(unittest.TestCase):
                 DISTILL, "apply", "--dry-run", "--root", root, "--state-dir", root.parent / "state",
                 "--action", "ADD", "--type", "principle", "--title", "Dry run",
                 "--scope", "global", "--workspace", "personal", "--confidentiality", "personal",
-                "--source", "codex", "--source-refs", "manual:test", "--content", "dry",
+                "--source", "manual:user_confirmed", "--confirmed", "--content", "dry",
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(sorted((root / "memory").rglob("*.md")), before)
@@ -626,11 +714,21 @@ class MemoryDistillReviewTests(unittest.TestCase):
             candidate_id = self.distill_apply(root, action="create")
             path, before = self.record_by_id(root, candidate_id)
             module = load_distill_module()
-            args = argparse.Namespace(root=str(root), state_dir=str(root.parent / "state"), id=candidate_id)
+            from review.gate import ReviewGate
+
+            gate = ReviewGate(
+                root,
+                root.parent / "state",
+                backend=module._review_backend(),
+            )
+            decision = gate.review("accept", candidate_id)
 
             with mock.patch.object(module, "index_store", side_effect=ValueError("injected index failure")):
                 with self.assertRaises(module.DistillError):
-                    module.accept_candidate(args)
+                    gate.activate(
+                        decision["decision_id"],
+                        decision["expected_active_generation"],
+                    )
 
             self.assertEqual(path.read_text(encoding="utf-8"), before)
             entries = [json.loads(line) for line in (root / "state/distill_runs.jsonl").read_text(encoding="utf-8").splitlines()]

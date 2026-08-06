@@ -13,7 +13,15 @@ import memory_tools
 from agents.candidate_generator import LowRiskCandidateAgent
 from agents.coordinator import LoopCoordinatorAgent
 from agents.handoff import HandoffAgent
-from agents.orchestrator import CandidateListAgent, ContextAgent, ImportAgent, MemoryAgent, ReviewAgent, SearchAgent
+from agents.orchestrator import (
+    ActivationAgent,
+    CandidateListAgent,
+    ContextAgent,
+    ImportAgent,
+    MemoryAgent,
+    ReviewAgent,
+    SearchAgent,
+)
 from agents.policy import PolicyAgent
 from agents.reflection import ConversationReviewAgent, ReflectionAgent
 from agents.reflection_record import ReflectionRecordAgent
@@ -26,7 +34,7 @@ from models import build_model_backend
 from orchestrator import Orchestrator
 from procedures.proposals import ProcedureProposalStore
 from reflection import ConversationReviewCoordinator, ConversationReviewService, ReviewStateStore
-from review.gate import ReviewGate
+from review import AuthorityMemoryStore, AuthorityStore, ReviewGate
 
 
 _INVALID_MEMORY_ROOT_MESSAGE = "\u8bf7\u5148\u6267\u884c\uff1apython3 src/memory.py init --root PATH"
@@ -39,8 +47,10 @@ class JsonArgumentParser(argparse.ArgumentParser):
 
 
 def build_application(root, state_dir=None, model_backend=None):
-    store = MemoryStore(root)
+    base_store = MemoryStore(root)
     candidates = CandidateStore(root, state_dir)
+    authority = AuthorityStore(root, candidates.state_dir)
+    store = AuthorityMemoryStore(base_store, authority)
 
     def search_documents(query, workspace, project):
         return memory.search_store(
@@ -86,8 +96,18 @@ def build_application(root, state_dir=None, model_backend=None):
         SearchAgent(core),
         CandidateListAgent(core),
         ReviewAgent(
-            ReviewGate(root, candidates.state_dir),
-            default_workspace="personal",
+            ReviewGate(
+                root,
+                candidates.state_dir,
+                authority_store=authority,
+            )
+        ),
+        ActivationAgent(
+            ReviewGate(
+                root,
+                candidates.state_dir,
+                authority_store=authority,
+            )
         ),
         ContextAgent(ContextBuilder(store)),
         HandoffAgent(root),

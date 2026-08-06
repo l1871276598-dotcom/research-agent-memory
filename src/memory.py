@@ -125,6 +125,8 @@ ALLOWED_FIELDS = set(REQUIRED_FIELDS) | {
     "source_id",
     "source_path",
     "source_sha256",
+    "source_provenance",
+    "source_bindings",
     "confirmation",
     "expected_target_status",
     "expected_target_sha256",
@@ -136,7 +138,15 @@ ALLOWED_FIELDS = set(REQUIRED_FIELDS) | {
     "source_refs",
     "relations",
 }
-LIST_FIELDS = {"tags", "supersedes", "superseded_by", "evidence", "source_refs", "relations"}
+LIST_FIELDS = {
+    "tags",
+    "supersedes",
+    "superseded_by",
+    "evidence",
+    "source_refs",
+    "source_bindings",
+    "relations",
+}
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-]*$")
 
 FILES = {
@@ -410,6 +420,7 @@ def render_front_matter(record):
         "source_id",
         "source_path",
         "source_sha256",
+        "source_provenance",
         "confirmation",
         "expected_target_status",
         "expected_target_sha256",
@@ -421,7 +432,15 @@ def render_front_matter(record):
         if field in record:
             lines.append(f"{field}: {_quoted(record[field])}")
 
-    for field in ["supersedes", "superseded_by", "tags", "evidence", "source_refs", "relations"]:
+    for field in [
+        "supersedes",
+        "superseded_by",
+        "tags",
+        "evidence",
+        "source_refs",
+        "source_bindings",
+        "relations",
+    ]:
         if field not in record:
             continue
         values = record.get(field, [])
@@ -523,6 +542,10 @@ def add_memory(args):
             break
 
     record["id"] = memory_id
+    if record.get("source") in {"manual:user_confirmed", "user"}:
+        from review.source_refs import resolve_source_bindings
+
+        record.update(resolve_source_bindings(root, None, record))
     tmp = target_dir / f".{memory_id}.tmp"
     try:
         tmp.write_text(render_memory(record), encoding="utf-8")
@@ -683,6 +706,45 @@ def validate_record(record, path, rel_path, expected_type):
 
     if "confirmation" in record and record["confirmation"] != "explicit":
         errors.append("confirmation has invalid value")
+    if "source_provenance" in record and record["source_provenance"] not in {
+        "verified",
+        "manual_declaration",
+    }:
+        errors.append("source_provenance has invalid value")
+    if "source_bindings" in record:
+        assurances = set()
+        for item in record.get("source_bindings", []):
+            try:
+                binding = json.loads(item)
+            except (TypeError, json.JSONDecodeError):
+                binding = None
+            if (
+                not isinstance(binding, dict)
+                or binding.get("assurance")
+                not in {"verified", "manual_declaration", "informational"}
+                or not isinstance(binding.get("canonical_id"), str)
+                or not binding["canonical_id"]
+                or not isinstance(binding.get("sha256"), str)
+                or not re.fullmatch(r"[a-f0-9]{64}", binding["sha256"])
+                or json.dumps(
+                    binding,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                != item
+            ):
+                errors.append("source_bindings contains an invalid canonical binding")
+                continue
+            assurances.add(binding["assurance"])
+        provenance = record.get("source_provenance")
+        if provenance == "verified" and "verified" not in assurances:
+            errors.append("verified source_provenance requires a verified binding")
+        if provenance == "manual_declaration" and (
+            "manual_declaration" not in assurances or "verified" in assurances
+        ):
+            errors.append("manual_declaration source_provenance has invalid assurance mix")
     if "expected_target_status" in record and record["expected_target_status"] not in STATUS_CHOICES:
         errors.append("expected_target_status has invalid value")
     for field in ("expected_target_sha256", "proposal_input_hash"):
@@ -1180,9 +1242,13 @@ def context_transition(args):
             json.dumps(proposal_input, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest(),
         "new_record_json": new_record_json,
+        "source_refs": [f"memory:{source_record['id']}"],
         "tags": args.tags or [],
         "content": content,
     }
+    from review.source_refs import resolve_source_bindings
+
+    transition_record.update(resolve_source_bindings(root, None, transition_record))
 
     final_records = list(records) + [
         {"relative_path": transition_path.relative_to(root).as_posix(), "record": transition_record, "path": transition_path},

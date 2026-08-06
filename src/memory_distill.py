@@ -31,6 +31,11 @@ from memory import (
     validate_record,
 )
 from memory import lifecycle
+from review.source_refs import (
+    SourceRefError,
+    resolve_source_bindings,
+    verify_source_bindings,
+)
 
 
 CANONICAL_ACTIONS = {"ADD", "UPDATE", "DEPRECATE", "NOOP", "REVIEW_REQUIRED"}
@@ -221,19 +226,37 @@ def _normalized_action(requested, records, args):
     return action, None
 
 
+def _source_error(error, *, verification=False):
+    if error.code == "missing_source":
+        return DistillError(
+            "missing_source",
+            str(error),
+            not verification,
+            "restore_source" if verification else "add_source",
+        )
+    if error.code == "partition_mismatch":
+        return DistillError(
+            "permission_denied",
+            str(error),
+            False,
+            "select_same_partition_source",
+        )
+    if error.code == "stale_source":
+        return DistillError(
+            "raw_integrity_violation",
+            str(error),
+            False,
+            "review_raw_source",
+        )
+    return DistillError(
+        "invalid_schema",
+        str(error),
+        False,
+        "use_allowed_source_scheme",
+    )
+
+
 def _validate_proposal(root, records, args, action):
-    source_refs = _list(args.source_refs) + _list(args.evidence)
-    file_source = bool(args.source_path and args.source_sha256)
-    if not source_refs and args.source != "manual:user_confirmed" and not file_source:
-        raise DistillError("missing_source", "candidate requires source_refs or a hashed source file", True, "add_source")
-    if bool(args.source_path) != bool(args.source_sha256):
-        raise DistillError("missing_source", "source_path and source_sha256 must be provided together", True, "add_source_hash")
-    if file_source:
-        path = root / args.source_path
-        if not path.is_file():
-            raise DistillError("missing_source", "source file not found", True, "restore_source")
-        if hashlib.sha256(path.read_bytes()).hexdigest() != args.source_sha256:
-            raise DistillError("raw_integrity_violation", "source hash changed", False, "review_raw_source")
     if args.scope == "project" and not args.project:
         raise DistillError("invalid_schema", "project scope requires project", True, "add_project")
     _validate_partition_references(records, args)
@@ -249,6 +272,14 @@ def _validate_proposal(root, records, args, action):
         raise DistillError("invalid_transition", "target memory not found", True, "select_target")
     if action in {"UPDATE", "DEPRECATE"} and target["record"].get("status") != "active":
         raise DistillError("invalid_transition", "only active memory may be replaced", False, "select_active_target")
+    source_record = dict(vars(args))
+    source_record["requested_action"] = args.action
+    if getattr(args, "confirmed", False):
+        source_record["confirmation"] = "explicit"
+    try:
+        return resolve_source_bindings(root, args.state_dir, source_record)
+    except SourceRefError as exc:
+        raise _source_error(exc) from exc
 
 
 def _verify_index(root, state_dir, records):
@@ -304,7 +335,7 @@ def _apply_candidate_once(args):
     root = _require_data_root(args.root)
     _, records = _records_by_id(root)
     action, duplicate_id = _normalized_action(args.action, records, args)
-    _validate_proposal(root, records, args, action)
+    source_resolution = _validate_proposal(root, records, args, action)
     if action == "NOOP":
         return {
             "candidate_id": duplicate_id, "path": None, "action": action,
@@ -350,6 +381,7 @@ def _apply_candidate_once(args):
         value = getattr(args, field)
         if value:
             record[field] = value
+    record.update(source_resolution)
 
     validation_errors = validate_record(record, path, path.relative_to(root).as_posix(), args.type)
     if validation_errors:
@@ -433,17 +465,110 @@ def _candidate_record(root, candidate_id):
     return dict(_require_candidate(records, candidate_id)["record"])
 
 
-def _check_source(root, record):
-    source_path = record.get("source_path")
-    source_sha256 = record.get("source_sha256")
-    if not source_path or not source_sha256:
+def _preflight_candidate_impl(root, candidate, review_action, state_dir=None):
+    root, records = _records_by_id(root)
+    current_item = _require_candidate(records, candidate.get("id"))
+    if current_item["record"] != candidate:
+        raise DistillError(
+            "stale_target",
+            "candidate changed during review",
+            False,
+            "review_current_candidate",
+        )
+
+    if review_action == "reject":
+        lifecycle.validate_transition(candidate.get("status"), "archived")
         return
-    path = root / source_path
-    if not path.is_file():
-        raise DistillError("missing_source", "source file not found", True, "restore_source")
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    if digest != source_sha256:
-        raise DistillError("raw_integrity_violation", "source hash changed", False, "review_raw_source")
+
+    requested_action = candidate.get(
+        "requested_action", candidate.get("candidate_action")
+    )
+    candidate_action = candidate.get("candidate_action")
+    target_id = candidate.get("target_id")
+    target_item = records.get(target_id) if target_id else None
+
+    if review_action == "conflict":
+        _validate_partition_references(records, candidate)
+        if target_id and (
+            target_item is None
+            or not _same_partition(
+                target_item["record"],
+                candidate.get("workspace"),
+                candidate.get("confidentiality"),
+            )
+        ):
+            raise DistillError(
+                "invalid_transition", "target memory not found", False, "select_target"
+            )
+        lifecycle.validate_transition(candidate.get("status"), "conflicted")
+        return
+
+    if requested_action == "context_transition":
+        _validated_context_transition(candidate, target_item)
+    else:
+        _validate_partition_references(records, candidate)
+
+    if (
+        target_id
+        and requested_action != "context_transition"
+        and (
+            (
+                target_item is None
+                and candidate_action not in {"UPDATE", "DEPRECATE"}
+            )
+            or (
+                target_item is not None
+                and not _same_partition(
+                    target_item["record"],
+                    candidate.get("workspace"),
+                    candidate.get("confidentiality"),
+                )
+            )
+        )
+    ):
+        raise DistillError(
+            "invalid_transition", "target memory not found", False, "select_target"
+        )
+
+    _check_source(root, candidate, state_dir)
+    if candidate_action in {"UPDATE", "DEPRECATE"}:
+        if target_item is None:
+            raise DistillError(
+                "stale_target",
+                "target memory no longer exists",
+                False,
+                "regenerate_proposal",
+            )
+        expected_status = candidate.get("expected_target_status")
+        expected_sha256 = candidate.get("expected_target_sha256")
+        current_sha256 = hashlib.sha256(target_item["path"].read_bytes()).hexdigest()
+        if (
+            target_item["record"].get("status") != expected_status
+            or current_sha256 != expected_sha256
+        ):
+            raise DistillError(
+                "stale_target",
+                "target memory changed after proposal",
+                False,
+                "regenerate_proposal",
+            )
+
+    if requested_action in {"context_transition", "merge", "support"}:
+        target_status = "archived"
+    elif candidate_action in {"ADD", "UPDATE", "DEPRECATE"}:
+        target_status = "active"
+    elif candidate_action == "REVIEW_REQUIRED":
+        target_status = "conflicted"
+    else:
+        target_status = "archived"
+    lifecycle.validate_transition(candidate.get("status"), target_status)
+
+
+def _check_source(root, record, state_dir=None):
+    try:
+        verify_source_bindings(root, state_dir, record)
+    except SourceRefError as exc:
+        raise _source_error(exc, verification=True) from exc
 
 
 def _reviewed(record, status, audit_status, reason=None):
@@ -593,7 +718,7 @@ def _accept_candidate_impl(args, authority=None):
             raise DistillError(
                 "invalid_transition", "target memory not found", False, "select_target"
             )
-        _check_source(root, candidate)
+        _check_source(root, candidate, args.state_dir)
         if action in {"UPDATE", "DEPRECATE"}:
             if target_item is None:
                 raise DistillError("stale_target", "target memory no longer exists", False, "regenerate_proposal")
@@ -791,15 +916,38 @@ def _review_backend():
         _accept_candidate_impl=_accept_candidate_impl,
         _candidate_record=_candidate_record,
         _conflict_candidate_impl=_conflict_candidate_impl,
+        _preflight_candidate_impl=_preflight_candidate_impl,
         _reject_candidate_impl=_reject_candidate_impl,
     )
 
 
-def _review_agent(root, state_dir=None):
+def _review_agent(
+    root,
+    state_dir=None,
+    reviewer_workspace="personal",
+    reviewer_confidentiality="personal",
+):
     from agents.orchestrator import ReviewAgent
+    from review.authority import ReviewerProfile
     from review.gate import ReviewGate
 
-    return ReviewAgent(ReviewGate(root, state_dir, backend=_review_backend()))
+    profile = ReviewerProfile(reviewer_workspace, reviewer_confidentiality)
+    return ReviewAgent(
+        ReviewGate(
+            root,
+            state_dir,
+            backend=_review_backend(),
+            reviewer_profile=profile,
+        ),
+        default_workspace=profile.workspace,
+    )
+
+
+def _activation_agent(root, state_dir):
+    from agents.orchestrator import ActivationAgent
+    from review.gate import ReviewGate
+
+    return ActivationAgent(ReviewGate(root, state_dir, backend=_review_backend()))
 
 
 def accept_candidate(args):
@@ -813,7 +961,12 @@ def accept_candidate(args):
         action = "conflict"
     else:
         action = "accept"
-    result = _review_agent(args.root, args.state_dir).run(
+    result = _review_agent(
+        args.root,
+        args.state_dir,
+        getattr(args, "reviewer_workspace", "personal"),
+        getattr(args, "reviewer_confidentiality", "personal"),
+    ).run(
         {"type": "memory.review", "input": {"action": action, "candidate_id": args.id}},
         {},
     )
@@ -821,13 +974,32 @@ def accept_candidate(args):
 
 
 def reject_candidate(args):
-    result = _review_agent(args.root, getattr(args, "state_dir", None)).run(
+    result = _review_agent(
+        args.root,
+        getattr(args, "state_dir", None),
+        getattr(args, "reviewer_workspace", "personal"),
+        getattr(args, "reviewer_confidentiality", "personal"),
+    ).run(
         {
             "type": "memory.review",
             "input": {
                 "action": "reject",
                 "candidate_id": args.id,
                 "reason": args.reason,
+            },
+        },
+        {},
+    )
+    return result["output"]
+
+
+def activate_candidate(args):
+    result = _activation_agent(args.root, args.state_dir).run(
+        {
+            "type": "memory.activate",
+            "input": {
+                "decision_id": args.decision_id,
+                "expected_active_generation": args.expected_active_generation,
             },
         },
         {},
@@ -890,12 +1062,38 @@ def build_parser():
     accept_parser.add_argument("--root", required=True)
     accept_parser.add_argument("--state-dir", default=str(default_state_dir()))
     accept_parser.add_argument("--id", required=True)
+    accept_parser.add_argument(
+        "--reviewer-workspace", choices=WORKSPACE_CHOICES, default="personal"
+    )
+    accept_parser.add_argument(
+        "--reviewer-confidentiality",
+        choices=("personal", "internal", "restricted"),
+        default="personal",
+    )
 
     reject_parser = subparsers.add_parser("reject", help="Reject a candidate memory.")
     reject_parser.add_argument("--root", required=True)
     reject_parser.add_argument("--state-dir", default=str(default_state_dir()))
     reject_parser.add_argument("--id", required=True)
     reject_parser.add_argument("--reason", required=True)
+    reject_parser.add_argument(
+        "--reviewer-workspace", choices=WORKSPACE_CHOICES, default="personal"
+    )
+    reject_parser.add_argument(
+        "--reviewer-confidentiality",
+        choices=("personal", "internal", "restricted"),
+        default="personal",
+    )
+
+    activate_parser = subparsers.add_parser(
+        "activate", help="Activate one immutable review decision."
+    )
+    activate_parser.add_argument("--root", required=True)
+    activate_parser.add_argument("--state-dir", default=str(default_state_dir()))
+    activate_parser.add_argument("--decision-id", required=True)
+    activate_parser.add_argument(
+        "--expected-active-generation", required=True, type=int
+    )
 
     resume_parser = subparsers.add_parser("resume", help="Read the durable state of a distill run.")
     resume_parser.add_argument("--root", required=True)
@@ -925,15 +1123,31 @@ def main(argv=None):
                 print(f"Candidates: {len(rows)}")
         elif args.command == "accept":
             summary = accept_candidate(args)
-            print(f"Accepted: {summary['candidate_id']}")
+            print(f"Decision: {summary['decision_id']}")
+            print(
+                "Expected active generation: "
+                f"{summary['expected_active_generation']}"
+            )
+            print(f"Candidate: {summary['candidate_id']}")
             print(f"Action: {summary['action']}")
+        elif args.command == "activate":
+            summary = activate_candidate(args)
+            print(f"Activated: {summary['candidate_id']}")
+            print(f"Activation: {summary['activation_id']}")
+            print(f"Active generation: {summary['active_generation']}")
         elif args.command == "resume":
             summary = resume_run(args)
             print(f"Run: {summary['run_id']}")
             print(f"Status: {summary['status']}")
         else:
             summary = reject_candidate(args)
-            print(f"Rejected: {summary['candidate_id']}")
+            print(f"Decision: {summary['decision_id']}")
+            print(
+                "Expected active generation: "
+                f"{summary['expected_active_generation']}"
+            )
+            print(f"Candidate: {summary['candidate_id']}")
+            print(f"Action: {summary['action']}")
         return 0
     except DistillError as exc:
         print(json.dumps(exc.feedback, ensure_ascii=False, sort_keys=True), file=sys.stderr)

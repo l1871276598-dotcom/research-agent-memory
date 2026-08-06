@@ -1,5 +1,6 @@
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -37,6 +38,11 @@ class FakeMemoryCore:
 
 
 class ConversationReviewTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.state = Path(self.temporary.name) / "state"
+
     def test_routed_digest_keeps_tool_result_with_assistant_call(self):
         messages = [
             {"role": "user", "content": "old question"},
@@ -110,7 +116,7 @@ class ConversationReviewTests(unittest.TestCase):
 
     def test_apply_forces_laos_ownership_and_creates_candidates_only(self):
         core = FakeMemoryCore()
-        service = ConversationReviewService(core)
+        service = ConversationReviewService(core, state_dir=self.state)
         response = {
             "memory_candidates": [
                 {
@@ -152,11 +158,12 @@ class ConversationReviewTests(unittest.TestCase):
         self.assertEqual(stored["status"], "candidate")
         self.assertEqual(stored["project"], "laos")
         self.assertNotIn("target_id", stored)
-        self.assertEqual(stored["source_refs"], ["session:session-1"])
+        self.assertEqual(len(stored["source_refs"]), 1)
+        self.assertTrue(stored["source_refs"][0].startswith("artifact:"))
 
     def test_review_id_reuses_existing_candidate_on_replay(self):
         core = FakeMemoryCore()
-        service = ConversationReviewService(core)
+        service = ConversationReviewService(core, state_dir=self.state)
         response = {
             "memory_candidates": [
                 {
@@ -203,7 +210,9 @@ class ConversationReviewTests(unittest.TestCase):
                 "nothing_to_save": False,
             }
 
-        service = ConversationReviewService(core, reviewer)
+        service = ConversationReviewService(
+            core, reviewer, state_dir=self.state
+        )
         result = service.review(
             [{"role": "user", "content": "Remember to review changes first."}],
             workspace="personal",
