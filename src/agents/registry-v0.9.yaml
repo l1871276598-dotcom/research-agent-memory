@@ -5,6 +5,7 @@
     {"id": "search_agent", "class": "SearchAgent", "handles": ["memory.search"]},
     {"id": "candidate_list_agent", "class": "CandidateListAgent", "handles": ["memory.candidates"]},
     {"id": "review_agent", "class": "ReviewAgent", "handles": ["memory.review"]},
+    {"id": "activation_agent", "class": "ActivationAgent", "handles": ["memory.activate"]},
     {"id": "context_agent", "class": "ContextAgent", "handles": ["context.build"]},
     {"id": "handoff_agent", "class": "HandoffAgent", "handles": ["handoff.write", "handoff.update"]},
     {"id": "reflection_agent", "class": "ReflectionAgent", "handles": ["loop.reflect"]},

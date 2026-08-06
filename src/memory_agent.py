@@ -176,12 +176,41 @@ def _candidate_content(task, result):
     return f"Original task:\n{task}\n\nCompleted task result:\n{result}"
 
 
-def _candidate_args(root, state, task, result, workspace=None, project=None):
+def _candidate_args(
+    root,
+    state,
+    task,
+    result,
+    workspace=None,
+    project=None,
+    loop_run_id=None,
+):
     workspace = workspace or "personal"
     project = project.strip() if isinstance(project, str) else None
+    confidentiality = "personal" if workspace == "personal" else "internal"
     task_text = " ".join(task.split())
     task_hash = hashlib.sha256(task.encode("utf-8")).hexdigest()
     result_hash = hashlib.sha256(result.encode("utf-8")).hexdigest()
+    source_refs = [
+        f"memory-agent:task:{task_hash}",
+        f"memory-agent:result:{result_hash}",
+    ]
+    if loop_run_id is not None:
+        source_refs.insert(0, f"loop-run:{loop_run_id}")
+    else:
+        from review.source_refs import publish_source_artifact
+
+        source_refs.insert(
+            0,
+            publish_source_artifact(
+                state,
+                kind="memory_agent_exchange",
+                workspace=workspace,
+                project=project,
+                confidentiality=confidentiality,
+                payload={"task": task, "result": result},
+            ),
+        )
     return argparse.Namespace(
         root=str(root),
         state_dir=str(state),
@@ -193,7 +222,7 @@ def _candidate_args(root, state, task, result, workspace=None, project=None):
         title=f"Task result: {task_text[:80]}",
         scope="project" if project else "global",
         workspace=workspace,
-        confidentiality="personal" if workspace == "personal" else "internal",
+        confidentiality=confidentiality,
         source="memory-agent",
         confidence="inferred",
         content=_candidate_content(task, result),
@@ -204,10 +233,7 @@ def _candidate_args(root, state, task, result, workspace=None, project=None):
         source_path=None,
         source_sha256=None,
         evidence=[],
-        source_refs=[
-            f"memory-agent:task:{task_hash}",
-            f"memory-agent:result:{result_hash}",
-        ],
+        source_refs=source_refs,
         relations=[],
         tags=["memory-agent"],
     )
@@ -659,6 +685,7 @@ def finalize_memory(
                     result,
                     workspace=workspace,
                     project=project,
+                    loop_run_id=loop_run["run_id"] if loop_run is not None else None,
                 )
             )
             relative_path = summary.get("path")

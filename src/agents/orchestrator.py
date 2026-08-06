@@ -5,6 +5,7 @@ from pathlib import Path
 
 from memory import WORKSPACE_CHOICES
 from memory.candidate import validate_candidate_values
+from review.authority import ReviewerProfile
 
 from .base import BaseAgent
 
@@ -15,6 +16,7 @@ _LEGACY_CONTEXT_FREE_TASKS = frozenset(
         "import.file",
         "import.chatgpt",
         "memory.review",
+        "memory.activate",
         "loop.reflect",
         "loop.suggest-policies",
         "loop.generate-candidate",
@@ -243,8 +245,22 @@ class ReviewAgent(BaseAgent):
             raise ValueError("review gate is invalid")
         if default_workspace is not None and default_workspace not in _WORKSPACE_CHOICES:
             raise ValueError("default workspace must be personal or work")
+        reviewer_profile = getattr(gate, "reviewer_profile", None)
+        if reviewer_profile is None:
+            workspace = default_workspace or "personal"
+            reviewer_profile = ReviewerProfile(
+                workspace,
+                "personal" if workspace == "personal" else "internal",
+            )
+        if not isinstance(reviewer_profile, ReviewerProfile):
+            raise ValueError("review gate has an invalid reviewer profile")
+        if (
+            default_workspace is not None
+            and default_workspace != reviewer_profile.workspace
+        ):
+            raise ValueError("default workspace conflicts with reviewer profile")
         self.gate = gate
-        self.default_workspace = default_workspace
+        self.reviewer_profile = reviewer_profile
 
     def run(self, task, context):
         values = _input(
@@ -257,22 +273,44 @@ class ReviewAgent(BaseAgent):
         reason = _optional_text(values.get("reason"), "input.reason")
 
         workspace = _task_value(task, values, "workspace")
-        if workspace is None:
-            workspace = self.default_workspace
-
-        if workspace is None:
-            output = self.gate.review(action, candidate_id, reason=reason)
-        else:
+        if workspace is not None:
             workspace = _text(workspace, "workspace")
             if workspace not in _WORKSPACE_CHOICES:
                 raise ValueError("workspace must be personal or work")
-            output = self.gate.review(
-                action,
-                candidate_id,
-                reason=reason,
-                workspace=workspace,
-            )
+        else:
+            workspace = self.reviewer_profile.workspace
+        output = self.gate.review(
+            action,
+            candidate_id,
+            reason=reason,
+            workspace=workspace,
+        )
 
+        return self.result(task, output)
+
+
+class ActivationAgent(BaseAgent):
+    agent_id = "activation_agent"
+    handles = ["memory.activate"]
+
+    def __init__(self, gate):
+        if not callable(getattr(gate, "activate", None)):
+            raise ValueError("activation gate is invalid")
+        self.gate = gate
+
+    def run(self, task, context):
+        values = _input(
+            self,
+            task,
+            {"decision_id", "expected_active_generation"},
+        )
+        decision_id = _text(values.get("decision_id"), "input.decision_id")
+        generation = values.get("expected_active_generation")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise ValueError(
+                "input.expected_active_generation must be a non-negative integer"
+            )
+        output = self.gate.activate(decision_id, generation)
         return self.result(task, output)
 
 
@@ -325,6 +363,7 @@ class ContextAgent(BaseAgent):
 
 
 __all__ = [
+    "ActivationAgent",
     "CandidateListAgent",
     "ContextAgent",
     "ImportAgent",

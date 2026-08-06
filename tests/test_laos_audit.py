@@ -14,6 +14,7 @@ if str(SOURCE_DIR) not in sys.path:
 import memory
 from laos import build_application
 from memory.store import MemoryStore
+from profiles.store import ProfileStore
 
 
 class ReviewWorkspaceAuditTests(unittest.TestCase):
@@ -61,6 +62,21 @@ class ReviewWorkspaceAuditTests(unittest.TestCase):
     def status(self, candidate_id):
         return MemoryStore(self.root).get(candidate_id)["status"]
 
+    def decide_and_activate(self, review_task, application=None):
+        application = application or self.application
+        decision = application.run(review_task)["output"]
+        return application.run(
+            {
+                "type": "memory.activate",
+                "input": {
+                    "decision_id": decision["decision_id"],
+                    "expected_active_generation": decision[
+                        "expected_active_generation"
+                    ],
+                },
+            }
+        )
+
     def test_review_cannot_cross_workspace(self):
         candidate_id = self.create_candidate(
             workspace="work",
@@ -81,7 +97,15 @@ class ReviewWorkspaceAuditTests(unittest.TestCase):
 
         self.assertEqual(self.status(candidate_id), "candidate")
 
-        self.application.run(
+        profiles = ProfileStore(self.state)
+        profiles.create(
+            "work-review",
+            workspace="work",
+            confidentiality="internal",
+        )
+        with profiles.activate("work-review"):
+            work_application = build_application(self.root, self.state)
+        self.decide_and_activate(
             {
                 "type": "memory.review",
                 "workspace": "work",
@@ -89,7 +113,8 @@ class ReviewWorkspaceAuditTests(unittest.TestCase):
                     "action": "accept",
                     "candidate_id": candidate_id,
                 },
-            }
+            },
+            application=work_application,
         )
 
         self.assertEqual(self.status(candidate_id), "active")
@@ -97,7 +122,7 @@ class ReviewWorkspaceAuditTests(unittest.TestCase):
     def test_repeated_accept_does_not_duplicate_active_memory(self):
         candidate_id = self.create_candidate(title="Repeated accept")
 
-        self.application.run(
+        first = self.decide_and_activate(
             {
                 "type": "memory.review",
                 "input": {
@@ -106,24 +131,28 @@ class ReviewWorkspaceAuditTests(unittest.TestCase):
                 },
             }
         )
+        replay = self.application.run(
+            {
+                "type": "memory.activate",
+                "input": {
+                    "decision_id": first["output"]["decision_id"],
+                    "expected_active_generation": first["output"][
+                        "previous_generation"
+                    ],
+                },
+            }
+        )
 
-        with self.assertRaises(ValueError):
-            self.application.run(
-                {
-                    "type": "memory.review",
-                    "input": {
-                        "action": "accept",
-                        "candidate_id": candidate_id,
-                    },
-                }
-            )
-
+        self.assertEqual(
+            replay["output"]["activation_id"],
+            first["output"]["activation_id"],
+        )
         self.assertEqual(self.status(candidate_id), "active")
 
     def test_rejected_candidate_cannot_be_accepted(self):
         candidate_id = self.create_candidate(title="Rejected candidate")
 
-        self.application.run(
+        self.decide_and_activate(
             {
                 "type": "memory.review",
                 "input": {

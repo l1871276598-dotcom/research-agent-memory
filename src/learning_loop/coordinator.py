@@ -174,6 +174,13 @@ class AutoUpdateLoopCoordinator:
                 "review_decisions",
                 accepted_candidate_ids=accepted_ids,
             )
+        activated_ids = set(run_status.get("activated_candidate_ids") or [])
+        pending_ids = sorted(set(accepted_ids) - activated_ids)
+        if pending_ids:
+            return self._save(
+                state,
+                activation_pending_candidate_ids=pending_ids,
+            )
         return self._activate_reviewed_memory(state, accepted_ids)
 
     def _register_verification(self, state, task):

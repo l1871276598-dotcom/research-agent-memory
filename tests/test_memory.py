@@ -43,9 +43,60 @@ def finish_add_fixture(root, result, status="active"):
     state = Path(root).parent / "state"
     if not (state / "memory.sqlite").is_file():
         return result
+    candidate = None
+    for path in (Path(root) / "memory").rglob("*.md"):
+        record, errors = load_memory_module().parse_front_matter(path)
+        if not errors and record.get("id") == memory_id:
+            candidate = record
+            break
+    if candidate is None:
+        raise AssertionError(f"missing fixture memory {memory_id}")
+    reviewer_confidentiality = candidate["confidentiality"]
+    if reviewer_confidentiality == "public":
+        reviewer_confidentiality = "personal"
+    decision = subprocess.run(
+        [
+            sys.executable,
+            str(DISTILL_CLI),
+            "accept",
+            "--root",
+            str(root),
+            "--state-dir",
+            str(state),
+            "--id",
+            memory_id,
+            "--reviewer-workspace",
+            candidate["workspace"],
+            "--reviewer-confidentiality",
+            reviewer_confidentiality,
+        ],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+    )
+    if decision.returncode != 0:
+        return decision
+    decision_id = re.search(r"Decision: (.+)", decision.stdout).group(1)
+    generation = re.search(
+        r"Expected active generation: (\d+)", decision.stdout
+    ).group(1)
     return subprocess.run(
-        [sys.executable, str(DISTILL_CLI), "accept", "--root", str(root), "--state-dir", str(state), "--id", memory_id],
-        capture_output=True, text=True, cwd=REPO_ROOT,
+        [
+            sys.executable,
+            str(DISTILL_CLI),
+            "activate",
+            "--root",
+            str(root),
+            "--state-dir",
+            str(state),
+            "--decision-id",
+            decision_id,
+            "--expected-active-generation",
+            generation,
+        ],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
     )
 
 EXPECTED_DIRS = [

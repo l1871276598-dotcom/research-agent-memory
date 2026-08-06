@@ -18,6 +18,7 @@ from src.learning_loop import LearningLoop, validate_task
 from src.memory import db_init, index_store, init_store
 from src.memory.candidate import CandidateStore
 from src.memory.store import MemoryStore
+from src.review.authority import ReviewerProfile
 from src.review.gate import ReviewGate
 
 
@@ -152,6 +153,33 @@ class LearningLoopTests(unittest.TestCase):
         self.state.cleanup()
         self.data.cleanup()
 
+    def decide_and_activate(self, loop, run_id, candidate_id, action, reason=None):
+        reviewed = loop.review(
+            run_id,
+            candidate_id,
+            action,
+            reason=reason,
+        )
+        decisions = json.loads(
+            Path(reviewed["artifacts"]["review_decisions.json"]).read_text(
+                encoding="utf-8"
+            )
+        )
+        result = decisions["decisions"][candidate_id]["result"]
+        return loop.activate_review(
+            run_id,
+            result["decision_id"],
+            result["expected_active_generation"],
+        )
+
+    @staticmethod
+    def decide_and_activate_gate(gate, action, candidate_id, **kwargs):
+        decision = gate.review(action, candidate_id, **kwargs)
+        return gate.activate(
+            decision["decision_id"],
+            decision["expected_active_generation"],
+        )
+
     def test_end_to_end_learning_loop_reuses_only_accepted_memory(self):
         backend = ImprovingBackend()
         loop = LearningLoop(self.data.name, self.state.name, self.work.name, backend)
@@ -183,8 +211,20 @@ class LearningLoopTests(unittest.TestCase):
         )
 
         accepted_id, rejected_id = first["candidate_ids"]
-        loop.review("run-one", accepted_id, "accept", reason="reusable audit rule")
-        reviewed = loop.review("run-one", rejected_id, "reject", reason="too broad")
+        self.decide_and_activate(
+            loop,
+            "run-one",
+            accepted_id,
+            "accept",
+            reason="reusable audit rule",
+        )
+        reviewed = self.decide_and_activate(
+            loop,
+            "run-one",
+            rejected_id,
+            "reject",
+            reason="too broad",
+        )
         self.assertEqual(reviewed["state"], "reviewed")
 
         active = store.active_relevant(
@@ -245,8 +285,12 @@ class LearningLoopTests(unittest.TestCase):
         first_task["memory_condition"] = "without_memory"
         first = loop.execute(first_task)
         accepted_id, rejected_id = first["candidate_ids"]
-        loop.review("adversarial-one", accepted_id, "accept")
-        loop.review("adversarial-one", rejected_id, "reject")
+        self.decide_and_activate(
+            loop, "adversarial-one", accepted_id, "accept"
+        )
+        self.decide_and_activate(
+            loop, "adversarial-one", rejected_id, "reject"
+        )
 
         restricted = CandidateStore(self.data.name, self.state.name).create(
             {
@@ -255,19 +299,26 @@ class LearningLoopTests(unittest.TestCase):
                 "scope": "global",
                 "workspace": "work",
                 "confidentiality": "restricted",
-                "source": "test",
+                "source": "manual:user_confirmed",
                 "content": "fail-closed recovery module audit restricted strategy",
                 "action": "create",
                 "confidence": "confirmed",
                 "source_id": "test:restricted:stage07-adversarial",
-                "evidence": ["test"],
-                "source_refs": ["test:stage07-adversarial"],
+                "evidence": ["manual:restricted-evidence"],
+                "source_refs": ["manual:restricted-source"],
                 "tags": ["fail-closed", "recovery"],
             }
         )
         restricted_id = restricted["candidate_id"]
-        ReviewGate(self.data.name, self.state.name).review(
-            "accept", restricted_id, workspace="work"
+        self.decide_and_activate_gate(
+            ReviewGate(
+                self.data.name,
+                self.state.name,
+                reviewer_profile=ReviewerProfile("work", "restricted"),
+            ),
+            "accept",
+            restricted_id,
+            workspace="work",
         )
 
         second_task = task(
@@ -338,17 +389,22 @@ class LearningLoopTests(unittest.TestCase):
                 "scope": "global",
                 "workspace": "work",
                 "confidentiality": "restricted",
-                "source": "test",
+                "source": "manual:user_confirmed",
                 "content": "restricted audit strategy secret",
                 "action": "create",
                 "confidence": "confirmed",
                 "source_id": "test:restricted:audit",
-                "evidence": ["test"],
-                "source_refs": ["test:fixture"],
+                "evidence": ["manual:restricted-evidence"],
+                "source_refs": ["manual:restricted-source"],
                 "tags": ["restricted", "audit"],
             }
         )
-        ReviewGate(self.data.name, self.state.name).review(
+        self.decide_and_activate_gate(
+            ReviewGate(
+                self.data.name,
+                self.state.name,
+                reviewer_profile=ReviewerProfile("work", "restricted"),
+            ),
             "accept",
             candidate["candidate_id"],
             workspace="work",
@@ -490,18 +546,20 @@ class LearningLoopTests(unittest.TestCase):
                 "scope": "global",
                 "workspace": "personal",
                 "confidentiality": "personal",
-                "source": "test",
+                "source": "manual:user_confirmed",
                 "content": "suppression test strategy content",
                 "action": "create",
                 "confidence": "confirmed",
                 "source_id": "test:mc:suppress",
-                "evidence": ["test"],
-                "source_refs": ["test:mc"],
+                "evidence": ["manual:mc-evidence"],
+                "source_refs": ["manual:mc-source"],
                 "tags": ["mc-test"],
             }
         )
-        ReviewGate(self.data.name, self.state.name).review(
-            "accept", candidate["candidate_id"]
+        self.decide_and_activate_gate(
+            ReviewGate(self.data.name, self.state.name),
+            "accept",
+            candidate["candidate_id"],
         )
 
         # Execute with memory_condition=without_memory

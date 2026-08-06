@@ -1,8 +1,11 @@
 import hashlib
+import json
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -232,6 +235,200 @@ class HandoffUpdateTests(unittest.TestCase):
             expected_sha256=result["sha256"],
         )
         self.assertEqual(updated["status"], "updated")
+
+    def test_existing_handoff_requires_expected_sha256(self):
+        from handoff import update_project_handoff
+
+        created = update_project_handoff(
+            self.root,
+            "research-agent-memory",
+            "first",
+            workspace="personal",
+        )
+        target = self.root / created["path"]
+        before = target.read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "expected_sha256 is required"):
+            update_project_handoff(
+                self.root,
+                "research-agent-memory",
+                "second",
+                workspace="personal",
+            )
+
+        self.assertEqual(target.read_bytes(), before)
+
+    def test_receipt_binds_before_after_and_recomputes(self):
+        from handoff import update_project_handoff
+
+        created = update_project_handoff(
+            self.root,
+            "research-agent-memory",
+            "first",
+            workspace="personal",
+        )
+        self.assertIsNone(created["before_sha256"])
+        self.assertEqual(created["after_sha256"], created["sha256"])
+        body = dict(created)
+        digest = body.pop("receipt_sha256")
+        canonical = json.dumps(
+            body,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        self.assertEqual(digest, hashlib.sha256(canonical).hexdigest())
+
+        updated = update_project_handoff(
+            self.root,
+            "research-agent-memory",
+            "second",
+            expected_sha256=created["sha256"],
+            workspace="personal",
+        )
+        self.assertEqual(updated["before_sha256"], created["sha256"])
+        self.assertEqual(updated["previous_sha256"], created["sha256"])
+        self.assertEqual(updated["after_sha256"], updated["sha256"])
+        self.assertEqual(updated["expected_sha256"], created["sha256"])
+
+    def test_same_expected_sha256_allows_only_one_concurrent_update(self):
+        from handoff import update_project_handoff
+
+        created = update_project_handoff(
+            self.root,
+            "research-agent-memory",
+            "first",
+            workspace="personal",
+        )
+        script = (
+            "import json,sys;"
+            f"sys.path.insert(0,{str(SOURCE_DIR)!r});"
+            "from handoff import update_project_handoff;"
+            "root,content,expected=sys.argv[1:4];"
+            "\ntry:\n"
+            " r=update_project_handoff(root,'research-agent-memory',content,expected,workspace='personal');"
+            " print(json.dumps({'ok':True,'result':r},sort_keys=True))"
+            "\nexcept Exception as e:\n"
+            " print(json.dumps({'ok':False,'error':str(e)},sort_keys=True))"
+        )
+        commands = [
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(self.root),
+                content,
+                created["sha256"],
+            ]
+            for content in ("second-a", "second-b")
+        ]
+        processes = [
+            subprocess.Popen(
+                command,
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for command in commands
+        ]
+        results = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=30)
+            self.assertEqual(process.returncode, 0, stdout + stderr)
+            results.append(json.loads(stdout))
+
+        winners = [item for item in results if item["ok"]]
+        losers = [item for item in results if not item["ok"]]
+        self.assertEqual(len(winners), 1, results)
+        self.assertEqual(len(losers), 1, results)
+        self.assertIn("sha256 mismatch", losers[0]["error"])
+        target = self.root / "projects/research-agent-memory/handoff.md"
+        final_text = target.read_text(encoding="utf-8")
+        winner_content = "second-a" if "second-a" in final_text else "second-b"
+        self.assertIn(winner_content, final_text)
+        self.assertFalse(list(target.parent.glob(".handoff-*.tmp")))
+        self.assertFalse(list(target.parent.glob(".handoff-*.bak")))
+
+    def test_failed_update_publication_restores_previous_bytes(self):
+        import handoff
+
+        created = handoff.update_project_handoff(
+            self.root,
+            "research-agent-memory",
+            "first",
+            workspace="personal",
+        )
+        target = self.root / created["path"]
+        before = target.read_bytes()
+        real_replace = handoff.os.replace
+        failed = False
+
+        def fail_new_publication(source, destination):
+            nonlocal failed
+            if not failed and str(source).endswith(".tmp"):
+                failed = True
+                raise OSError("injected publication failure")
+            return real_replace(source, destination)
+
+        with mock.patch.object(
+            handoff.os,
+            "replace",
+            side_effect=fail_new_publication,
+        ):
+            with self.assertRaisesRegex(OSError, "injected publication failure"):
+                handoff.update_project_handoff(
+                    self.root,
+                    "research-agent-memory",
+                    "second",
+                    expected_sha256=created["sha256"],
+                    workspace="personal",
+                )
+
+        self.assertEqual(target.read_bytes(), before)
+        self.assertFalse(list(target.parent.glob(".handoff-*.tmp")))
+        self.assertFalse(list(target.parent.glob(".handoff-*.bak")))
+
+    def test_failed_temp_write_leaves_no_residue(self):
+        import handoff
+
+        target_dir = self.root / "projects/research-agent-memory"
+        with mock.patch.object(
+            handoff.os,
+            "write",
+            side_effect=OSError("injected short write"),
+        ):
+            with self.assertRaisesRegex(ValueError, "handoff write failed"):
+                handoff.update_project_handoff(
+                    self.root,
+                    "research-agent-memory",
+                    "content",
+                    workspace="personal",
+                )
+
+        self.assertFalse(list(target_dir.glob(".handoff-*.tmp")))
+        self.assertFalse((target_dir / "handoff.md").exists())
+
+    def test_symlink_target_is_rejected_without_touching_external_file(self):
+        from handoff import update_project_handoff
+
+        external = Path(self.temp.name) / "external.md"
+        external.write_text("external", encoding="utf-8")
+        target = self.root / "projects/research-agent-memory/handoff.md"
+        target.parent.mkdir(parents=True)
+        target.symlink_to(external)
+
+        with self.assertRaisesRegex(ValueError, "invalid handoff target"):
+            update_project_handoff(
+                self.root,
+                "research-agent-memory",
+                "replacement",
+                workspace="personal",
+            )
+
+        self.assertEqual(external.read_text(encoding="utf-8"), "external")
+        self.assertTrue(target.is_symlink())
 
 
 if __name__ == "__main__":

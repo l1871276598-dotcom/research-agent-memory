@@ -9,9 +9,11 @@ candidates and can never write active memory directly.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Callable
 
 from memory.candidate import validate_candidate_values
+from review.source_refs import publish_source_artifact
 
 
 MEMORY_REVIEW_PROMPT = (
@@ -212,11 +214,19 @@ class ReviewCounter:
 class ConversationReviewService:
     """Prepare model review and persist only LAOS-owned candidates."""
 
-    def __init__(self, memory_core: Any, reviewer: Callable | None = None):
+    def __init__(
+        self,
+        memory_core: Any,
+        reviewer: Callable | None = None,
+        state_dir: str | Path | None = None,
+    ):
         if not callable(getattr(memory_core, "create_candidate", None)):
             raise ValueError("memory core is invalid")
         if reviewer is not None and not callable(reviewer):
             raise ValueError("reviewer must be callable")
+        if state_dir is None:
+            state_dir = getattr(getattr(memory_core, "candidates", None), "state_dir", None)
+        self.state_dir = None if state_dir is None else Path(state_dir).expanduser()
         self.memory_core = memory_core
         self.reviewer = reviewer
 
@@ -256,17 +266,33 @@ class ConversationReviewService:
                 value["project"] = project
             if review_id:
                 value["source_id"] = f"review:{review_id}:memory:{index}"
-            refs = list(value.get("source_refs") or [])
-            if session_id:
-                reference = f"session:{session_id}"
-                if reference not in refs:
-                    refs.append(reference)
-            value["source_refs"] = refs
-            validate_candidate_values(value)
             existing = None
             if review_id and callable(finder):
                 existing = finder(value["source_id"])
-            result = existing or self.memory_core.create_candidate(value)
+            if existing is not None:
+                result = existing
+            else:
+                if self.state_dir is None:
+                    raise ValueError("conversation review source state is unavailable")
+                refs = list(value.get("source_refs") or [])
+                artifact_ref = publish_source_artifact(
+                    self.state_dir,
+                    kind="conversation_review_evidence",
+                    workspace=workspace,
+                    project=project,
+                    confidentiality=confidentiality,
+                    payload={
+                        "session_id": session_id,
+                        "review_id": review_id,
+                        "candidate_index": index,
+                        "candidate": item,
+                    },
+                )
+                if artifact_ref not in refs:
+                    refs.append(artifact_ref)
+                value["source_refs"] = refs
+                validate_candidate_values(value)
+                result = self.memory_core.create_candidate(value)
             results.append(result)
             candidate_ids.append(result["candidate_id"])
         return {
