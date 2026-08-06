@@ -2,7 +2,7 @@
 
 LAOS is a local-first, auditable, human-governed memory and learning layer for AI agents. It keeps structured memory, project context, task evidence, reflections, and reusable principles in user-controlled files with rebuildable indexes, so GPT, Codex, Claude, local models, and other agents can reuse knowledge without bypassing human review.
 
-**Current release:** [v0.10.0](https://github.com/l1871276598-dotcom/research-agent-memory/releases/tag/v0.10.0) · Python 3.11+ · macOS acceptance target · [MIT](LICENSE)
+**Current release:** [v0.11.0](https://github.com/l1871276598-dotcom/research-agent-memory/releases/tag/v0.11.0) · Python 3.11+ · macOS acceptance target · [MIT](LICENSE)
 
 [Reproducible local demo](#reproducible-local-demo) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
@@ -79,7 +79,7 @@ LAOS 是一个本地优先、可审计、人工审核受控的 Agent 记忆与�
 
 ## 当前版本
 
-- 当前正式版本：`v0.10.0`
+- 当前正式版本：`v0.11.0`
 - SQLite schema：`v3`
 - Python：`3.11+`
 - 当前验收平台：macOS
