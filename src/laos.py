@@ -12,6 +12,7 @@ import memory_agent
 import memory_tools
 from agents.candidate_generator import LowRiskCandidateAgent
 from agents.coordinator import LoopCoordinatorAgent
+from agents.evidence import EvidenceAgent
 from agents.handoff import HandoffAgent
 from agents.orchestrator import (
     ActivationAgent,
@@ -95,6 +96,7 @@ def build_application(root, state_dir=None, model_backend=None):
         MemoryAgent(core),
         SearchAgent(core),
         CandidateListAgent(core),
+        EvidenceAgent(candidates.state_dir),
         ReviewAgent(
             ReviewGate(
                 root,
