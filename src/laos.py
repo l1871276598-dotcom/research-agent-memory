@@ -98,7 +98,9 @@ def build_application(root, state_dir=None, model_backend=None):
         SearchAgent(core),
         CandidateListAgent(core),
         EvidenceAgent(candidates.state_dir),
-        VaultReadAgent(),
+        # GP4-01: the vault root is a Core-side authority from administrator
+        # configuration (LAOS_VAULT_ROOT). A caller can never supply it.
+        VaultReadAgent(os.environ.get("LAOS_VAULT_ROOT") or ""),
         ReviewAgent(
             ReviewGate(
                 root,

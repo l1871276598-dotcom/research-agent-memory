@@ -148,24 +148,35 @@ class VaultReadAgent(BaseAgent):
     agent_id = "vault_read_agent"
     handles = ["vault.read"]
 
-    def __init__(self):
-        pass
+    def __init__(self, trusted_vault_root):
+        # GP4-01: the vault root is a Core-side authority, injected at
+        # construction from administrator configuration (LAOS_VAULT_ROOT). A
+        # caller can NEVER supply a vault_root — doing so would turn vault.read
+        # into arbitrary file read. The agent accepts only relative_path.
+        # An empty trusted_vault_root means vault evidence is not configured;
+        # the agent still constructs (so registry wiring is stable) but every
+        # run() fails closed.
+        if trusted_vault_root is None:
+            raise ValueError("trusted vault root must be a string")
+        if trusted_vault_root and not os.path.isabs(trusted_vault_root):
+            raise ValueError("trusted vault root must be an absolute path")
+        self.trusted_vault_root = trusted_vault_root
 
     def run(self, task, context):
         values = task.get("input")
         if not isinstance(values, dict):
             raise ValueError("task.input must be an object")
-        keys = set(values)
-        if keys != {"vault_root", "relative_path"}:
-            raise ValueError("task.input must contain exactly vault_root and relative_path")
-        vault_root = values["vault_root"]
+        # Exact input: ONLY relative_path. A caller-supplied vault_root (or any
+        # other field) is rejected — the trusted root comes from construction.
+        if set(values) != {"relative_path"}:
+            raise ValueError("task.input must contain exactly relative_path")
         relative_path = values["relative_path"]
-        if not isinstance(vault_root, str) or not vault_root:
-            raise ValueError("vault_root must be a non-empty string")
         if not isinstance(relative_path, str) or not relative_path:
             raise ValueError("relative_path must be a non-empty string")
+        if not self.trusted_vault_root:
+            raise ValueError("vault.read is not configured (no trusted vault root)")
         try:
-            content = _read_vault_note_fd_rooted(vault_root, relative_path)
+            content = _read_vault_note_fd_rooted(self.trusted_vault_root, relative_path)
         except VaultReadError as exc:
             raise ValueError(str(exc)) from exc
         return self.result(

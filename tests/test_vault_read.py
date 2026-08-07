@@ -31,11 +31,11 @@ class VaultReadAgentTests(unittest.TestCase):
         (self.vault / "sub" / "nested.md").write_text("nested body", encoding="utf-8")
 
     def agent(self):
-        return VaultReadAgent()
+        return VaultReadAgent(str(self.vault))
 
     def read(self, relative_path):
         return self.agent().run(
-            {"type": "vault.read", "input": {"vault_root": str(self.vault), "relative_path": relative_path}},
+            {"type": "vault.read", "input": {"relative_path": relative_path}},
             {},
         )["output"]["content"]
 
@@ -45,6 +45,23 @@ class VaultReadAgentTests(unittest.TestCase):
 
     def test_reads_nested_note_via_intermediate_dir(self):
         self.assertEqual(self.read("sub/nested.md"), "nested body")
+
+    # ---- GP4-01: caller cannot supply vault_root ----
+    def test_rejects_caller_supplied_vault_root(self):
+        with self.assertRaises(ValueError):
+            self.agent().run(
+                {"type": "vault.read", "input": {"vault_root": "/etc", "relative_path": "hosts"}},
+                {},
+            )
+
+    def test_rejects_any_extra_input_field_besides_relative_path(self):
+        # A caller supplying vault_root alongside relative_path is rejected
+        # (exact-input schema: only relative_path is accepted).
+        with self.assertRaises(ValueError):
+            self.agent().run(
+                {"type": "vault.read", "input": {"vault_root": "/etc", "relative_path": "note.md"}},
+                {},
+            )
 
     # ---- lexical traversal ----
     def test_rejects_traversal(self):
@@ -91,20 +108,20 @@ class VaultReadAgentTests(unittest.TestCase):
     def test_rejects_extra_input_fields(self):
         with self.assertRaises(ValueError):
             self.agent().run(
-                {"type": "vault.read", "input": {"vault_root": str(self.vault), "relative_path": "note.md", "extra": 1}},
+                {"type": "vault.read", "input": {"relative_path": "note.md", "extra": 1}},
                 {},
             )
 
     def test_rejects_non_string_fields(self):
         with self.assertRaises(ValueError):
             self.agent().run(
-                {"type": "vault.read", "input": {"vault_root": str(self.vault), "relative_path": 42}},
+                {"type": "vault.read", "input": {"relative_path": 42}},
                 {},
             )
 
     def test_never_creates_candidates_or_authority(self):
         result = self.agent().run(
-            {"type": "vault.read", "input": {"vault_root": str(self.vault), "relative_path": "note.md"}},
+            {"type": "vault.read", "input": {"relative_path": "note.md"}},
             {},
         )
         self.assertEqual(result["candidates"], [])
