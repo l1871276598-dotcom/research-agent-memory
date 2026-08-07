@@ -34,8 +34,15 @@ class VaultReadError(ValueError):
         self.code = code
 
 
-_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
-_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+# R1-GP3/R2-GP3 (Round 4): O_NOFOLLOW/O_DIRECTORY must NOT silently degrade to
+# 0 — that would fail open (a platform without O_NOFOLLOW would follow
+# symlinks). If either is missing, vault.read is entirely unavailable
+# (fail-closed) rather than running without the symlink guarantee.
+if getattr(os, "O_NOFOLLOW", None) is None or getattr(os, "O_DIRECTORY", None) is None:
+    raise RuntimeError("vault.read requires O_NOFOLLOW and O_DIRECTORY (unsupported platform)")
+
+_NOFOLLOW = os.O_NOFOLLOW
+_O_DIRECTORY = os.O_DIRECTORY
 _MAX_NOTE_BYTES = 512 * 1024
 
 # A note-relative path must be reject-all: no "." / ".." / NUL / backslash /
