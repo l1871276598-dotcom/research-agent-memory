@@ -146,6 +146,19 @@ class FdRootedReadTests(unittest.TestCase):
         with self.assertRaises(Exception):
             _read_vault_note_fd_rooted(str(self.vault), "link.txt")
 
+    # S8b (Round 6): stable-content snapshot. An in-place write to the SAME
+    # inode during the read must be detected via size/mtime_ns/ctime_ns change,
+    # so a torn read never mints an evidence artifact.
+    def test_s8b_detects_same_inode_rewrite_during_read(self):
+        # Write through the opened fd (same inode) before the content read.
+        def rewrite(fd, _stat):
+            os.write(fd, b"changed-content")
+        with self.assertRaises(Exception):
+            _read_vault_note_fd_rooted(str(self.vault), "f.txt", before_read=rewrite)
+
+    def test_s8b_unchanged_read_succeeds(self):
+        self.assertEqual(_read_vault_note_fd_rooted(str(self.vault), "f.txt", before_read=lambda fd, st: None), "hello")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -67,12 +67,15 @@ def _split_relative(relative_path: str) -> list[str]:
     return segments
 
 
-def _read_vault_note_fd_rooted(vault_root: str, relative_path: str) -> str:
+def _read_vault_note_fd_rooted(vault_root: str, relative_path: str, before_read=None) -> str:
     """Read one vault note through an fd-rooted traversal.
 
     Returns the note content as UTF-8 text. Fails closed (VaultReadError) on
     any symlink at any level, any non-directory intermediate, any non-regular
     final file, or any mutation detected between open and read.
+    before_read (test seam): an optional callable invoked after the final fd is
+    opened and before the content is read, so tests can deterministically
+    simulate a concurrent in-place writer on the same inode.
     """
     if not isinstance(vault_root, str) or not vault_root or not os.path.isabs(vault_root):
         raise VaultReadError("invalid_vault_root", "vault root must be an absolute directory")
@@ -123,6 +126,8 @@ def _read_vault_note_fd_rooted(vault_root: str, relative_path: str) -> str:
             if before.st_size > _MAX_NOTE_BYTES:
                 os.close(final_fd)
                 raise VaultReadError("note_too_large", "note exceeds the size limit")
+            if before_read is not None:
+                before_read(final_fd, before)
             chunks = []
             total = 0
             while True:
@@ -136,9 +141,24 @@ def _read_vault_note_fd_rooted(vault_root: str, relative_path: str) -> str:
                     raise VaultReadError("note_too_large", "note exceeds the size limit")
             after = os.fstat(final_fd)
             os.close(final_fd)
-            # fd cannot change identity mid-read (same open descriptor); this
-            # guards a size/mode mutation that exceeds our read.
-            if before.st_ino != after.st_ino or before.st_dev != after.st_dev:
+            # S8b (Round 6): stable-content snapshot. The fd cannot change
+            # identity mid-read (same open descriptor), so dev/ino never differ
+            # — that check alone cannot catch an in-place modification of the
+            # SAME inode during the read. Compare size and nanosecond
+            # mtime/ctime as CHANGE DETECTORS (not generation guarantees): if
+            # the file was written while we read, these differ and we fail
+            # closed rather than minting an evidence artifact from a torn read.
+            before_mtime = getattr(before, "st_mtime_ns", int(before.st_mtime * 1_000_000_000))
+            after_mtime = getattr(after, "st_mtime_ns", int(after.st_mtime * 1_000_000_000))
+            before_ctime = getattr(before, "st_ctime_ns", int(before.st_ctime * 1_000_000_000))
+            after_ctime = getattr(after, "st_ctime_ns", int(after.st_ctime * 1_000_000_000))
+            if (
+                before.st_ino != after.st_ino
+                or before.st_dev != after.st_dev
+                or before.st_size != after.st_size
+                or before_mtime != after_mtime
+                or before_ctime != after_ctime
+            ):
                 raise VaultReadError("note_changed", "note changed during read")
             return b"".join(chunks).decode("utf-8")
         finally:
