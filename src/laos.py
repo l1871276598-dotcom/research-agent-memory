@@ -27,6 +27,7 @@ from agents.policy import PolicyAgent
 from agents.reflection import ConversationReviewAgent, ReflectionAgent
 from agents.reflection_record import ReflectionRecordAgent
 from agents.registry import AgentRegistry
+from agents.vault_read import VaultReadAgent
 from context.builder import ContextBuilder
 from memory.candidate import CandidateStore
 from memory.core import MemoryCore
@@ -97,6 +98,7 @@ def build_application(root, state_dir=None, model_backend=None):
         SearchAgent(core),
         CandidateListAgent(core),
         EvidenceAgent(candidates.state_dir),
+        VaultReadAgent(),
         ReviewAgent(
             ReviewGate(
                 root,

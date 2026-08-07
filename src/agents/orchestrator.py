@@ -24,6 +24,9 @@ _LEGACY_CONTEXT_FREE_TASKS = frozenset(
         "review.list",
         "review.show",
         "review.decide",
+        # vault.read is a context-free ingress primitive (fd-rooted vault read);
+        # it requires no memory context and is NOT an authority operation.
+        "vault.read",
     }
 )
 _CANDIDATE_STATUSES = frozenset({"candidate", "conflicted"})
