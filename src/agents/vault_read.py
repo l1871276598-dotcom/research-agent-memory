@@ -100,6 +100,13 @@ def _read_vault_note_fd_rooted(vault_root: str, relative_path: str, before_read=
                 flags = os.O_RDONLY | _NOFOLLOW
                 if not is_final:
                     flags |= _O_DIRECTORY
+                else:
+                    # GP7-04: a FIFO/device at the final component would block
+                    # os.open(O_RDONLY) until a writer appears — a hang an
+                    # attacker can create inside the vault. O_NONBLOCK makes the
+                    # open return immediately so the fstat below can reject the
+                    # non-regular file. Regular files are unaffected.
+                    flags |= getattr(os, "O_NONBLOCK", 0)
                 try:
                     fd = os.open(segment, flags, dir_fd=parent_fd)
                 except OSError as exc:
@@ -123,6 +130,15 @@ def _read_vault_note_fd_rooted(vault_root: str, relative_path: str, before_read=
             before = os.fstat(final_fd)
             if not stat.S_ISREG(before.st_mode):
                 raise VaultReadError("note_not_file", "note must be a regular file")
+            # GP7-03: O_NOFOLLOW blocks symlinks but not hard links. A hard link
+            # would let the same inode live under two paths in different
+            # partitions (e.g. private/secret.md and public/innocent.md), so the
+            # partition identity (computed from the caller path) could diverge
+            # from the actual bytes' partition. Requiring nlink == 1 rejects the
+            # aliasing; fail closed rather than mint evidence from an ambiguous
+            # inode.
+            if getattr(before, "st_nlink", 1) != 1:
+                raise VaultReadError("note_hardlink", "note must not have hard links")
             if before.st_size > _MAX_NOTE_BYTES:
                 raise VaultReadError("note_too_large", "note exceeds the size limit")
             if before_read is not None:

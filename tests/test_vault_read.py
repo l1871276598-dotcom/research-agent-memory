@@ -159,6 +159,30 @@ class FdRootedReadTests(unittest.TestCase):
     def test_s8b_unchanged_read_succeeds(self):
         self.assertEqual(_read_vault_note_fd_rooted(str(self.vault), "f.txt", before_read=lambda fd, st: None), "hello")
 
+    # GP7-04: a FIFO planted in the vault must not block the fd-rooted read.
+    # O_NONBLOCK on the final open makes os.open return immediately; the
+    # fstat-regular check then rejects it as not a regular file.
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires mkfifo")
+    def test_gp7_04_rejects_fifo_without_hanging(self):
+        os.mkfifo(self.vault / "hang.fifo")
+        import time
+        start = time.monotonic()
+        with self.assertRaises(ValueError):
+            _read_vault_note_fd_rooted(str(self.vault), "hang.fifo")
+        # The read must fail promptly (non-blocking open), not hang waiting
+        # for a writer.
+        self.assertLess(time.monotonic() - start, 2.0, "FIFO read must not block")
+
+    # GP7-03: a hard link aliases the same inode under two paths, so partition
+    # identity (from the caller path) could diverge from the actual bytes'
+    # partition. Reject nlink != 1 (fail closed).
+    def test_gp7_03_rejects_hardlinked_note(self):
+        os.link(self.vault / "f.txt", self.vault / "f-alias.txt")
+        with self.assertRaises(ValueError):
+            _read_vault_note_fd_rooted(str(self.vault), "f.txt")
+        with self.assertRaises(ValueError):
+            _read_vault_note_fd_rooted(str(self.vault), "f-alias.txt")
+
 
 if __name__ == "__main__":
     unittest.main()
