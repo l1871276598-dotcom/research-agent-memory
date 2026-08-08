@@ -93,6 +93,7 @@ def _read_vault_note_fd_rooted(vault_root: str, relative_path: str, before_read=
         segments = _split_relative(relative_path)
         parent_fd = root_fd
         opened_fds = []  # parents opened during traversal (close after)
+        final_fd = None  # GP6-04: tracked so every path closes it (incl. exceptions)
         try:
             for index, segment in enumerate(segments):
                 is_final = index == len(segments) - 1
@@ -121,10 +122,8 @@ def _read_vault_note_fd_rooted(vault_root: str, relative_path: str, before_read=
             # Read from the exact final fd.
             before = os.fstat(final_fd)
             if not stat.S_ISREG(before.st_mode):
-                os.close(final_fd)
                 raise VaultReadError("note_not_file", "note must be a regular file")
             if before.st_size > _MAX_NOTE_BYTES:
-                os.close(final_fd)
                 raise VaultReadError("note_too_large", "note exceeds the size limit")
             if before_read is not None:
                 before_read(final_fd, before)
@@ -137,10 +136,8 @@ def _read_vault_note_fd_rooted(vault_root: str, relative_path: str, before_read=
                 chunks.append(chunk)
                 total += len(chunk)
                 if total > _MAX_NOTE_BYTES:
-                    os.close(final_fd)
                     raise VaultReadError("note_too_large", "note exceeds the size limit")
             after = os.fstat(final_fd)
-            os.close(final_fd)
             # S8b (Round 6): stable-content snapshot. The fd cannot change
             # identity mid-read (same open descriptor), so dev/ino never differ
             # — that check alone cannot catch an in-place modification of the
@@ -162,6 +159,12 @@ def _read_vault_note_fd_rooted(vault_root: str, relative_path: str, before_read=
                 raise VaultReadError("note_changed", "note changed during read")
             return b"".join(chunks).decode("utf-8")
         finally:
+            # GP6-04: close final_fd unconditionally (no leak on exception).
+            if final_fd is not None:
+                try:
+                    os.close(final_fd)
+                except OSError:
+                    pass
             for fd in opened_fds:
                 try:
                     os.close(fd)
