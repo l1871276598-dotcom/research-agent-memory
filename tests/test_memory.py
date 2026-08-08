@@ -2201,6 +2201,37 @@ class UnifiedSearchCommandTests(unittest.TestCase):
                 {"global active", "global restricted", "global deprecated"},
             )
 
+    def test_search_confidentiality_ceiling_is_non_interference(self):
+        # GP9-02: same workspace/project, different caller confidentiality
+        # ceiling → different results. A public-ceiling profile must NOT see
+        # personal/internal notes under the same workspace/project.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, state_dir, _ = self.setup_store(tmp)
+            common = {"content": "CeilingProbe durable evidence"}
+            additions = [
+                self.run_add(root, title="pub note", confidentiality="public", **common),
+                self.run_add(root, title="personal note", confidentiality="personal", **common),
+                self.run_add(root, title="internal note", confidentiality="internal", workspace="work", **common),
+            ]
+            self.assertTrue(all(result.returncode == 0 for result in additions), [result.stderr for result in additions])
+            self.assertEqual(self.run_index(root, state_dir).returncode, 0)
+
+            public = self.run_search(root, state_dir, "CeilingProbe", "--kind", "memory", "--confidentiality", "public", "--workspace", "personal")
+            self.assertEqual(public.returncode, 0, public.stdout + public.stderr)
+            self.assertEqual({row["title"] for row in json.loads(public.stdout)["results"]}, {"pub note"})
+
+            personal = self.run_search(root, state_dir, "CeilingProbe", "--kind", "memory", "--confidentiality", "personal", "--workspace", "personal")
+            self.assertEqual(personal.returncode, 0, personal.stdout + personal.stderr)
+            self.assertEqual({row["title"] for row in json.loads(personal.stdout)["results"]}, {"pub note", "personal note"})
+
+            internal = self.run_search(root, state_dir, "CeilingProbe", "--kind", "memory", "--confidentiality", "internal", "--workspace", "personal")
+            self.assertEqual(internal.returncode, 0, internal.stdout + internal.stderr)
+            self.assertEqual({row["title"] for row in json.loads(internal.stdout)["results"]}, {"pub note", "personal note"})
+
+            no_ceiling = self.run_search(root, state_dir, "CeilingProbe", "--kind", "memory", "--workspace", "personal")
+            self.assertEqual(no_ceiling.returncode, 0, no_ceiling.stdout + no_ceiling.stderr)
+            self.assertEqual({row["title"] for row in json.loads(no_ceiling.stdout)["results"]}, {"pub note", "personal note"})
+
     def test_search_supports_manual_text_chatgpt_literature_and_manuscript_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
             root, state_dir, _ = self.setup_store(tmp)

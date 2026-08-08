@@ -1075,8 +1075,8 @@ class AuthorityMemoryStore:
     def reviewable(self, workspace=None, project=None, statuses=None):
         return self.store.reviewable(workspace, project, statuses)
 
-    def active_relevant(self, query, workspace=None, project=None):
-        rows = self.store.active_relevant(query, workspace, project)
+    def active_relevant(self, query, workspace=None, project=None, confidentiality=None):
+        rows = self.store.active_relevant(query, workspace, project, confidentiality)
         return self.authority.authorize_active_records(rows)
 
 

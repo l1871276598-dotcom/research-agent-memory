@@ -77,6 +77,12 @@ AUDIT_STATUS_CHOICES = [
 SCOPE_CHOICES = ["global", "context", "project"]
 WORKSPACE_CHOICES = ["personal", "work"]
 CONFIDENTIALITY_CHOICES = ["public", "personal", "internal", "restricted"]
+_CONFIDENTIALITY_RANK = {
+    "public": 0,
+    "personal": 1,
+    "internal": 2,
+    "restricted": 3,
+}
 CONFIDENCE_CHOICES = ["confirmed", "inferred", "uncertain"]
 TEXT_DOCUMENT_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".json", ".html", ".htm", ".rtf"}
 CONFLICT_STATUS_CHOICES = {"conflict", "conflicted"}
@@ -2548,6 +2554,21 @@ def _search_memory(conn, args, query):
         conditions.append("m.tier != 'recent'")
     if not getattr(args, "include_restricted", False):
         conditions.append("COALESCE(m.confidentiality, '') != 'restricted'")
+    # GP9-02: a caller confidentiality ceiling excludes records MORE
+    # confidential than the ceiling (public < personal < internal < restricted),
+    # so a public-ceiling profile cannot read internal notes under the same
+    # workspace/project.
+    ceiling = getattr(args, "confidentiality", None)
+    if ceiling:
+        ceiling_rank = _CONFIDENTIALITY_RANK.get(ceiling)
+        if ceiling_rank is None:
+            raise ValueError("confidentiality must be public, personal, internal or restricted")
+        allowed = tuple(
+            level for level, rank in _CONFIDENTIALITY_RANK.items() if rank <= ceiling_rank
+        )
+        placeholders = ", ".join("?" for _ in allowed)
+        conditions.append(f"COALESCE(m.confidentiality, '') IN ({placeholders})")
+        values.extend(allowed)
     if not getattr(args, "include_inactive", False):
         conditions.append("m.status = 'active'")
     if args.project:
@@ -2596,6 +2617,17 @@ def _search_documents(conn, args, query):
     values = [query]
     if not getattr(args, "include_restricted", False):
         conditions.append("COALESCE(d.confidentiality, '') != 'restricted'")
+    ceiling = getattr(args, "confidentiality", None)
+    if ceiling:
+        ceiling_rank = _CONFIDENTIALITY_RANK.get(ceiling)
+        if ceiling_rank is None:
+            raise ValueError("confidentiality must be public, personal, internal or restricted")
+        allowed = tuple(
+            level for level, rank in _CONFIDENTIALITY_RANK.items() if rank <= ceiling_rank
+        )
+        placeholders = ", ".join("?" for _ in allowed)
+        conditions.append(f"COALESCE(d.confidentiality, '') IN ({placeholders})")
+        values.extend(allowed)
     if args.source_kind:
         conditions.append("d.source_kind = ?")
         values.append(args.source_kind)
@@ -3246,6 +3278,7 @@ def build_parser():
     search_parser.add_argument("--project")
     search_parser.add_argument("--context-id")
     search_parser.add_argument("--workspace")
+    search_parser.add_argument("--confidentiality", choices=CONFIDENTIALITY_CHOICES)
     search_parser.add_argument("--status")
     search_parser.add_argument("--as-of")
     search_parser.add_argument("--mode", choices=["lexical", "semantic", "hybrid"], default="lexical")

@@ -54,7 +54,7 @@ def build_application(root, state_dir=None, model_backend=None):
     authority = AuthorityStore(root, candidates.state_dir)
     store = AuthorityMemoryStore(base_store, authority)
 
-    def search_documents(query, workspace, project):
+    def search_documents(query, workspace, project, confidentiality=None):
         return memory.search_store(
             argparse.Namespace(
                 root=str(root),
@@ -70,6 +70,7 @@ def build_application(root, state_dir=None, model_backend=None):
                 include_unassigned=False,
                 include_restricted=False,
                 include_inactive=False,
+                confidentiality=confidentiality,
                 limit=20,
                 json=True,
                 mode="lexical",

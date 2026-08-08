@@ -138,14 +138,21 @@ class SearchAgent(BaseAgent):
         self.core = core
 
     def run(self, task, context):
-        values = _input(self, task, {"query", "workspace", "project", "limit"})
+        values = _input(self, task, {"query", "workspace", "project", "confidentiality", "limit"})
         query = _text(values.get("query"), "input.query")
         workspace = _text(_task_value(task, values, "workspace"), "workspace")
         if workspace not in _WORKSPACE_CHOICES:
             raise ValueError("input.workspace must be personal or work")
         project = _optional_text(_task_value(task, values, "project"), "project")
+        confidentiality = _optional_text(
+            _task_value(task, values, "confidentiality"), "confidentiality"
+        )
+        if confidentiality is not None and confidentiality not in (
+            "public", "personal", "internal", "restricted"
+        ):
+            raise ValueError("input.confidentiality is invalid")
         limit = _limit(values)
-        results = self.core.search(query, workspace, project)
+        results = self.core.search(query, workspace, project, confidentiality)
         if not isinstance(results, list):
             raise ValueError("memory search result must be a list")
         if limit is not None:
@@ -327,8 +334,15 @@ class ContextAgent(BaseAgent):
         self.builder = builder
 
     def run(self, task, context):
-        values = _input(self, task, {"query", "task", "limit", "workspace", "project"})
+        values = _input(self, task, {"query", "task", "limit", "workspace", "project", "confidentiality"})
         embedded = values.get("task")
+        confidentiality = _optional_text(
+            _task_value(task, values, "confidentiality"), "confidentiality"
+        )
+        if confidentiality is not None and confidentiality not in (
+            "public", "personal", "internal", "restricted"
+        ):
+            raise ValueError("input.confidentiality is invalid")
         if isinstance(embedded, dict):
             original_type = _text(embedded.get("type"), "input.task.type")
             original_input = embedded.get("input", {})
@@ -361,7 +375,10 @@ class ContextAgent(BaseAgent):
             workspace = _text(workspace, "workspace")
             if workspace not in _WORKSPACE_CHOICES:
                 raise ValueError("input.workspace must be personal or work")
-            output = self.builder.build(query, limit, workspace, project)
+            if confidentiality is not None:
+                output = self.builder.build(query, limit, workspace, project, confidentiality)
+            else:
+                output = self.builder.build(query, limit, workspace, project)
         return self.result(task, output)
 
 

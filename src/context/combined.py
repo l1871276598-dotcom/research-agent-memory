@@ -10,10 +10,13 @@ class CombinedContextBuilder:
         self.procedure_builder = procedure_builder
         self.procedure_ratio = procedure_ratio
 
-    def build(self, query, limit=8000, workspace=None, project=None):
+    def build(self, query, limit=8000, workspace=None, project=None, confidentiality=None):
         procedure_limit = max(1, int(limit * self.procedure_ratio))
         memory_limit = limit - procedure_limit
-        memory = self.memory_builder.build(query, memory_limit, workspace, project)
+        if confidentiality is not None:
+            memory = self.memory_builder.build(query, memory_limit, workspace, project, confidentiality)
+        else:
+            memory = self.memory_builder.build(query, memory_limit, workspace, project)
         procedures = self.procedure_builder.build(query, procedure_limit)
         parts = []
         if memory.get("text"):
