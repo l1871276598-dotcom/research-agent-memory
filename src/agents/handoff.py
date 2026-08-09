@@ -12,8 +12,9 @@ class HandoffAgent(BaseAgent):
     agent_id = "handoff_agent"
     handles = ["handoff.write", "handoff.update"]
 
-    def __init__(self, root):
+    def __init__(self, root, state_dir):
         self.root = Path(root).expanduser().resolve(strict=False)
+        self.state_dir = Path(state_dir).expanduser().resolve(strict=False)
 
     def run(self, task, context):
         values = _input(self, task, {"project_slug", "content", "expected_sha256", "workspace", "project"})
@@ -32,7 +33,12 @@ class HandoffAgent(BaseAgent):
         return self.result(
             task,
             update_project_handoff(
-                self.root, project_slug, content, expected_sha256, workspace=workspace
+                self.root,
+                project_slug,
+                content,
+                expected_sha256,
+                workspace=workspace,
+                state_dir=self.state_dir,
             ),
         )
 

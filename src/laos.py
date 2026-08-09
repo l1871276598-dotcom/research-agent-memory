@@ -117,7 +117,7 @@ def build_application(root, state_dir=None, model_backend=None):
             )
         ),
         ContextAgent(ContextBuilder(store)),
-        HandoffAgent(root),
+        HandoffAgent(root, candidates.state_dir),
         reflection,
         policy,
         generator,

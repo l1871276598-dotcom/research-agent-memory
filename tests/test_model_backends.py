@@ -116,6 +116,7 @@ class ModelBackendTests(unittest.TestCase):
             task = {
                 "type": "reflection.record",
                 "workspace": "personal",
+                "confidentiality": "personal",
                 "input": {
                     "session_id": "session-one",
                     "messages": [{"role": "user", "content": "Remember minimal code."}],

@@ -20,6 +20,7 @@ class ReflectionRuntimeTests(unittest.TestCase):
             result = app.run({
                 "type": "reflection.record",
                 "workspace": "personal",
+                "confidentiality": "personal",
                 "input": {
                     "session_id": "session-1",
                     "messages": [{"role": "user", "content": "hello"}]

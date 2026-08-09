@@ -149,6 +149,7 @@ class CandidateListingTests(unittest.TestCase):
             {
                 "type": "memory.candidates",
                 "workspace": "personal",
+                "confidentiality": "personal",
                 "input": {"limit": 2},
             }
         )
@@ -168,6 +169,7 @@ class CandidateListingTests(unittest.TestCase):
         result = self.run_task(
             {
                 "type": "memory.candidates",
+                "confidentiality": "personal",
                 "input": {
                     "workspace": "personal",
                     "project": "localoperations",

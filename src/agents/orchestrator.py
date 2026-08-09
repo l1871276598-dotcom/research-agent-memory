@@ -61,6 +61,14 @@ def _task_value(task, values, name):
     return values.get(name)
 
 
+def _trusted_task_value(task, values, name):
+    if name in task:
+        return True, task[name]
+    if name in values:
+        return True, values[name]
+    return False, None
+
+
 def _limit(values):
     limit = values.get("limit")
     if limit is not None and (
@@ -348,29 +356,23 @@ class ContextAgent(BaseAgent):
             original_input = embedded.get("input", {})
             if not isinstance(original_input, dict):
                 raise ValueError("input.task.input must be an object")
-            # GP10-02: embedded tasks must not smuggle scope fields that would
-            # override the trusted top-level workspace/project/confidentiality.
-            # Scope is authoritative only from the top-level task (injected by
-            # the Bridge). The embedded task's own scope values are tolerated
-            # ONLY when they equal the trusted top-level values (so existing
-            # callers that mirror scope into embedded tasks continue to work).
-            # A nested scope that differs is a cross-scope read attempt and
-            # must fail closed. Legacy context-free tasks (vault.read, etc.)
-            # carry workspace in input with no top-level — they are always
-            # exempt from the equality check because trusted scope is None.
-            for scopeKey in ("workspace", "project", "confidentiality"):
-                if scopeKey in original_input:
-                    embeddedVal = original_input[scopeKey]
-                    trustedVal = _task_value(task, values, scopeKey)
-                    if trustedVal is not None and embeddedVal != trustedVal:
-                        raise ValueError(f"input.task.input must not override {scopeKey}")
+            for scope_key in ("workspace", "project", "confidentiality"):
+                trusted, trusted_value = _trusted_task_value(task, values, scope_key)
+                for location, nested_values in (
+                    ("input.task", embedded),
+                    ("input.task.input", original_input),
+                ):
+                    if scope_key not in nested_values:
+                        continue
+                    if (
+                        not trusted
+                        or trusted_value is None
+                        or nested_values[scope_key] != trusted_value
+                    ):
+                        raise ValueError(f"{location} must not override {scope_key}")
             query = original_input.get("query") or original_input.get("task") or original_type
             workspace = _task_value(task, values, "workspace")
-            if "workspace" not in task:
-                workspace = _task_value(embedded, original_input, "workspace")
             project = _task_value(task, values, "project")
-            if "project" not in task:
-                project = _task_value(embedded, original_input, "project")
         else:
             query = values.get("query") or embedded
             workspace = _task_value(task, values, "workspace")
@@ -391,10 +393,9 @@ class ContextAgent(BaseAgent):
             workspace = _text(workspace, "workspace")
             if workspace not in _WORKSPACE_CHOICES:
                 raise ValueError("input.workspace must be personal or work")
-            if confidentiality is not None:
-                output = self.builder.build(query, limit, workspace, project, confidentiality)
-            else:
-                output = self.builder.build(query, limit, workspace, project)
+            if confidentiality not in {"public", "personal", "internal", "restricted"}:
+                raise ValueError("input.confidentiality is required and must be valid")
+            output = self.builder.build(query, limit, workspace, project, confidentiality)
         return self.result(task, output)
 
 

@@ -17,6 +17,15 @@ def _validate_task(task):
     return task_type
 
 
+def _trusted_context_scope(task):
+    values = task.get("input", {})
+    return {
+        name: task[name] if name in task else values[name]
+        for name in ("workspace", "project", "confidentiality")
+        if name in task or name in values
+    }
+
+
 class Orchestrator:
     def __init__(self, registry):
         if not isinstance(registry, AgentRegistry):
@@ -31,11 +40,15 @@ class Orchestrator:
             validate_result(result, target, task)
             return result
 
+        context_input = {"task": task}
         context_task = {
             "type": "context.build",
-            "input": {"task": task},
+            "input": context_input,
             "context_limit": task.get("context_limit", 8000),
         }
+        for name, value in _trusted_context_scope(task).items():
+            context_task[name] = value
+            context_input[name] = value
         context_agent = self.registry.select(context_task)
         context_result = context_agent.run(context_task, {})
         validate_result(context_result, context_agent, context_task)

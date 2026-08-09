@@ -309,56 +309,24 @@ def _handoff_lock(root, staging_dir):
             os.close(descriptor)
 
 
-def _require_source_backed_project(root, project_slug, workspace):
+def _require_source_backed_project(root, state_dir, project_slug, workspace):
     from memory import collect_validated_records
     from review.authority import AuthorityStore
 
-    # GP10-04: a pending activation can produce a record at status=active
-    # before the receipt is written. Raw collect_validated_records sees it;
-    # AuthorityStore.authorize_active_records blocks it. Handoff must gate
-    # through the Authority facade so a crash-window active state cannot
-    # produce a permanent handoff side-effect.
+    authority = AuthorityStore(root, state_dir)
     _, records, errors, _ = collect_validated_records(root)
     if errors:
         raise ValueError("handoff project validation failed")
 
-    # Run active records through the Authority filter so pending-activation
-    # projects are invisible. Fail closed on any Authority error.
-    try:
-        authority = AuthorityStore(root)
-    except Exception:
-        authority = None
-    filtered = None
-    if authority is not None:
-        try:
-            # authorize_active_records blocks when pending activation exists.
-            # We don't need the returned records — just the gate check.
-            _ = authority.authorize_active_records(records)
-            # Also check for a pending activation that targets this project.
-            pending = authority.pending_count()
-            if pending > 0:
-                # Check whether the pending activation targets the same project.
-                from pathlib import Path as _Path
-                import json as _json
-                for p in _Path(authority.activations).iterdir():
-                    if p.name.startswith(".tmp."):
-                        continue
-                    if p.suffix != ".json" or p.is_symlink() or not p.is_file():
-                        continue
-                    try:
-                        data = _json.loads(p.read_text(encoding="utf-8"))
-                    except Exception:
-                        continue
-                    for authorized in data.get("authorized_records", {}).values():
-                        if authorized.get("workspace") == workspace and authorized.get("project") == project_slug:
-                            raise ValueError("blocked: handoff project has pending activation")
-        except ValueError:
-            raise
-        except Exception:
-            pass  # Non-blocking Authority errors: let raw scan continue.
-
+    active_records = []
     for item in records:
-        record = item["record"]
+        record = dict(item["record"])
+        if record.get("status") != "active":
+            continue
+        record["relative_path"] = item["relative_path"]
+        active_records.append(record)
+
+    for record in authority.authorize_active_records(active_records):
         if (
             record.get("type") == "project"
             and record.get("status") == "active"
@@ -456,6 +424,7 @@ def update_project_handoff(
     expected_sha256=None,
     *,
     workspace,
+    state_dir,
 ):
     project_slug = _validate_project_slug(project_slug)
     expected_sha256 = _validate_sha256(expected_sha256)
@@ -474,7 +443,7 @@ def update_project_handoff(
         raise ValueError("invalid legacy handoff") from exc
     if legacy_info is not None and stat.S_ISLNK(legacy_info.st_mode):
         raise ValueError("invalid legacy handoff")
-    _require_source_backed_project(root, project_slug, workspace)
+    _require_source_backed_project(root, state_dir, project_slug, workspace)
 
     target_dir = root / "projects" / project_slug
     staging_dir = root / "_staging" / project_slug

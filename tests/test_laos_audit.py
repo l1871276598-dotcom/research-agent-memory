@@ -109,6 +109,7 @@ class ReviewWorkspaceAuditTests(unittest.TestCase):
             {
                 "type": "memory.review",
                 "workspace": "work",
+                "confidentiality": "internal",
                 "input": {
                     "action": "accept",
                     "candidate_id": candidate_id,
