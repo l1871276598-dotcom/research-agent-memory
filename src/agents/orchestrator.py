@@ -348,6 +348,22 @@ class ContextAgent(BaseAgent):
             original_input = embedded.get("input", {})
             if not isinstance(original_input, dict):
                 raise ValueError("input.task.input must be an object")
+            # GP10-02: embedded tasks must not smuggle scope fields that would
+            # override the trusted top-level workspace/project/confidentiality.
+            # Scope is authoritative only from the top-level task (injected by
+            # the Bridge). The embedded task's own scope values are tolerated
+            # ONLY when they equal the trusted top-level values (so existing
+            # callers that mirror scope into embedded tasks continue to work).
+            # A nested scope that differs is a cross-scope read attempt and
+            # must fail closed. Legacy context-free tasks (vault.read, etc.)
+            # carry workspace in input with no top-level — they are always
+            # exempt from the equality check because trusted scope is None.
+            for scopeKey in ("workspace", "project", "confidentiality"):
+                if scopeKey in original_input:
+                    embeddedVal = original_input[scopeKey]
+                    trustedVal = _task_value(task, values, scopeKey)
+                    if trustedVal is not None and embeddedVal != trustedVal:
+                        raise ValueError(f"input.task.input must not override {scopeKey}")
             query = original_input.get("query") or original_input.get("task") or original_type
             workspace = _task_value(task, values, "workspace")
             if "workspace" not in task:
