@@ -409,6 +409,96 @@ class MemoryDistillReviewTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("target memory not found", result.stderr)
 
+    def test_target_mutation_proposal_rejects_cross_project_or_context_partition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.init_root(tmp)
+            self.add_memory(
+                root,
+                title="Project A",
+                content="project a",
+                memory_type="project",
+                scope="project",
+                project="project-a",
+            )
+            self.add_memory(
+                root,
+                title="Project B",
+                content="project b",
+                memory_type="project",
+                scope="project",
+                project="project-b",
+            )
+            self.add_memory(
+                root,
+                title="Context A",
+                content="context a",
+                memory_type="context",
+                scope="context",
+                context_id="context-a",
+            )
+            self.distill_apply(
+                root,
+                action="create",
+                title="Context B",
+                content="context b",
+                memory_type="context",
+                scope="context",
+                context_id="context-b",
+            )
+            target_id = self.add_memory(
+                root,
+                title="Target",
+                content="target content",
+                scope="project",
+                project="project-a",
+                context_id="context-a",
+            )
+            for field, replacement in (
+                ("project", "project-b"),
+                ("context-id", "context-b"),
+            ):
+                with self.subTest(field=field):
+                    result = self.run_cli(
+                        DISTILL,
+                        "apply",
+                        "--root",
+                        root,
+                        "--state-dir",
+                        root.parent / "state",
+                        "--action",
+                        "UPDATE",
+                        "--target-id",
+                        target_id,
+                        "--type",
+                        "principle",
+                        "--title",
+                        f"Cross {field}",
+                        "--scope",
+                        "project",
+                        "--workspace",
+                        "personal",
+                        "--confidentiality",
+                        "personal",
+                        "--project",
+                        replacement if field == "project" else "project-a",
+                        "--context-id",
+                        replacement if field == "context-id" else "context-a",
+                        "--source",
+                        "manual:user_confirmed",
+                        "--confirmed",
+                        "--content",
+                        f"cross {field} candidate",
+                    )
+
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("target memory not found", result.stderr)
+                    self.assertFalse(
+                        any(
+                            record.get("title") == f"Cross {field}"
+                            for _, record in self.parsed_records(root).values()
+                        )
+                    )
+
     def test_accept_rejects_stale_target_before_index_or_file_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self.init_root(tmp)

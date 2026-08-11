@@ -1,9 +1,11 @@
+import argparse
 import hashlib
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -373,6 +375,17 @@ class HandoffUpdateTests(unittest.TestCase):
             workspace="personal",
             state_dir=self.state,
         )
+        project = self.root / "memory/projects/project-research-agent-memory-test.md"
+        self.assertEqual(created["authority_generation"], 0)
+        self.assertEqual(
+            created["authorized_project_binding"],
+            {
+                "memory_id": "project-research-agent-memory",
+                "relative_path": project.relative_to(self.root).as_posix(),
+                "artifact_sha256": hashlib.sha256(project.read_bytes()).hexdigest(),
+                "activation_id": None,
+            },
+        )
         self.assertIsNone(created["before_sha256"])
         self.assertEqual(created["after_sha256"], created["sha256"])
         body = dict(created)
@@ -398,6 +411,147 @@ class HandoffUpdateTests(unittest.TestCase):
         self.assertEqual(updated["previous_sha256"], created["sha256"])
         self.assertEqual(updated["after_sha256"], updated["sha256"])
         self.assertEqual(updated["expected_sha256"], created["sha256"])
+
+    def test_authority_generation_change_between_authorization_and_publication_is_rejected(self):
+        import handoff
+        from review.authority import AuthorityStore
+
+        authority = AuthorityStore(self.root, self.state)
+        real_handoff_lock = handoff._handoff_lock
+
+        @contextmanager
+        def generation_changes_after_authorization(root, staging_dir):
+            with real_handoff_lock(root, staging_dir):
+                authority._set_generation(0, 1)
+                yield
+
+        with mock.patch.object(
+            handoff, "_handoff_lock", generation_changes_after_authorization
+        ):
+            with self.assertRaisesRegex(ValueError, "handoff authority changed"):
+                handoff.update_project_handoff(
+                    self.root,
+                    "research-agent-memory",
+                    "content",
+                    workspace="personal",
+                    state_dir=self.state,
+                )
+
+        self.assertFalse(
+            (self.root / "projects/research-agent-memory/handoff.md").exists()
+        )
+
+    def test_pending_activation_created_during_handoff_staging_is_rejected(self):
+        import handoff
+        from review.authority import AuthorityStore
+
+        authority = AuthorityStore(self.root, self.state)
+        real_write_temp = handoff._write_temp
+
+        def stage_then_mark_pending(parent, rendered):
+            temp = real_write_temp(parent, rendered)
+            (authority.pending / ("mdec_" + "0" * 64 + ".json")).write_text(
+                "{}", encoding="utf-8"
+            )
+            return temp
+
+        with mock.patch.object(handoff, "_write_temp", side_effect=stage_then_mark_pending):
+            with self.assertRaisesRegex(ValueError, "pending activation"):
+                handoff.update_project_handoff(
+                    self.root,
+                    "research-agent-memory",
+                    "content",
+                    workspace="personal",
+                    state_dir=self.state,
+                )
+
+        target_dir = self.root / "projects/research-agent-memory"
+        self.assertFalse((target_dir / "handoff.md").exists())
+        self.assertFalse(list(target_dir.glob(".handoff-*.tmp")))
+
+    def test_project_artifact_changed_during_handoff_staging_is_rejected(self):
+        import handoff
+        from review.authority import AuthorityError
+
+        project = self.root / "memory/projects/project-research-agent-memory-test.md"
+        real_write_temp = handoff._write_temp
+
+        def stage_then_change_project(parent, rendered):
+            temp = real_write_temp(parent, rendered)
+            project.write_text(
+                project.read_text(encoding="utf-8").replace(
+                    "Project research-agent-memory", "Changed project", 1
+                ),
+                encoding="utf-8",
+            )
+            return temp
+
+        with mock.patch.object(handoff, "_write_temp", side_effect=stage_then_change_project):
+            with self.assertRaises(AuthorityError) as raised:
+                handoff.update_project_handoff(
+                    self.root,
+                    "research-agent-memory",
+                    "content",
+                    workspace="personal",
+                    state_dir=self.state,
+                )
+
+        self.assertEqual(raised.exception.code, "activation_receipt_missing")
+        self.assertFalse(
+            (self.root / "projects/research-agent-memory/handoff.md").exists()
+        )
+
+    def test_receipt_binds_activation_backed_project_authorization(self):
+        from handoff import update_project_handoff
+        import memory
+        from memory.candidate import CandidateStore
+        from review.gate import ReviewGate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            state = Path(tmp) / "state"
+            memory.init_store(root)
+            memory.db_init(argparse.Namespace(root=str(root), state_dir=str(state)))
+            created = CandidateStore(root, state).create(
+                {
+                    "type": "project",
+                    "title": "Project one",
+                    "scope": "project",
+                    "workspace": "personal",
+                    "confidentiality": "personal",
+                    "source": "manual:user_confirmed",
+                    "confidence": "confirmed",
+                    "content": "project one",
+                    "action": "create",
+                    "project": "project-one",
+                    "tags": [],
+                }
+            )
+            gate = ReviewGate(root, state)
+            decision = gate.review("accept", created["candidate_id"])
+            activation = gate.activate(
+                decision["decision_id"], decision["expected_active_generation"]
+            )
+
+            result = update_project_handoff(
+                root,
+                "project-one",
+                "content",
+                workspace="personal",
+                state_dir=state,
+            )
+
+            project = root / created["path"]
+            self.assertEqual(result["authority_generation"], 1)
+            self.assertEqual(
+                result["authorized_project_binding"],
+                {
+                    "memory_id": created["candidate_id"],
+                    "relative_path": created["path"],
+                    "artifact_sha256": hashlib.sha256(project.read_bytes()).hexdigest(),
+                    "activation_id": activation["activation_id"],
+                },
+            )
 
     def test_same_expected_sha256_allows_only_one_concurrent_update(self):
         from handoff import update_project_handoff

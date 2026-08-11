@@ -411,6 +411,42 @@ class AuthorityStore:
             raise AuthorityError("candidate_not_found", "candidate not found")
         return matches[0]
 
+    def _target_binding(self, target_id: str | None):
+        if target_id is None:
+            return None
+        if not _nonblank(target_id):
+            raise AuthorityError("target_invalid", "candidate target is invalid")
+        try:
+            row = self._row(target_id)
+        except AuthorityError as exc:
+            if exc.code == "candidate_not_found":
+                raise AuthorityError("target_not_found", "target memory not found") from exc
+            raise
+        record = row["record"]
+        workspace = record.get("workspace")
+        confidentiality = record.get("confidentiality")
+        project = record.get("project")
+        context_id = record.get("context_id")
+        if (
+            workspace not in {"personal", "work"}
+            or confidentiality not in _CONFIDENTIALITY_RANK
+            or (project is not None and not _nonblank(project))
+            or (context_id is not None and not _nonblank(context_id))
+        ):
+            raise AuthorityError("target_invalid", "target partition is invalid")
+        raw = _safe_regular_bytes(row["path"], root=self.root)
+        return {
+            "target_id": target_id,
+            "relative_path": row["relative_path"],
+            "artifact_sha256": hashlib.sha256(raw).hexdigest(),
+            "partition": {
+                "workspace": workspace,
+                "project": project,
+                "context_id": context_id,
+                "confidentiality": confidentiality,
+            },
+        }
+
     def _record_snapshot(
         self,
         memory_id: str,
@@ -418,6 +454,7 @@ class AuthorityStore:
         require_candidate: bool,
         reviewer_profile: ReviewerProfile | None = None,
         verify_provenance: bool = True,
+        bind_target: bool = True,
     ):
         if not _nonblank(memory_id):
             raise AuthorityError("invalid_candidate_id", "candidate_id must be non-empty")
@@ -526,6 +563,10 @@ class AuthorityStore:
             "requested_action": requested_action,
             "candidate_action": candidate_action,
         }
+        if bind_target:
+            target_binding = self._target_binding(record.get("target_id"))
+            if target_binding is not None:
+                snapshot["target_binding"] = target_binding
         return snapshot, record
 
     def snapshot_candidate(self, candidate_id: str):
@@ -615,12 +656,20 @@ class AuthorityStore:
             candidate_id,
             require_candidate=True,
             reviewer_profile=reviewer_profile,
+            bind_target=False,
         )
         self._validate_action(action, record)
         if validator is not None:
             if not callable(validator):
                 raise AuthorityError("validator_invalid", "decision validator is invalid")
             validator(copy.deepcopy(record), copy.deepcopy(snapshot))
+        snapshot, current_record = self._record_snapshot(
+            candidate_id,
+            require_candidate=True,
+            reviewer_profile=reviewer_profile,
+        )
+        if current_record != record:
+            raise AuthorityError("stale_candidate", "candidate changed during review")
         if reason is None:
             reason = "rejected by reviewer" if action == "reject" else "approved by reviewer"
         if not _nonblank(reason):
@@ -1004,7 +1053,9 @@ class AuthorityStore:
             count += 1
         return count
 
-    def authorize_active_records(self, records):
+    def authorize_active_records(self, records, *, include_bindings=False):
+        if not isinstance(include_bindings, bool):
+            raise AuthorityError("visibility_invalid", "active record binding is invalid")
         if self.pending_count():
             raise AuthorityError(
                 "activation_pending", "active visibility is blocked by pending activation"
@@ -1040,6 +1091,11 @@ class AuthorityStore:
                 "artifact_sha256": hashlib.sha256(raw).hexdigest(),
             }
             if baseline.get(memory_id) == binding:
+                if include_bindings:
+                    record["authority_binding"] = {
+                        **binding,
+                        "activation_id": None,
+                    }
                 authorized.append(record)
                 continue
             receipt = receipts.get(memory_id)
@@ -1049,6 +1105,11 @@ class AuthorityStore:
                     "active memory lacks a matching activation receipt",
                 )
             record["authority_receipt_id"] = receipt["activation_id"]
+            if include_bindings:
+                record["authority_binding"] = {
+                    **binding,
+                    "activation_id": receipt["activation_id"],
+                }
             authorized.append(record)
         return authorized
 

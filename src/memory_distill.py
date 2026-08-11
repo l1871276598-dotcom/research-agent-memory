@@ -157,21 +157,40 @@ def _merge_unique(left, right):
     return result
 
 
-def _same_partition(record, workspace, confidentiality):
+_PARTITION_FIELDS = ("workspace", "project", "context_id", "confidentiality")
+
+
+def _same_partition(record, values):
+    get = (
+        values.get
+        if isinstance(values, dict)
+        else lambda name: getattr(values, name, None)
+    )
+    return all(record.get(field) == get(field) for field in _PARTITION_FIELDS)
+
+
+def _same_reference_visibility(record, values):
+    get = (
+        values.get
+        if isinstance(values, dict)
+        else lambda name: getattr(values, name, None)
+    )
     return (
-        record.get("workspace") == workspace
-        and record.get("confidentiality") == confidentiality
+        record.get("workspace") == get("workspace")
+        and record.get("confidentiality") == get("confidentiality")
     )
 
 
 def _validate_partition_references(records, values):
-    get = values.get if isinstance(values, dict) else lambda name: getattr(values, name, None)
-    workspace = get("workspace")
-    confidentiality = get("confidentiality")
+    get = (
+        values.get
+        if isinstance(values, dict)
+        else lambda name: getattr(values, name, None)
+    )
     visible = [
         item["record"]
         for item in records.values()
-        if _same_partition(item["record"], workspace, confidentiality)
+        if _same_reference_visibility(item["record"], values)
     ]
     project = get("project")
     if get("type") != "project" and (get("scope") == "project" or project) and not any(
@@ -213,7 +232,7 @@ def _normalized_action(requested, records, args):
     partition = [
         item
         for item in records.values()
-        if _same_partition(item["record"], args.workspace, args.confidentiality)
+        if _same_partition(item["record"], args)
     ]
     for item in partition:
         record = item["record"]
@@ -267,7 +286,7 @@ def _validate_proposal(root, records, args, action):
     target = records.get(args.target_id) if args.target_id else None
     if args.target_id and (
         target is None
-        or not _same_partition(target["record"], args.workspace, args.confidentiality)
+        or not _same_partition(target["record"], args)
     ):
         raise DistillError("invalid_transition", "target memory not found", True, "select_target")
     if action in {"UPDATE", "DEPRECATE"} and target["record"].get("status") != "active":
@@ -491,11 +510,7 @@ def _preflight_candidate_impl(root, candidate, review_action, state_dir=None):
         _validate_partition_references(records, candidate)
         if target_id and (
             target_item is None
-            or not _same_partition(
-                target_item["record"],
-                candidate.get("workspace"),
-                candidate.get("confidentiality"),
-            )
+            or not _same_partition(target_item["record"], candidate)
         ):
             raise DistillError(
                 "invalid_transition", "target memory not found", False, "select_target"
@@ -518,11 +533,7 @@ def _preflight_candidate_impl(root, candidate, review_action, state_dir=None):
             )
             or (
                 target_item is not None
-                and not _same_partition(
-                    target_item["record"],
-                    candidate.get("workspace"),
-                    candidate.get("confidentiality"),
-                )
+                and not _same_partition(target_item["record"], candidate)
             )
         )
     ):
@@ -709,11 +720,7 @@ def _accept_candidate_impl(args, authority=None):
             target_id
             and requested_action != "context_transition"
             and target_item is not None
-            and not _same_partition(
-                target_item["record"],
-                candidate.get("workspace"),
-                candidate.get("confidentiality"),
-            )
+            and not _same_partition(target_item["record"], candidate)
         ):
             raise DistillError(
                 "invalid_transition", "target memory not found", False, "select_target"
@@ -852,11 +859,7 @@ def _conflict_candidate_impl(args, authority=None):
     target_item = records.get(target_id) if target_id else None
     if target_id and (
         target_item is None
-        or not _same_partition(
-            target_item["record"],
-            candidate.get("workspace"),
-            candidate.get("confidentiality"),
-        )
+        or not _same_partition(target_item["record"], candidate)
     ):
         raise DistillError(
             "invalid_transition", "target memory not found", False, "select_target"

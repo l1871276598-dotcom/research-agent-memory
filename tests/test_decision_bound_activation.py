@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import json
 import sys
 import tempfile
 import unittest
@@ -45,6 +47,55 @@ class DecisionBoundActivationTests(unittest.TestCase):
         from memory.candidate import CandidateStore
 
         return CandidateStore(self.root, self.state).create(self.values(**overrides))
+
+    def write_active_memory(self, memory_id, memory_type, title, scope, content, **fields):
+        import memory
+
+        record = {
+            "id": memory_id,
+            "type": memory_type,
+            "title": title,
+            "created": "2026-08-10",
+            "updated": "2026-08-10",
+            "status": "active",
+            "scope": scope,
+            "workspace": "personal",
+            "confidentiality": "personal",
+            "source": "test",
+            "confidence": "confirmed",
+            "content": content,
+            "tags": [],
+            **fields,
+        }
+        path = self.root / memory.TYPE_DIRS[memory_type] / f"{memory_id}-fixture.md"
+        path.write_text(memory.render_memory(record), encoding="utf-8")
+        return path
+
+    def create_target_mutation(self):
+        self.write_active_memory(
+            "project-a", "project", "Project A", "project", "project a", project="project-a"
+        )
+        self.write_active_memory(
+            "context-a", "context", "Context A", "context", "context a", context_id="context-a"
+        )
+        target_path = self.write_active_memory(
+            "target-memory",
+            "principle",
+            "Target memory",
+            "project",
+            "target content",
+            project="project-a",
+            context_id="context-a",
+        )
+        created = self.create_candidate(
+            action="merge",
+            title="Target mutation candidate",
+            scope="project",
+            project="project-a",
+            context_id="context-a",
+            target_id="target-memory",
+        )
+        return created, target_path
 
     def status(self, memory_id):
         from memory.store import MemoryStore
@@ -151,6 +202,100 @@ class DecisionBoundActivationTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "provenance_changed")
         self.assertEqual(self.status(created["candidate_id"]), "candidate")
+
+    def test_target_binding_is_transitive_in_decision_and_activation_receipt(self):
+        from review.gate import ReviewGate
+
+        created, target_path = self.create_target_mutation()
+        gate = ReviewGate(self.root, self.state)
+
+        decision = gate.review("merge", created["candidate_id"])
+
+        binding = gate.authority_store.read_decision(decision["decision_id"])[
+            "candidate_snapshot"
+        ]["target_binding"]
+        self.assertEqual(
+            binding,
+            {
+                "target_id": "target-memory",
+                "relative_path": target_path.relative_to(self.root).as_posix(),
+                "artifact_sha256": hashlib.sha256(target_path.read_bytes()).hexdigest(),
+                "partition": {
+                    "workspace": "personal",
+                    "project": "project-a",
+                    "context_id": "context-a",
+                    "confidentiality": "personal",
+                },
+            },
+        )
+
+        gate.activate(decision["decision_id"], decision["expected_active_generation"])
+
+        receipt = json.loads(
+            (gate.authority_store.activations / f"{decision['decision_id']}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(receipt["candidate_before"]["target_binding"], binding)
+        self.assertEqual(
+            receipt["candidate_after"]["target_binding"]["target_id"], "target-memory"
+        )
+        self.assertNotEqual(
+            receipt["candidate_after"]["target_binding"]["artifact_sha256"],
+            binding["artifact_sha256"],
+        )
+
+    def test_target_artifact_drift_is_rejected_before_activation_mutation(self):
+        from review import AuthorityError
+        from review.gate import ReviewGate
+
+        created, target_path = self.create_target_mutation()
+        gate = ReviewGate(self.root, self.state)
+        decision = gate.review("merge", created["candidate_id"])
+        target_path.write_text(
+            target_path.read_text(encoding="utf-8").replace(
+                "target content", "changed target content", 1
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(AuthorityError) as raised:
+            gate.activate(decision["decision_id"], decision["expected_active_generation"])
+
+        self.assertEqual(raised.exception.code, "stale_candidate")
+        self.assertEqual(self.status(created["candidate_id"]), "candidate")
+        self.assertEqual(gate.authority_store.current_generation(), 0)
+        self.assertFalse(
+            (gate.authority_store.activations / f"{decision['decision_id']}.json").exists()
+        )
+
+    def test_target_partition_drift_is_rejected_before_activation_mutation(self):
+        import memory
+        from review import AuthorityError
+        from review.gate import ReviewGate
+
+        created, target_path = self.create_target_mutation()
+        self.write_active_memory(
+            "project-b", "project", "Project B", "project", "project b", project="project-b"
+        )
+        gate = ReviewGate(self.root, self.state)
+        decision = gate.review("merge", created["candidate_id"])
+        target, errors = memory.parse_front_matter(target_path)
+        self.assertEqual(errors, [])
+        target["project"] = "project-b"
+        target_path.write_text(
+            memory.render_existing_memory(target_path, target), encoding="utf-8"
+        )
+
+        with self.assertRaises(AuthorityError) as raised:
+            gate.activate(decision["decision_id"], decision["expected_active_generation"])
+
+        self.assertEqual(raised.exception.code, "stale_candidate")
+        self.assertEqual(self.status(created["candidate_id"]), "candidate")
+        self.assertEqual(gate.authority_store.current_generation(), 0)
+        self.assertFalse(
+            (gate.authority_store.activations / f"{decision['decision_id']}.json").exists()
+        )
 
     def test_unreceipted_postbaseline_active_memory_is_not_visible(self):
         import memory
