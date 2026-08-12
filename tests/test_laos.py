@@ -321,6 +321,29 @@ class OrchestratorTests(unittest.TestCase):
         self.assertFalse(hasattr(kernel, "memory"))
         self.assertFalse(hasattr(kernel, "review_gate"))
 
+    def test_implicit_context_wrapper_mirrors_trusted_scope_with_top_level_precedence(self):
+        kernel, _, context_agent, _, _ = self.make_kernel()
+        task = {
+            "type": "memory.search",
+            "workspace": "personal",
+            "project": "project-one",
+            "confidentiality": "public",
+            "input": {"query": "PDC"},
+        }
+
+        kernel.run(task)
+
+        context_task, _ = context_agent.calls[0]
+        self.assertIs(context_task["input"]["task"], task)
+        for name, value in (
+            ("workspace", "personal"),
+            ("project", "project-one"),
+            ("confidentiality", "public"),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(context_task[name], value)
+                self.assertEqual(context_task["input"][name], value)
+
     def test_constructor_requires_agent_registry(self):
         with self.assertRaises(ValueError):
             Orchestrator(object())
@@ -1835,8 +1858,8 @@ class RecordingBuilder:
         self.calls.append(("empty", limit))
         return {"text": "", "sources": [], "limit": limit, "used": 0}
 
-    def build(self, query, limit, workspace=None, project=None):
-        self.calls.append((query, limit, workspace, project))
+    def build(self, query, limit, workspace=None, project=None, confidentiality=None):
+        self.calls.append((query, limit, workspace, project, confidentiality))
         return {"text": query, "limit": limit}
 
 
@@ -1873,6 +1896,9 @@ class ConcreteAgentTests(unittest.TestCase):
             },
             {
                 "type": "context.build",
+                "workspace": "work",
+                "project": "p1",
+                "confidentiality": "internal",
                 "context_limit": 120,
                 "input": {
                     "task": {
@@ -1881,6 +1907,7 @@ class ConcreteAgentTests(unittest.TestCase):
                             "query": "original query",
                             "workspace": "work",
                             "project": "p1",
+                            "confidentiality": "internal",
                         },
                     }
                 },
@@ -1896,7 +1923,10 @@ class ConcreteAgentTests(unittest.TestCase):
             self.gate.calls,
             [("reject", "candidate-1", "duplicate", "personal")],
         )
-        self.assertEqual(self.builder.calls, [("original query", 120, "work", "p1")])
+        self.assertEqual(
+            self.builder.calls,
+            [("original query", 120, "work", "p1", "internal")],
+        )
 
     def test_context_agent_query_falls_back_to_task_then_type(self):
         from agents.orchestrator import ContextAgent
@@ -1905,10 +1935,16 @@ class ConcreteAgentTests(unittest.TestCase):
         agent.run(
             {
                 "type": "context.build",
+                "workspace": "personal",
+                "confidentiality": "personal",
                 "input": {
                     "task": {
                         "type": "memory.create",
-                        "input": {"task": "draft paper", "workspace": "personal"},
+                        "input": {
+                            "task": "draft paper",
+                            "workspace": "personal",
+                            "confidentiality": "personal",
+                        },
                     }
                 },
             },
@@ -1917,10 +1953,12 @@ class ConcreteAgentTests(unittest.TestCase):
         agent.run(
             {
                 "type": "context.build",
+                "workspace": "work",
+                "confidentiality": "internal",
                 "input": {
                     "task": {
                         "type": "memory.search",
-                        "input": {"workspace": "work"},
+                        "input": {"workspace": "work", "confidentiality": "internal"},
                     }
                 },
             },
@@ -1929,6 +1967,28 @@ class ConcreteAgentTests(unittest.TestCase):
 
         self.assertEqual(self.builder.calls[0][0], "draft paper")
         self.assertEqual(self.builder.calls[1][0], "memory.search")
+
+    def test_orchestrator_propagates_public_confidentiality_to_context_builder(self):
+        from agents.orchestrator import ContextAgent
+
+        builder = RecordingBuilder()
+        events = []
+        target = RecordingAgent("search_agent", ["memory.search"], events, {"results": []})
+        kernel = Orchestrator(AgentRegistry([ContextAgent(builder), target]))
+        task = {
+            "type": "memory.search",
+            "workspace": "personal",
+            "project": "project-one",
+            "confidentiality": "public",
+            "input": {"query": "public query"},
+        }
+
+        kernel.run(task)
+
+        self.assertEqual(
+            builder.calls,
+            [("public query", 8000, "personal", "project-one", "public")],
+        )
 
     def test_context_agent_requires_workspace_before_builder_call(self):
         from agents.orchestrator import ContextAgent
@@ -1993,22 +2053,29 @@ class ConcreteAgentTests(unittest.TestCase):
             ],
         )
 
-    def test_context_agent_accepts_build_only_adapter_for_scoped_tasks(self):
+    def test_context_agent_uses_confidentiality_aware_builder_for_scoped_tasks(self):
         from agents.orchestrator import ContextAgent
 
-        class BuildOnlyBuilder:
-            def build(self, query, limit, workspace=None, project=None):
+        class ConfidentialityAwareBuilder:
+            def build(self, query, limit, workspace=None, project=None, confidentiality=None):
                 return {"text": query, "sources": [], "limit": limit, "used": len(query)}
 
-        agent = ContextAgent(BuildOnlyBuilder())
-        task = {"type": "context.build", "input": {"query": "PDC", "workspace": "work"}}
+        agent = ContextAgent(ConfidentialityAwareBuilder())
+        task = {
+            "type": "context.build",
+            "input": {
+                "query": "PDC",
+                "workspace": "work",
+                "confidentiality": "internal",
+            },
+        }
 
         result = agent.run(task, {})
 
         self.assertIs(validate_result(result, agent, task), result)
         self.assertEqual(result["output"]["text"], "PDC")
 
-    def test_context_agent_prefers_top_level_metadata_and_keeps_input_compatibility(self):
+    def test_context_agent_prefers_outer_metadata_and_accepts_matching_embedded_scope(self):
         from agents.orchestrator import ContextAgent
 
         agent = ContextAgent(self.builder)
@@ -2017,11 +2084,13 @@ class ConcreteAgentTests(unittest.TestCase):
                 "type": "context.build",
                 "workspace": "work",
                 "project": "top-level-project",
+                "confidentiality": "internal",
                 "context_limit": 90,
                 "input": {
                     "query": "direct query",
                     "workspace": "personal",
                     "project": "input-project",
+                    "confidentiality": "public",
                 },
             },
             {},
@@ -2029,16 +2098,21 @@ class ConcreteAgentTests(unittest.TestCase):
         agent.run(
             {
                 "type": "context.build",
+                "workspace": "work",
+                "project": "embedded-top-level",
+                "confidentiality": "internal",
                 "context_limit": 91,
                 "input": {
                     "task": {
                         "type": "memory.search",
                         "workspace": "work",
                         "project": "embedded-top-level",
+                        "confidentiality": "internal",
                         "input": {
                             "query": "embedded query",
-                            "workspace": "personal",
-                            "project": "embedded-input",
+                            "workspace": "work",
+                            "project": "embedded-top-level",
+                            "confidentiality": "internal",
                         },
                     }
                 },
@@ -2048,6 +2122,9 @@ class ConcreteAgentTests(unittest.TestCase):
         agent.run(
             {
                 "type": "context.build",
+                "workspace": "personal",
+                "project": "compatibility-project",
+                "confidentiality": "personal",
                 "context_limit": 92,
                 "input": {
                     "task": {
@@ -2056,6 +2133,7 @@ class ConcreteAgentTests(unittest.TestCase):
                             "query": "compatibility query",
                             "workspace": "personal",
                             "project": "compatibility-project",
+                            "confidentiality": "personal",
                         },
                     }
                 },
@@ -2066,11 +2144,70 @@ class ConcreteAgentTests(unittest.TestCase):
         self.assertEqual(
             self.builder.calls,
             [
-                ("direct query", 90, "work", "top-level-project"),
-                ("embedded query", 91, "work", "embedded-top-level"),
-                ("compatibility query", 92, "personal", "compatibility-project"),
+                ("direct query", 90, "work", "top-level-project", "internal"),
+                ("embedded query", 91, "work", "embedded-top-level", "internal"),
+                ("compatibility query", 92, "personal", "compatibility-project", "personal"),
             ],
         )
+
+    def test_context_agent_rejects_embedded_scope_overrides_at_both_levels(self):
+        from agents.orchestrator import ContextAgent
+
+        builder = RecordingBuilder()
+        agent = ContextAgent(builder)
+        trusted = {
+            "workspace": "work",
+            "project": "project-A",
+            "confidentiality": "public",
+        }
+        overrides = {
+            "workspace": "personal",
+            "project": "project-B",
+            "confidentiality": "internal",
+        }
+        for location in ("top", "input"):
+            for name, override in overrides.items():
+                embedded = {"type": "memory.search", "input": {"query": "scope probe"}}
+                if location == "top":
+                    embedded[name] = override
+                else:
+                    embedded["input"][name] = override
+                task = {"type": "context.build", **trusted, "input": {"task": embedded}}
+                with self.subTest(location=location, name=name):
+                    with self.assertRaisesRegex(ValueError, "must not override"):
+                        agent.run(task, {})
+        self.assertEqual(builder.calls, [])
+
+    def test_context_agent_rejects_embedded_scope_without_a_trusted_outer_scope(self):
+        from agents.orchestrator import ContextAgent
+
+        builder = RecordingBuilder()
+        agent = ContextAgent(builder)
+        task = {
+            "type": "context.build",
+            "input": {
+                "task": {
+                    "type": "memory.search",
+                    "workspace": "work",
+                    "input": {"query": "scope probe", "workspace": "work"},
+                }
+            },
+        }
+
+        with self.assertRaises(ValueError):
+            agent.run(task, {})
+        self.assertEqual(builder.calls, [])
+
+    def test_context_agent_rejects_missing_confidentiality_for_scoped_contexts(self):
+        from agents.orchestrator import ContextAgent
+
+        builder = RecordingBuilder()
+        agent = ContextAgent(builder)
+        task = {"type": "context.build", "input": {"query": "PDC", "workspace": "work"}}
+
+        with self.assertRaisesRegex(ValueError, "confidentiality"):
+            agent.run(task, {})
+        self.assertEqual(builder.calls, [])
 
     def test_review_and_context_agents_reject_malformed_tasks(self):
         from agents.orchestrator import ContextAgent, ReviewAgent
@@ -2290,11 +2427,17 @@ class ContextBuilderTests(unittest.TestCase):
         agent = ContextAgent(ContextBuilder(MemoryStore(self.root)))
         task = {
             "type": "context.build",
+            "workspace": "work",
+            "confidentiality": "internal",
             "context_limit": 200,
             "input": {
                 "task": {
                     "type": "memory.search",
-                    "input": {"query": "PDC", "workspace": "work"},
+                    "input": {
+                        "query": "PDC",
+                        "workspace": "work",
+                        "confidentiality": "internal",
+                    },
                 }
             },
         }
@@ -2527,12 +2670,13 @@ class RealAgentStorageTests(unittest.TestCase):
         task = {
             "type": "import.file",
             "workspace": "personal",
+            "confidentiality": "personal",
             "input": {"path": str(source)},
         }
 
         result = kernel.run(task)
 
-        self.assertEqual(builder.calls, [("import.file", 8000, "personal", None)])
+        self.assertEqual(builder.calls, [("import.file", 8000, "personal", None, "personal")])
         self.assertTrue(result["output"]["written_paths"])
 
     def test_real_orchestrator_runs_legacy_import_without_workspace(self):
@@ -2566,12 +2710,13 @@ class RealAgentStorageTests(unittest.TestCase):
         task = {
             "type": "memory.review",
             "workspace": "work",
+            "confidentiality": "internal",
             "input": {"action": "reject", "candidate_id": "candidate-1"},
         }
 
         result = kernel.run(task)
 
-        self.assertEqual(builder.calls, [("memory.review", 8000, "work", None)])
+        self.assertEqual(builder.calls, [("memory.review", 8000, "work", None, "internal")])
         self.assertEqual(
             gate.calls,
             [("reject", "candidate-1", None, "work")],
@@ -2807,13 +2952,21 @@ class PipelineTests(unittest.TestCase):
         search = self.run_task(
             {
                 "type": "memory.search",
-                "input": {"query": "pipeline evidence", "workspace": "personal"},
+                "input": {
+                    "query": "pipeline evidence",
+                    "workspace": "personal",
+                    "confidentiality": "personal",
+                },
             }
         )
         context = self.run_task(
             {
                 "type": "context.build",
-                "input": {"query": "pipeline evidence", "workspace": "personal"},
+                "input": {
+                    "query": "pipeline evidence",
+                    "workspace": "personal",
+                    "confidentiality": "personal",
+                },
             }
         )
         self.assertEqual(search.returncode, 0, search.stderr)
@@ -2830,7 +2983,11 @@ class PipelineTests(unittest.TestCase):
             json.dumps(
                 {
                     "type": "context.build",
-                    "input": {"query": "nothing", "workspace": "personal"},
+                    "input": {
+                        "query": "nothing",
+                        "workspace": "personal",
+                        "confidentiality": "personal",
+                    },
                 }
             ),
             encoding="utf-8",
@@ -2852,7 +3009,11 @@ class PipelineTests(unittest.TestCase):
             json.dumps(
                 {
                     "type": "context.build",
-                    "input": {"query": "nothing", "workspace": "personal"},
+                    "input": {
+                        "query": "nothing",
+                        "workspace": "personal",
+                        "confidentiality": "personal",
+                    },
                 }
             ),
             encoding="utf-8-sig",

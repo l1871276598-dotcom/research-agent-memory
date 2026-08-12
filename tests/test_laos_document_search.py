@@ -45,6 +45,7 @@ class LaosDocumentSearchTests(unittest.TestCase):
     def run_search(self, *, project=None, limit=None, top_level_workspace=False):
         task = {
             "type": "memory.search",
+            "confidentiality": "personal",
             "input": {
                 "query": "indexed bridge phrase",
             },

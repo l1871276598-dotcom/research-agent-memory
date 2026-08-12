@@ -411,6 +411,42 @@ class AuthorityStore:
             raise AuthorityError("candidate_not_found", "candidate not found")
         return matches[0]
 
+    def _target_binding(self, target_id: str | None):
+        if target_id is None:
+            return None
+        if not _nonblank(target_id):
+            raise AuthorityError("target_invalid", "candidate target is invalid")
+        try:
+            row = self._row(target_id)
+        except AuthorityError as exc:
+            if exc.code == "candidate_not_found":
+                raise AuthorityError("target_not_found", "target memory not found") from exc
+            raise
+        record = row["record"]
+        workspace = record.get("workspace")
+        confidentiality = record.get("confidentiality")
+        project = record.get("project")
+        context_id = record.get("context_id")
+        if (
+            workspace not in {"personal", "work"}
+            or confidentiality not in _CONFIDENTIALITY_RANK
+            or (project is not None and not _nonblank(project))
+            or (context_id is not None and not _nonblank(context_id))
+        ):
+            raise AuthorityError("target_invalid", "target partition is invalid")
+        raw = _safe_regular_bytes(row["path"], root=self.root)
+        return {
+            "target_id": target_id,
+            "relative_path": row["relative_path"],
+            "artifact_sha256": hashlib.sha256(raw).hexdigest(),
+            "partition": {
+                "workspace": workspace,
+                "project": project,
+                "context_id": context_id,
+                "confidentiality": confidentiality,
+            },
+        }
+
     def _record_snapshot(
         self,
         memory_id: str,
@@ -418,6 +454,7 @@ class AuthorityStore:
         require_candidate: bool,
         reviewer_profile: ReviewerProfile | None = None,
         verify_provenance: bool = True,
+        bind_target: bool = True,
     ):
         if not _nonblank(memory_id):
             raise AuthorityError("invalid_candidate_id", "candidate_id must be non-empty")
@@ -526,6 +563,10 @@ class AuthorityStore:
             "requested_action": requested_action,
             "candidate_action": candidate_action,
         }
+        if bind_target:
+            target_binding = self._target_binding(record.get("target_id"))
+            if target_binding is not None:
+                snapshot["target_binding"] = target_binding
         return snapshot, record
 
     def snapshot_candidate(self, candidate_id: str):
@@ -615,12 +656,20 @@ class AuthorityStore:
             candidate_id,
             require_candidate=True,
             reviewer_profile=reviewer_profile,
+            bind_target=False,
         )
         self._validate_action(action, record)
         if validator is not None:
             if not callable(validator):
                 raise AuthorityError("validator_invalid", "decision validator is invalid")
             validator(copy.deepcopy(record), copy.deepcopy(snapshot))
+        snapshot, current_record = self._record_snapshot(
+            candidate_id,
+            require_candidate=True,
+            reviewer_profile=reviewer_profile,
+        )
+        if current_record != record:
+            raise AuthorityError("stale_candidate", "candidate changed during review")
         if reason is None:
             reason = "rejected by reviewer" if action == "reject" else "approved by reviewer"
         if not _nonblank(reason):
@@ -730,6 +779,33 @@ class AuthorityStore:
                 }
         return result
 
+    @staticmethod
+    def _binding_valid(binding) -> bool:
+        return (
+            isinstance(binding, dict)
+            and set(binding) == {"relative_path", "artifact_sha256"}
+            and _nonblank(binding.get("relative_path"))
+            and isinstance(binding.get("artifact_sha256"), str)
+            and _SHA256.fullmatch(binding["artifact_sha256"]) is not None
+        )
+
+    @classmethod
+    def _active_map_valid(cls, records) -> bool:
+        return isinstance(records, dict) and all(
+            _nonblank(memory_id) and cls._binding_valid(binding)
+            for memory_id, binding in records.items()
+        )
+
+    @classmethod
+    def _snapshot_binding(cls, snapshot):
+        if not isinstance(snapshot, dict):
+            return None
+        binding = {
+            "relative_path": snapshot.get("relative_path"),
+            "artifact_sha256": snapshot.get("artifact_sha256"),
+        }
+        return binding if cls._binding_valid(binding) else None
+
     def _ensure_baseline(self):
         if self.baseline_path.exists():
             self._baseline()
@@ -758,7 +834,7 @@ class AuthorityStore:
         if payload.get("schema_version") != 1 or digest != _digest(body):
             raise AuthorityError("baseline_invalid", "authority baseline is invalid")
         records = payload.get("records")
-        if not isinstance(records, dict):
+        if not self._active_map_valid(records):
             raise AuthorityError("baseline_invalid", "authority baseline is invalid")
         return payload
 
@@ -819,7 +895,42 @@ class AuthorityStore:
         }
         if activation_id != "mact_" + _digest(identity):
             raise AuthorityError("activation_invalid", "activation identity mismatch")
+        if not self._active_map_valid(receipt.get("authorized_records")):
+            raise AuthorityError("activation_invalid", "activation receipt is invalid")
         return receipt
+
+    def _validate_pending(self, pending, decision, before, expected_generation):
+        required = {
+            "schema_version",
+            "decision_id",
+            "decision_sha256",
+            "candidate_before",
+            "previous_generation",
+            "active_before",
+            "prepared_at",
+            "pending_sha256",
+        }
+        if (
+            not isinstance(pending, dict)
+            or set(pending) != required
+            or pending.get("schema_version") != 1
+            or pending.get("decision_id") != decision["decision_id"]
+            or pending.get("decision_sha256") != decision["decision_sha256"]
+            or pending.get("candidate_before") != before
+            or isinstance(pending.get("previous_generation"), bool)
+            or pending.get("previous_generation") != expected_generation
+            or not _nonblank(pending.get("prepared_at"))
+            or not self._active_map_valid(pending.get("active_before"))
+        ):
+            raise AuthorityError("pending_invalid", "pending activation is invalid")
+        body = dict(pending)
+        digest = body.pop("pending_sha256")
+        if (
+            not isinstance(digest, str)
+            or _SHA256.fullmatch(digest) is None
+            or digest != _digest(body)
+        ):
+            raise AuthorityError("pending_invalid", "pending activation is invalid")
 
     def _remove_pending(self, path: Path) -> None:
         try:
@@ -843,6 +954,96 @@ class AuthorityStore:
             return status_value == "conflicted" and audit == "conflict"
         return status_value in {"active", "archived"} and audit == "accepted"
 
+    def _authorized_active_records(
+        self,
+        *,
+        before,
+        candidate_after,
+        record_after,
+        active_before,
+        active_after,
+    ):
+        candidate_id = before.get("candidate_id")
+        candidate_binding = self._snapshot_binding(candidate_after)
+        if (
+            not _nonblank(candidate_id)
+            or candidate_after.get("candidate_id") != candidate_id
+            or candidate_binding is None
+            or candidate_id in active_before
+        ):
+            raise AuthorityError("outcome_uncertain", "activation outcome is uncertain")
+
+        allowed = {candidate_id}
+        target_id = None
+        target_before = before.get("target_binding")
+        if target_before is not None:
+            target_id = target_before.get("target_id") if isinstance(target_before, dict) else None
+            target_binding = self._snapshot_binding(target_before)
+            target_after = candidate_after.get("target_binding")
+            target_after_id = (
+                target_after.get("target_id") if isinstance(target_after, dict) else None
+            )
+            target_after_binding = self._snapshot_binding(target_after)
+            if (
+                not _nonblank(target_id)
+                or target_binding is None
+                or target_after_id != target_id
+                or target_after_binding is None
+            ):
+                raise AuthorityError("outcome_uncertain", "activation outcome is uncertain")
+            allowed.add(target_id)
+            if (
+                before.get("candidate_action") in {"UPDATE", "DEPRECATE"}
+                or before.get("requested_action") == "context_transition"
+            ) and active_before.get(target_id) != target_binding:
+                raise AuthorityError("outcome_uncertain", "activation outcome is uncertain")
+            if target_id in active_before and active_before[target_id] != target_binding:
+                raise AuthorityError("outcome_uncertain", "activation outcome is uncertain")
+            if target_id in active_after and (
+                active_before.get(target_id) != target_binding
+                or active_after[target_id] != target_after_binding
+            ):
+                raise AuthorityError("outcome_uncertain", "activation outcome is uncertain")
+
+        new_record = None
+        if before.get("requested_action") == "context_transition":
+            try:
+                new_record = json.loads(record_after["new_record_json"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise AuthorityError(
+                    "outcome_uncertain", "activation outcome is uncertain"
+                ) from exc
+            new_id = new_record.get("id") if isinstance(new_record, dict) else None
+            if not _nonblank(new_id) or new_id in allowed or new_id in active_before:
+                raise AuthorityError("outcome_uncertain", "activation outcome is uncertain")
+            allowed.add(new_id)
+            if new_id in active_after:
+                try:
+                    new_row = self._row(new_id)
+                except AuthorityError as exc:
+                    raise AuthorityError(
+                        "outcome_uncertain", "activation outcome is uncertain"
+                    ) from exc
+                if new_row["record"] != new_record:
+                    raise AuthorityError(
+                        "outcome_uncertain", "activation outcome is uncertain"
+                    )
+
+        changed = {
+            memory_id
+            for memory_id in set(active_before) | set(active_after)
+            if active_before.get(memory_id) != active_after.get(memory_id)
+        }
+        if changed - allowed:
+            raise AuthorityError("outcome_uncertain", "activation outcome is uncertain")
+        if candidate_id in active_after and active_after[candidate_id] != candidate_binding:
+            raise AuthorityError("outcome_uncertain", "activation outcome is uncertain")
+        return {
+            memory_id: binding
+            for memory_id, binding in active_after.items()
+            if memory_id in changed
+        }
+
     def _commit_receipt(
         self,
         *,
@@ -859,11 +1060,13 @@ class AuthorityStore:
         if not self._postcondition(decision, record_after):
             raise AuthorityError("outcome_uncertain", "activation outcome is uncertain")
         active_after = self._active_map()
-        authorized_records = {
-            memory_id: value
-            for memory_id, value in active_after.items()
-            if active_before.get(memory_id) != value
-        }
+        authorized_records = self._authorized_active_records(
+            before=before,
+            candidate_after=candidate_after,
+            record_after=record_after,
+            active_before=active_before,
+            active_after=active_after,
+        )
         previous = decision["expected_active_generation"]
         target = previous + 1
         result_hash = _digest(backend_result)
@@ -924,16 +1127,12 @@ class AuthorityStore:
                 pending = _decode_canonical(
                     _safe_regular_bytes(pending_path), name="pending activation"
                 )
-                if (
-                    not isinstance(pending, dict)
-                    or pending.get("schema_version") != 1
-                    or pending.get("decision_id") != decision_id
-                    or pending.get("decision_sha256") != decision["decision_sha256"]
-                    or pending.get("candidate_before") != before
-                    or pending.get("previous_generation") != expected_active_generation
-                    or not isinstance(pending.get("active_before"), dict)
-                ):
-                    raise AuthorityError("pending_invalid", "pending activation is invalid")
+                self._validate_pending(
+                    pending,
+                    decision,
+                    before,
+                    expected_active_generation,
+                )
             else:
                 current, _ = self._record_snapshot(
                     before["candidate_id"], require_candidate=True
@@ -959,6 +1158,10 @@ class AuthorityStore:
                     verify_provenance=False,
                 )
                 if current == before:
+                    if pending["active_before"] != self._active_map():
+                        raise AuthorityError(
+                            "pending_invalid", "pending activation baseline is invalid"
+                        )
                     verified_current, _ = self._record_snapshot(
                         before["candidate_id"], require_candidate=True
                     )
@@ -1004,7 +1207,9 @@ class AuthorityStore:
             count += 1
         return count
 
-    def authorize_active_records(self, records):
+    def authorize_active_records(self, records, *, include_bindings=False):
+        if not isinstance(include_bindings, bool):
+            raise AuthorityError("visibility_invalid", "active record binding is invalid")
         if self.pending_count():
             raise AuthorityError(
                 "activation_pending", "active visibility is blocked by pending activation"
@@ -1040,6 +1245,11 @@ class AuthorityStore:
                 "artifact_sha256": hashlib.sha256(raw).hexdigest(),
             }
             if baseline.get(memory_id) == binding:
+                if include_bindings:
+                    record["authority_binding"] = {
+                        **binding,
+                        "activation_id": None,
+                    }
                 authorized.append(record)
                 continue
             receipt = receipts.get(memory_id)
@@ -1049,6 +1259,11 @@ class AuthorityStore:
                     "active memory lacks a matching activation receipt",
                 )
             record["authority_receipt_id"] = receipt["activation_id"]
+            if include_bindings:
+                record["authority_binding"] = {
+                    **binding,
+                    "activation_id": receipt["activation_id"],
+                }
             authorized.append(record)
         return authorized
 
@@ -1075,8 +1290,8 @@ class AuthorityMemoryStore:
     def reviewable(self, workspace=None, project=None, statuses=None):
         return self.store.reviewable(workspace, project, statuses)
 
-    def active_relevant(self, query, workspace=None, project=None):
-        rows = self.store.active_relevant(query, workspace, project)
+    def active_relevant(self, query, workspace=None, project=None, confidentiality=None):
+        rows = self.store.active_relevant(query, workspace, project, confidentiality)
         return self.authority.authorize_active_records(rows)
 
 

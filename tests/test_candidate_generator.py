@@ -377,6 +377,7 @@ class LowRiskCandidateAgentTests(unittest.TestCase):
                     json.dumps(
                         {
                             "type": "loop.generate-candidate",
+                            "confidentiality": "internal",
                             "input": {
                                 "policy_id": self.policy_id(lesson),
                                 "workspace": "work",

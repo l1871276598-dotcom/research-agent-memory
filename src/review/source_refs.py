@@ -42,6 +42,7 @@ _LEARNING_ARTIFACTS = frozenset(
 )
 _INFORMATIONAL_LEARNING_KINDS = frozenset({"principle", "procedure"})
 _MAX_SOURCE_BYTES = 64 * 1024 * 1024
+_VALID_ARTIFACT_KINDS = frozenset({"vault_note_snapshot"})
 
 
 class SourceRefError(ValueError):
@@ -567,29 +568,68 @@ def _resolve_state_artifact(state_dir, digest: str) -> dict:
     if actual != digest:
         raise SourceRefError("stale_source", "source artifact hash changed")
     artifact = _json_bytes(raw, "source artifact is invalid")
-    required = {
-        "schema_version",
-        "kind",
-        "workspace",
-        "project",
-        "confidentiality",
-        "payload",
-        "payload_sha256",
-    }
-    if (
-        set(artifact) != required
-        or artifact.get("schema_version") != 1
-        or not _nonblank(artifact.get("kind"))
-        or artifact.get("payload_sha256") != _digest(artifact.get("payload"))
-        or canonical_bytes(artifact) != raw
-    ):
-        raise SourceRefError("invalid_source", "source artifact is invalid")
-    partition = _partition(
-        artifact.get("workspace"),
-        artifact.get("project"),
-        artifact.get("confidentiality"),
-    )
-    return _verified(f"artifact:{digest}", actual, partition, artifact["kind"])
+    schema_version = artifact.get("schema_version")
+    if schema_version == 1:
+        required = {
+            "schema_version",
+            "kind",
+            "workspace",
+            "project",
+            "confidentiality",
+            "payload",
+            "payload_sha256",
+        }
+        if (
+            set(artifact) != required
+            or not _nonblank(artifact.get("kind"))
+            or artifact.get("payload_sha256") != _digest(artifact.get("payload"))
+            or canonical_bytes(artifact) != raw
+        ):
+            raise SourceRefError("invalid_source", "source artifact is invalid")
+        partition = _partition(
+            artifact.get("workspace"),
+            artifact.get("project"),
+            artifact.get("confidentiality"),
+        )
+        return _verified(f"artifact:{digest}", actual, partition, artifact["kind"])
+    if schema_version == 2:
+        required = {
+            "schema_version",
+            "kind",
+            "source",
+            "locator",
+            "workspace",
+            "project",
+            "confidentiality",
+            "payload",
+            "payload_sha256",
+        }
+        if (
+            set(artifact) != required
+            or not _nonblank(artifact.get("kind"))
+            or artifact.get("payload_sha256") != _digest(artifact.get("payload"))
+            or canonical_bytes(artifact) != raw
+        ):
+            raise SourceRefError("invalid_source", "source artifact is invalid")
+        source = artifact.get("source")
+        if (
+            not isinstance(source, dict)
+            or source.get("scheme") != "vault-note"
+            or not _nonblank(source.get("note_id"))
+            or _SHA256.fullmatch(source.get("source_sha256") or "") is None
+        ):
+            raise SourceRefError("invalid_source", "source artifact is invalid")
+        partition = _partition(
+            artifact.get("workspace"),
+            artifact.get("project"),
+            artifact.get("confidentiality"),
+        )
+        return _verified(f"artifact:{digest}", actual, partition, artifact["kind"])
+    raise SourceRefError("invalid_source", "source artifact schema is unsupported")
+
+
+def _artifact_digest(body) -> str:
+    return hashlib.sha256(canonical_bytes(body)).hexdigest()
 
 
 def publish_source_artifact(
@@ -601,7 +641,13 @@ def publish_source_artifact(
     confidentiality: str,
     payload,
 ) -> str:
-    """Write one immutable canonical source artifact and return its reference."""
+    """Write one immutable canonical source artifact and return its reference.
+
+    v1 publication format (schema_version 1): binds partition + payload only.
+    Retained for existing internal callers (memory_agent exchange,
+    conversation_review). New external evidence publication MUST use
+    publish_source_artifact_v2 so the source identity is bound into the body.
+    """
 
     if not _nonblank(kind):
         raise SourceRefError("invalid_source", "source artifact kind is invalid")
@@ -614,7 +660,7 @@ def publish_source_artifact(
         "payload_sha256": _digest(payload),
     }
     raw = canonical_bytes(body)
-    digest = hashlib.sha256(raw).hexdigest()
+    digest = _artifact_digest(body)
     state = _ensure_state_root(state_dir)
     directory = state / "source_artifacts"
     try:
@@ -656,6 +702,147 @@ def publish_source_artifact(
     except OSError as exc:
         raise SourceRefError("invalid_source", "source artifact could not be written") from exc
     return f"artifact:{digest}"
+
+
+# A shared low-level writer so v1 and v2 publication cannot drift on the
+# atomic write path. The v1 public function above keeps its historical inline
+# implementation (no behavior change); v2 uses this helper.
+def _write_artifact_bytes(state, raw, digest) -> None:
+    directory = state / "source_artifacts"
+    try:
+        if directory.exists() and (directory.is_symlink() or not directory.is_dir()):
+            raise SourceRefError("invalid_source", "source artifact directory is unsafe")
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / f"{digest}.json"
+        if target.exists():
+            if _regular_bytes(target, root=state) != raw:
+                raise SourceRefError("stale_source", "source artifact identity conflicts")
+            return
+        temporary = directory / f".tmp.{digest}.{uuid.uuid4().hex}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(temporary, flags, 0o600)
+        try:
+            offset = 0
+            while offset < len(raw):
+                written = os.write(descriptor, raw[offset:])
+                if written <= 0:
+                    raise OSError("short write")
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            if _regular_bytes(target, root=state) != raw:
+                raise SourceRefError("stale_source", "source artifact identity conflicts")
+        finally:
+            temporary.unlink(missing_ok=True)
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except SourceRefError:
+        raise
+    except OSError as exc:
+        raise SourceRefError("invalid_source", "source artifact could not be written") from exc
+
+
+def publish_source_artifact_v2(
+    state_dir,
+    *,
+    kind: str,
+    source: dict,
+    locator: dict,
+    workspace: str,
+    project,
+    confidentiality: str,
+    payload: dict,
+) -> dict:
+    """Write a schema_version 2 evidence artifact and return its digests.
+
+    v2 binds the cryptographically-derived source identity into the artifact
+    body (C-INV-14): `artifact_sha256` changes when source_sha256, note_id,
+    locator, scope, or payload changes. Core recomputes every digest itself —
+    it never trusts a caller-supplied digest (C-INV-15 / F-02 / F-03).
+
+    The vault_note_snapshot payload carries the canonical note text under
+    `payload["content"]`; Core re-verifies `source_sha256 == SHA256(content)`
+    so a caller cannot substitute a hash of something else (F-02 defense).
+    """
+
+    if not _nonblank(kind):
+        raise SourceRefError("invalid_source", "source artifact kind is invalid")
+    kind = kind.strip()
+    if kind not in _VALID_ARTIFACT_KINDS:
+        raise SourceRefError("invalid_source", "source artifact kind is not allowed")
+
+    if not isinstance(source, dict):
+        raise SourceRefError("invalid_source", "source identity is invalid")
+    if source.get("scheme") != "vault-note":
+        raise SourceRefError("invalid_source", "source scheme must be vault-note")
+    note_id = source.get("note_id")
+    if not _nonblank(note_id) or len(note_id) > 512:
+        raise SourceRefError("invalid_source", "source note id is invalid")
+    if "\x00" in note_id or "/" in note_id or "\\" in note_id:
+        raise SourceRefError("invalid_source", "source note id must not contain path separators")
+    supplied_source_sha = source.get("source_sha256")
+    if not isinstance(supplied_source_sha, str) or _SHA256.fullmatch(supplied_source_sha.lower()) is None:
+        raise SourceRefError("invalid_source", "source sha256 is invalid")
+
+    if not isinstance(locator, dict) or set(locator) != {"relative_path"}:
+        raise SourceRefError("invalid_source", "source locator is invalid")
+    relative_path = locator["relative_path"]
+    if not _nonblank(relative_path) or len(relative_path) > 4096 or relative_path.startswith("/"):
+        raise SourceRefError("invalid_source", "source locator is invalid")
+
+    partition = _partition(workspace, project, confidentiality)
+
+    if not isinstance(payload, dict) or not _nonblank(payload.get("content")):
+        raise SourceRefError("invalid_source", "vault note payload is invalid")
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict) or set(metadata) != {"title"}:
+        raise SourceRefError("invalid_source", "vault note metadata is invalid")
+    title = metadata.get("title")
+    if not _nonblank(title):
+        raise SourceRefError("invalid_source", "vault note metadata title is invalid")
+
+    # Defense-in-depth: source_sha256 is recomputed from the payload content
+    # bytes Core actually sees. A caller-supplied source_sha256 (if any) is
+    # never trusted; the canonical identity derives from Core's own digest.
+    content_bytes = payload["content"].encode("utf-8")
+    source_sha256 = hashlib.sha256(content_bytes).hexdigest()
+    canonical_identity = f"vault-note:{note_id}@{source_sha256}"
+
+    payload_sha256 = _digest(payload)
+
+    body = {
+        "schema_version": 2,
+        "kind": kind,
+        "source": {
+            "scheme": "vault-note",
+            "note_id": note_id,
+            "source_sha256": source_sha256,
+        },
+        "locator": {"relative_path": relative_path},
+        **partition,
+        "payload": payload,
+        "payload_sha256": payload_sha256,
+    }
+    raw = canonical_bytes(body)
+    artifact_sha256 = _artifact_digest(body)
+    _write_artifact_bytes(_ensure_state_root(state_dir), raw, artifact_sha256)
+    return {
+        "source_ref": f"artifact:{artifact_sha256}",
+        "canonical_identity": canonical_identity,
+        "source_sha256": source_sha256,
+        "payload_sha256": payload_sha256,
+        "artifact_sha256": artifact_sha256,
+        "workspace": workspace,
+        "project": project,
+        "confidentiality": confidentiality,
+    }
 
 
 def _parse_ref(root: Path, state_dir, ref: str) -> dict:
@@ -821,6 +1008,7 @@ __all__ = [
     "SourceRefError",
     "canonical_bytes",
     "publish_source_artifact",
+    "publish_source_artifact_v2",
     "resolve_source_bindings",
     "verify_source_bindings",
 ]

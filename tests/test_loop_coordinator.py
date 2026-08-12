@@ -62,6 +62,7 @@ class LoopCoordinatorTests(unittest.TestCase):
     def task(self, index=1, workspace="personal"):
         return {
             "type": "loop.coordinate",
+            "confidentiality": "internal" if workspace == "work" else "personal",
             "input": {
                 "task": f"Migration attempt {index}",
                 "result": f"Migration {index} stopped before writes",

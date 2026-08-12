@@ -28,8 +28,14 @@ class MemoryCore:
             raise ValueError("memory store cannot list reviewable records")
         return finder(workspace, project, statuses)
 
-    def search(self, query, workspace=None, project=None):
-        results = self.store.active_relevant(query, workspace, project)
+    def search(self, query, workspace=None, project=None, confidentiality=None):
+        if confidentiality is not None:
+            results = self.store.active_relevant(query, workspace, project, confidentiality)
+        else:
+            results = self.store.active_relevant(query, workspace, project)
         if self.document_search is not None:
-            results.extend(self.document_search(query, workspace, project))
+            if confidentiality is not None:
+                results.extend(self.document_search(query, workspace, project, confidentiality))
+            else:
+                results.extend(self.document_search(query, workspace, project))
         return results

@@ -7,6 +7,15 @@ from . import WORKSPACE_CHOICES, collect_validated_records
 _TERMS = re.compile(r"[A-Za-z0-9_]+|[\u3400-\u4dbf\u4e00-\u9fff]+")
 _WORKSPACE_CHOICES = frozenset(WORKSPACE_CHOICES)
 _REVIEWABLE_STATUSES = frozenset({"candidate", "conflicted"})
+_CONFIDENTIALITY_LEVELS = ["public", "personal", "internal", "restricted"]
+
+
+def _confidentiality_rank(value):
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in _CONFIDENTIALITY_LEVELS:
+        raise ValueError("confidentiality must be public, personal, internal or restricted")
+    return _CONFIDENTIALITY_LEVELS.index(value)
 
 
 def _optional_text(value, name):
@@ -83,16 +92,24 @@ class MemoryStore:
             results.append(record)
         return results
 
-    def active_relevant(self, query, workspace=None, project=None):
+    def active_relevant(self, query, workspace=None, project=None, confidentiality=None):
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
         workspace = _workspace(workspace)
+        ceiling_rank = _confidentiality_rank(confidentiality)
         project = _optional_text(project, "project")
         terms = {term.casefold() for term in _TERMS.findall(query)}
         ranked = []
         for record in self.records():
             if record.get("status") != "active" or record.get("confidentiality") == "restricted":
                 continue
+            # GP9-02: a caller-confidentiality ceiling filters records strictly.
+            # When a ceiling is supplied, records more confidential than the
+            # ceiling are excluded (public < personal < internal < restricted).
+            if ceiling_rank is not None:
+                record_conf = record.get("confidentiality")
+                if record_conf not in _CONFIDENTIALITY_LEVELS or _CONFIDENTIALITY_LEVELS.index(record_conf) > ceiling_rank:
+                    continue
             if record.get("workspace") != workspace:
                 continue
             record_project = record.get("project")

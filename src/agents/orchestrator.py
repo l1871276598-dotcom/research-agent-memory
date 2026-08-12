@@ -24,6 +24,9 @@ _LEGACY_CONTEXT_FREE_TASKS = frozenset(
         "review.list",
         "review.show",
         "review.decide",
+        # vault.read is a context-free ingress primitive (fd-rooted vault read);
+        # it requires no memory context and is NOT an authority operation.
+        "vault.read",
     }
 )
 _CANDIDATE_STATUSES = frozenset({"candidate", "conflicted"})
@@ -56,6 +59,14 @@ def _task_value(task, values, name):
     if name in task:
         return task[name]
     return values.get(name)
+
+
+def _trusted_task_value(task, values, name):
+    if name in task:
+        return True, task[name]
+    if name in values:
+        return True, values[name]
+    return False, None
 
 
 def _limit(values):
@@ -135,14 +146,21 @@ class SearchAgent(BaseAgent):
         self.core = core
 
     def run(self, task, context):
-        values = _input(self, task, {"query", "workspace", "project", "limit"})
+        values = _input(self, task, {"query", "workspace", "project", "confidentiality", "limit"})
         query = _text(values.get("query"), "input.query")
         workspace = _text(_task_value(task, values, "workspace"), "workspace")
         if workspace not in _WORKSPACE_CHOICES:
             raise ValueError("input.workspace must be personal or work")
         project = _optional_text(_task_value(task, values, "project"), "project")
+        confidentiality = _optional_text(
+            _task_value(task, values, "confidentiality"), "confidentiality"
+        )
+        if confidentiality is not None and confidentiality not in (
+            "public", "personal", "internal", "restricted"
+        ):
+            raise ValueError("input.confidentiality is invalid")
         limit = _limit(values)
-        results = self.core.search(query, workspace, project)
+        results = self.core.search(query, workspace, project, confidentiality)
         if not isinstance(results, list):
             raise ValueError("memory search result must be a list")
         if limit is not None:
@@ -324,20 +342,37 @@ class ContextAgent(BaseAgent):
         self.builder = builder
 
     def run(self, task, context):
-        values = _input(self, task, {"query", "task", "limit", "workspace", "project"})
+        values = _input(self, task, {"query", "task", "limit", "workspace", "project", "confidentiality"})
         embedded = values.get("task")
+        confidentiality = _optional_text(
+            _task_value(task, values, "confidentiality"), "confidentiality"
+        )
+        if confidentiality is not None and confidentiality not in (
+            "public", "personal", "internal", "restricted"
+        ):
+            raise ValueError("input.confidentiality is invalid")
         if isinstance(embedded, dict):
             original_type = _text(embedded.get("type"), "input.task.type")
             original_input = embedded.get("input", {})
             if not isinstance(original_input, dict):
                 raise ValueError("input.task.input must be an object")
+            for scope_key in ("workspace", "project", "confidentiality"):
+                trusted, trusted_value = _trusted_task_value(task, values, scope_key)
+                for location, nested_values in (
+                    ("input.task", embedded),
+                    ("input.task.input", original_input),
+                ):
+                    if scope_key not in nested_values:
+                        continue
+                    if (
+                        not trusted
+                        or trusted_value is None
+                        or nested_values[scope_key] != trusted_value
+                    ):
+                        raise ValueError(f"{location} must not override {scope_key}")
             query = original_input.get("query") or original_input.get("task") or original_type
             workspace = _task_value(task, values, "workspace")
-            if "workspace" not in task:
-                workspace = _task_value(embedded, original_input, "workspace")
             project = _task_value(task, values, "project")
-            if "project" not in task:
-                project = _task_value(embedded, original_input, "project")
         else:
             query = values.get("query") or embedded
             workspace = _task_value(task, values, "workspace")
@@ -358,7 +393,9 @@ class ContextAgent(BaseAgent):
             workspace = _text(workspace, "workspace")
             if workspace not in _WORKSPACE_CHOICES:
                 raise ValueError("input.workspace must be personal or work")
-            output = self.builder.build(query, limit, workspace, project)
+            if confidentiality not in {"public", "personal", "internal", "restricted"}:
+                raise ValueError("input.confidentiality is required and must be valid")
+            output = self.builder.build(query, limit, workspace, project, confidentiality)
         return self.result(task, output)
 
 

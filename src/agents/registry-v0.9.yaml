@@ -4,6 +4,8 @@
     {"id": "memory_agent", "class": "MemoryAgent", "handles": ["memory.create"]},
     {"id": "search_agent", "class": "SearchAgent", "handles": ["memory.search"]},
     {"id": "candidate_list_agent", "class": "CandidateListAgent", "handles": ["memory.candidates"]},
+    {"id": "evidence_agent", "class": "EvidenceAgent", "handles": ["evidence.publish"]},
+    {"id": "vault_read_agent", "class": "VaultReadAgent", "handles": ["vault.read"]},
     {"id": "review_agent", "class": "ReviewAgent", "handles": ["memory.review"]},
     {"id": "activation_agent", "class": "ActivationAgent", "handles": ["memory.activate"]},
     {"id": "context_agent", "class": "ContextAgent", "handles": ["context.build"]},

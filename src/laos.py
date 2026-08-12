@@ -12,6 +12,7 @@ import memory_agent
 import memory_tools
 from agents.candidate_generator import LowRiskCandidateAgent
 from agents.coordinator import LoopCoordinatorAgent
+from agents.evidence import EvidenceAgent
 from agents.handoff import HandoffAgent
 from agents.orchestrator import (
     ActivationAgent,
@@ -26,6 +27,7 @@ from agents.policy import PolicyAgent
 from agents.reflection import ConversationReviewAgent, ReflectionAgent
 from agents.reflection_record import ReflectionRecordAgent
 from agents.registry import AgentRegistry
+from agents.vault_read import VaultReadAgent
 from context.builder import ContextBuilder
 from memory.candidate import CandidateStore
 from memory.core import MemoryCore
@@ -52,7 +54,7 @@ def build_application(root, state_dir=None, model_backend=None):
     authority = AuthorityStore(root, candidates.state_dir)
     store = AuthorityMemoryStore(base_store, authority)
 
-    def search_documents(query, workspace, project):
+    def search_documents(query, workspace, project, confidentiality=None):
         return memory.search_store(
             argparse.Namespace(
                 root=str(root),
@@ -68,6 +70,7 @@ def build_application(root, state_dir=None, model_backend=None):
                 include_unassigned=False,
                 include_restricted=False,
                 include_inactive=False,
+                confidentiality=confidentiality,
                 limit=20,
                 json=True,
                 mode="lexical",
@@ -95,6 +98,10 @@ def build_application(root, state_dir=None, model_backend=None):
         MemoryAgent(core),
         SearchAgent(core),
         CandidateListAgent(core),
+        EvidenceAgent(candidates.state_dir),
+        # GP4-01: the vault root is a Core-side authority from administrator
+        # configuration (LAOS_VAULT_ROOT). A caller can never supply it.
+        VaultReadAgent(os.environ.get("LAOS_VAULT_ROOT") or ""),
         ReviewAgent(
             ReviewGate(
                 root,
@@ -110,7 +117,7 @@ def build_application(root, state_dir=None, model_backend=None):
             )
         ),
         ContextAgent(ContextBuilder(store)),
-        HandoffAgent(root),
+        HandoffAgent(root, candidates.state_dir),
         reflection,
         policy,
         generator,

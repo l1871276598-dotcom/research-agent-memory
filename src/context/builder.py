@@ -36,12 +36,15 @@ class ContextBuilder:
             raise ValueError("context limit must be a positive integer")
         return {"text": "", "sources": [], "limit": limit, "used": 0}
 
-    def build(self, query, limit=8000, workspace=None, project=None):
+    def build(self, query, limit=8000, workspace=None, project=None, confidentiality=None):
         if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
             raise ValueError("context limit must be a positive integer")
         if not isinstance(workspace, str) or not workspace.strip():
             raise ValueError("workspace must be a non-empty string")
-        entries = self.store.active_relevant(query, workspace, project)
+        if confidentiality is not None:
+            entries = self.store.active_relevant(query, workspace, project, confidentiality)
+        else:
+            entries = self.store.active_relevant(query, workspace, project)
         text = ""
         sources = []
         seen_ids = set()

@@ -309,21 +309,51 @@ def _handoff_lock(root, staging_dir):
             os.close(descriptor)
 
 
-def _require_source_backed_project(root, project_slug, workspace):
+def _require_source_backed_project(
+    root, state_dir, project_slug, workspace, authority=None
+):
     from memory import collect_validated_records
+    from review.authority import AuthorityStore
 
+    if authority is None:
+        authority = AuthorityStore(root, state_dir)
     _, records, errors, _ = collect_validated_records(root)
     if errors:
         raise ValueError("handoff project validation failed")
+
+    active_records = []
     for item in records:
-        record = item["record"]
+        record = dict(item["record"])
+        if record.get("status") != "active":
+            continue
+        record["relative_path"] = item["relative_path"]
+        active_records.append(record)
+
+    for record in authority.authorize_active_records(
+        active_records, include_bindings=True
+    ):
         if (
             record.get("type") == "project"
             and record.get("status") == "active"
             and record.get("project") == project_slug
         ):
             if record.get("workspace") == workspace:
-                return
+                binding = record.get("authority_binding")
+                if not isinstance(binding, dict) or set(binding) != {
+                    "relative_path", "artifact_sha256", "activation_id"
+                }:
+                    raise ValueError("handoff project validation failed")
+                pending_count = authority.pending_count()
+                if pending_count:
+                    raise ValueError("blocked: pending activation")
+                return {
+                    "authority_generation": authority.current_generation(),
+                    "authority_pending_count": pending_count,
+                    "authorized_project_binding": {
+                        "memory_id": record["id"],
+                        **binding,
+                    },
+                }
             raise ValueError("blocked: project_not_in_workspace")
     raise ValueError("blocked: project_slug_not_source_backed")
 
@@ -414,6 +444,7 @@ def update_project_handoff(
     expected_sha256=None,
     *,
     workspace,
+    state_dir,
 ):
     project_slug = _validate_project_slug(project_slug)
     expected_sha256 = _validate_sha256(expected_sha256)
@@ -432,70 +463,84 @@ def update_project_handoff(
         raise ValueError("invalid legacy handoff") from exc
     if legacy_info is not None and stat.S_ISLNK(legacy_info.st_mode):
         raise ValueError("invalid legacy handoff")
-    _require_source_backed_project(root, project_slug, workspace)
-
     target_dir = root / "projects" / project_slug
     staging_dir = root / "_staging" / project_slug
     target = target_dir / "handoff.md"
 
-    with _handoff_lock(root, staging_dir):
-        _ensure_safe_directory(root, target_dir)
-        previous_raw = _read_regular_file(root, target, missing_ok=True)
-        previous_sha256 = None
-        if previous_raw is not None:
-            _validate_existing(project_slug, previous_raw)
-            previous_sha256 = hashlib.sha256(previous_raw).hexdigest()
-            if expected_sha256 is None:
-                raise ValueError(
-                    "expected_sha256 is required for handoff update"
-                )
-            if previous_sha256 != expected_sha256:
+    from review.authority import AuthorityStore
+
+    authority = AuthorityStore(root, state_dir)
+    with authority.locked():
+        authority_evidence = _require_source_backed_project(
+            root, state_dir, project_slug, workspace, authority
+        )
+        with _handoff_lock(root, staging_dir):
+            _ensure_safe_directory(root, target_dir)
+            previous_raw = _read_regular_file(root, target, missing_ok=True)
+            previous_sha256 = None
+            if previous_raw is not None:
+                _validate_existing(project_slug, previous_raw)
+                previous_sha256 = hashlib.sha256(previous_raw).hexdigest()
+                if expected_sha256 is None:
+                    raise ValueError(
+                        "expected_sha256 is required for handoff update"
+                    )
+                if previous_sha256 != expected_sha256:
+                    raise ValueError("handoff target sha256 mismatch")
+            elif expected_sha256 is not None:
                 raise ValueError("handoff target sha256 mismatch")
-        elif expected_sha256 is not None:
-            raise ValueError("handoff target sha256 mismatch")
 
-        rendered = _render_handoff(project_slug, content)
-        if len(rendered) > _MAX_HANDOFF_BYTES:
-            raise ValueError("handoff content is too large")
-        try:
-            rendered_text = rendered.decode("utf-8")
-        except UnicodeDecodeError as exc:  # pragma: no cover - rendered bytes are UTF-8.
-            raise ValueError("handoff validation failed") from exc
-        if _project_slug_from_frontmatter(rendered_text) != project_slug:
-            raise ValueError("handoff validation failed")
+            rendered = _render_handoff(project_slug, content)
+            if len(rendered) > _MAX_HANDOFF_BYTES:
+                raise ValueError("handoff content is too large")
+            try:
+                rendered_text = rendered.decode("utf-8")
+            except UnicodeDecodeError as exc:  # pragma: no cover - rendered bytes are UTF-8.
+                raise ValueError("handoff validation failed") from exc
+            if _project_slug_from_frontmatter(rendered_text) != project_slug:
+                raise ValueError("handoff validation failed")
 
-        temp = _write_temp(target_dir, rendered)
-        try:
-            if previous_raw is None:
-                _publish_create(root, target, temp, rendered)
-            else:
-                _publish_update(root, target, temp, rendered, previous_raw)
-        finally:
-            if temp.exists() and not temp.is_symlink():
-                try:
-                    _unlink_owned(temp)
-                except ValueError:
-                    pass
+            temp = _write_temp(target_dir, rendered)
+            try:
+                current_authority_evidence = _require_source_backed_project(
+                    root, state_dir, project_slug, workspace, authority
+                )
+                if current_authority_evidence != authority_evidence:
+                    raise ValueError("handoff authority changed")
+                if previous_raw is None:
+                    _publish_create(root, target, temp, rendered)
+                else:
+                    _publish_update(root, target, temp, rendered, previous_raw)
+            finally:
+                if temp.exists() and not temp.is_symlink():
+                    try:
+                        _unlink_owned(temp)
+                    except ValueError:
+                        pass
 
-        final_raw = _read_regular_file(root, target)
-        if final_raw != rendered:
-            raise ValueError("handoff readback failed")
-        after_sha256 = hashlib.sha256(final_raw).hexdigest()
-        receipt = {
-            "project_slug": project_slug,
-            "path": f"projects/{project_slug}/handoff.md",
-            "status": "updated" if previous_sha256 else "created",
-            "sha256": after_sha256,
-            "previous_sha256": previous_sha256,
-            "before_sha256": previous_sha256,
-            "after_sha256": after_sha256,
-            "expected_sha256": expected_sha256,
-            "content_size": len(final_raw),
-        }
-        receipt["receipt_sha256"] = hashlib.sha256(
-            _canonical_json_bytes(receipt)
-        ).hexdigest()
-        return receipt
+            final_raw = _read_regular_file(root, target)
+            if final_raw != rendered:
+                raise ValueError("handoff readback failed")
+            after_sha256 = hashlib.sha256(final_raw).hexdigest()
+            receipt = {
+                "project_slug": project_slug,
+                "path": f"projects/{project_slug}/handoff.md",
+                "status": "updated" if previous_sha256 else "created",
+                "sha256": after_sha256,
+                "previous_sha256": previous_sha256,
+                "before_sha256": previous_sha256,
+                "after_sha256": after_sha256,
+                "expected_sha256": expected_sha256,
+                "content_size": len(final_raw),
+                "authority_generation": authority_evidence["authority_generation"],
+                "authorized_project_binding": authority_evidence[
+                    "authorized_project_binding"
+                ],
+            }
+            receipt["receipt_sha256"] = hashlib.sha256(
+                _canonical_json_bytes(receipt)
+            ).hexdigest()
+            return receipt
 
 
 __all__ = ["update_project_handoff"]
